@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.log
+
+# Runtime data — never commit real scan data or quarantine content
+quarantine/
+*.report.json
+scan-reports/
+.dupecleaner_cache/
+
+# OS
+.DS_Store
+Thumbs.db

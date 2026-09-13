@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>dupe-cleaner</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>dupe-cleaner</h1>
+    <p class="subtitle">Локальный поиск дубликатов. Ничего не покидает эту машину.</p>
+  </header>
+
+  <section id="scan-form">
+    <h2>1. Сканирование</h2>
+    <label>Папки/диски для сканирования (по одной на строку):</label>
+    <textarea id="paths" rows="3" placeholder="D:\Photos&#10;D:\Backup"></textarea>
+    <label><input type="checkbox" id="include-archives" checked> Заглядывать внутрь архивов (.zip/.tar/.7z/.rar)</label>
+    <button id="scan-btn">Начать скан</button>
+    <div id="scan-status"></div>
+  </section>
+
+  <section id="results" hidden>
+    <h2>2. Найденные дубликаты</h2>
+    <div id="summary"></div>
+
+    <div class="group-block">
+      <h3>Обычные файлы</h3>
+      <div id="plain-groups"></div>
+    </div>
+
+    <div class="group-block media-block">
+      <h3>⚠️ Медиа (фото/видео) — требует ручной проверки</h3>
+      <p class="hint">Эти группы никогда не отправляются в карантин автоматически.</p>
+      <div id="media-groups"></div>
+    </div>
+
+    <div class="group-block archive-block">
+      <h3>📦 Найдено только внутри архивов — только отчёт</h3>
+      <p class="hint">Архивы не изменяются автоматически. Удалите лишнюю копию вручную.</p>
+      <div id="archive-groups"></div>
+    </div>
+
+    <div class="quarantine-controls">
+      <label>Папка карантина:</label>
+      <input type="text" id="quarantine-dir" placeholder="D:\DupeQuarantine">
+      <button id="quarantine-btn">Отправить отмеченное в карантин</button>
+      <div id="quarantine-status"></div>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

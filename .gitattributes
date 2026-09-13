@@ -1,0 +1,12 @@
+# Store text files with LF in the repository, check them out natively
+# (CRLF on Windows). Keeps diffs clean when the project is edited on
+# Windows but tested on Linux in CI.
+* text=auto
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+*.7z binary
+*.rar binary

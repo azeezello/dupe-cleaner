@@ -1,0 +1,12 @@
+# Core (Phase 1) dependencies. Equivalent to `pip install -e .` — see
+# pyproject.toml for the authoritative list and optional extras
+# ([dev] for tests, [media] for the not-yet-wired Phase 2 near-duplicate /
+# face recognition libraries).
+py7zr>=0.21
+rarfile>=4.1
+xxhash>=3.4
+fastapi>=0.111
+uvicorn[standard]>=0.30
+jinja2>=3.1
+pillow>=10.3
+python-multipart>=0.0.9

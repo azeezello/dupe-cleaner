@@ -1,0 +1,19 @@
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 1.5rem; line-height: 1.5; }
+header { margin-bottom: 1.5rem; }
+.subtitle { opacity: 0.7; margin-top: -0.5rem; }
+textarea, input[type="text"] { width: 100%; font-family: monospace; box-sizing: border-box; }
+button { padding: 0.5rem 1rem; margin-top: 0.5rem; cursor: pointer; }
+section { margin-bottom: 2rem; }
+.group-block { border: 1px solid #8884; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; }
+.media-block { border-color: #d9822b; }
+.archive-block { border-color: #8888; opacity: 0.9; }
+.hint { opacity: 0.7; font-size: 0.9em; }
+.dup-group { border-top: 1px solid #8883; padding: 0.5rem 0; }
+.dup-group:first-child { border-top: none; }
+.dup-records { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.4rem 0; }
+.dup-record { font-size: 0.85em; max-width: 220px; word-break: break-all; }
+.dup-record img { max-width: 120px; max-height: 120px; display: block; border-radius: 4px; }
+.keeper-badge { color: #2b8a3e; font-weight: bold; }
+.quarantine-controls { margin-top: 1rem; }
+#scan-status, #quarantine-status { margin-top: 0.5rem; font-size: 0.9em; }
