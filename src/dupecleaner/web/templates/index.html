@@ -2,6 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>dupe-cleaner</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -11,42 +12,84 @@
     <p class="subtitle">Локальный поиск дубликатов. Ничего не покидает эту машину.</p>
   </header>
 
-  <section id="scan-form">
-    <h2>1. Сканирование</h2>
-    <label>Папки/диски для сканирования (по одной на строку):</label>
-    <textarea id="paths" rows="3" placeholder="D:\Photos&#10;D:\Backup"></textarea>
-    <label><input type="checkbox" id="include-archives" checked> Заглядывать внутрь архивов (.zip/.tar/.7z/.rar)</label>
-    <button id="scan-btn">Начать скан</button>
-    <div id="scan-status"></div>
+  <section class="card">
+    <h2>Сканирование</h2>
+    <label for="paths">Папки или диски (по одной на строку)</label>
+    <textarea id="paths" rows="3" placeholder="D:\Photos&#10;E:\Backup"></textarea>
+    <label class="inline"><input type="checkbox" id="include-archives" checked> Заглядывать внутрь архивов (.zip / .tar / .7z / .rar)</label>
+
+    <div class="row">
+      <button id="scan-btn" class="primary">Начать скан</button>
+      <button id="cancel-btn" class="danger" hidden>Остановить</button>
+    </div>
+
+    <p class="hint" id="index-stats"></p>
   </section>
 
-  <section id="results" hidden>
-    <h2>2. Найденные дубликаты</h2>
-    <div id="summary"></div>
+  <section class="card" id="progress-card" hidden>
+    <h2>Ход работы</h2>
 
-    <div class="group-block">
-      <h3>Обычные файлы</h3>
-      <div id="plain-groups"></div>
+    <div class="phase-line">
+      <strong id="phase-label">Подготовка</strong>
+      <span id="elapsed" class="muted"></span>
     </div>
 
-    <div class="group-block media-block">
-      <h3>⚠️ Медиа (фото/видео) — требует ручной проверки</h3>
+    <div class="bar-outer"><div class="bar-inner" id="bar"></div></div>
+    <div class="phase-line">
+      <span id="phase-detail" class="muted"></span>
+      <span id="eta" class="muted"></span>
+    </div>
+
+    <dl class="stats">
+      <div><dt>Найдено файлов</dt><dd id="stat-files">0</dd></div>
+      <div><dt>Объём</dt><dd id="stat-bytes">0 Б</dd></div>
+      <div><dt>Прочитано сейчас</dt><dd id="stat-hashed">0</dd></div>
+      <div><dt>Из кэша (не перечитывалось)</dt><dd id="stat-cache">0</dd></div>
+      <div><dt>Скорость</dt><dd id="stat-rate">—</dd></div>
+    </dl>
+
+    <p class="current">Сейчас: <code id="current-path">—</code></p>
+
+    <p class="stall" id="stall-warning" hidden></p>
+    <p class="hint" id="resume-note">
+      Прогресс пишется на диск по ходу работы. Если процесс упадёт или вы нажмёте
+      «Остановить» — уже посчитанные хэши сохранены, повторный запуск продолжит с этого места.
+    </p>
+    <p class="error" id="scan-error" hidden></p>
+  </section>
+
+  <section class="card" id="results" hidden>
+    <h2>Найденные дубликаты</h2>
+    <div id="summary" class="summary"></div>
+
+    <details open class="group-block">
+      <summary><h3>Обычные файлы</h3></summary>
+      <div id="plain-groups"></div>
+    </details>
+
+    <details class="group-block media-block">
+      <summary><h3>⚠️ Медиа (фото/видео) — ручная проверка</h3></summary>
       <p class="hint">Эти группы никогда не отправляются в карантин автоматически.</p>
       <div id="media-groups"></div>
-    </div>
+    </details>
 
-    <div class="group-block archive-block">
-      <h3>📦 Найдено только внутри архивов — только отчёт</h3>
-      <p class="hint">Архивы не изменяются автоматически. Удалите лишнюю копию вручную.</p>
+    <details class="group-block archive-block">
+      <summary><h3>📦 Только внутри архивов — только отчёт</h3></summary>
+      <p class="hint">Архивы не изменяются автоматически. Лишнюю копию удалите вручную.</p>
       <div id="archive-groups"></div>
-    </div>
+    </details>
 
     <div class="quarantine-controls">
-      <label>Папка карантина:</label>
+      <label for="quarantine-dir">Папка карантина</label>
       <input type="text" id="quarantine-dir" placeholder="D:\DupeQuarantine">
-      <button id="quarantine-btn">Отправить отмеченное в карантин</button>
-      <div id="quarantine-status"></div>
+      <button id="quarantine-btn" class="primary">Отправить отмеченное в карантин</button>
+      <div id="quarantine-status" class="hint"></div>
     </div>
+  </section>
+
+  <section class="card" id="warnings-card" hidden>
+    <h2>Предупреждения</h2>
+    <ul id="warnings-list"></ul>
   </section>
 
   <script src="/static/app.js"></script>

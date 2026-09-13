@@ -62,3 +62,38 @@ def full_hash_from_opener(open_stream: Callable[[], BinaryIO]) -> str:
     """
     with open_stream() as stream:
         return full_hash(stream)
+
+
+def quick_and_full_hash(stream: BinaryIO, size: int, chunk_size: int = HASH_CHUNK_SIZE) -> tuple[str, str]:
+    """Compute both hashes in a single sequential pass.
+
+    This exists for streams that can't seek (archive members): the quick
+    hash normally seeks to the tail, which such a stream can't do. Reading
+    once and deriving both is not only possible but cheaper than reading
+    twice — and, crucially, the quick hash produced here is *bit-identical*
+    to `quick_hash` on a seekable file with the same content. That equality
+    is what lets a file inside a .zip and a loose file on disk land in the
+    same candidate bucket and be recognised as duplicates of each other.
+    """
+    full = xxhash.xxh3_128()
+    head = b""
+    tail = bytearray()
+
+    while True:
+        chunk = stream.read(chunk_size)
+        if not chunk:
+            break
+        full.update(chunk)
+        if len(head) < QUICK_HASH_SAMPLE_BYTES:
+            head += chunk[: QUICK_HASH_SAMPLE_BYTES - len(head)]
+        tail.extend(chunk)
+        if len(tail) > QUICK_HASH_SAMPLE_BYTES:
+            del tail[: len(tail) - QUICK_HASH_SAMPLE_BYTES]
+
+    quick = xxhash.xxh3_128()
+    quick.update(size.to_bytes(8, "little"))
+    quick.update(head)
+    if size > QUICK_HASH_SAMPLE_BYTES:
+        quick.update(bytes(tail))
+
+    return quick.hexdigest(), full.hexdigest()

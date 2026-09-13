@@ -30,6 +30,22 @@ class FileRecord:
     archive_path: str | None = None   # set only if is_archive_member
     member_name: str | None = None    # set only if is_archive_member
 
+    # size+mtime of the real file on disk this record's bytes come from —
+    # for an archive member that's the archive, not the member. The hash
+    # cache is stamped with these, so a changed archive invalidates the
+    # cached hashes of everything inside it. Defaults to the record's own
+    # size/mtime, which is correct for plain files.
+    source_size: int | None = None
+    source_mtime: float | None = None
+
+    @property
+    def effective_source_size(self) -> int:
+        return self.source_size if self.source_size is not None else self.size
+
+    @property
+    def effective_source_mtime(self) -> float:
+        return self.source_mtime if self.source_mtime is not None else self.mtime
+
     @property
     def is_media(self) -> bool:
         return self.media_kind is not MediaKind.NONE

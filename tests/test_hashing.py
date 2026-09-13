@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 
-from dupecleaner.hashing import full_hash, quick_hash
+from dupecleaner.hashing import full_hash, quick_and_full_hash, quick_hash
 
 
 def test_full_hash_matches_for_identical_content():
@@ -22,6 +22,22 @@ def test_quick_hash_matches_for_identical_content():
     a = io.BytesIO(data)
     b = io.BytesIO(data)
     assert quick_hash(a, len(data)) == quick_hash(b, len(data))
+
+
+def test_sequential_quick_hash_matches_the_seeking_one():
+    """The sequential variant (used for archive members, which can't seek)
+    must produce exactly the same quick hash as the seeking variant (used
+    for plain files). If these ever diverge, a file inside a .zip stops
+    matching the identical file loose on disk — the mixed-source detection
+    silently breaks while every other test still passes.
+    """
+    for size in (10, 64 * 1024, 100_000, 300_000):
+        data = bytes(range(256)) * (size // 256 + 1)
+        data = data[:size]
+        seeking = quick_hash(io.BytesIO(data), size)
+        sequential, full = quick_and_full_hash(io.BytesIO(data), size)
+        assert sequential == seeking, f"mismatch at size {size}"
+        assert full == full_hash(io.BytesIO(data))
 
 
 def test_quick_hash_differs_when_middle_differs_but_head_tail_same():

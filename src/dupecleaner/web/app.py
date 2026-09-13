@@ -1,13 +1,16 @@
-"""Minimal local web UI: run a scan, review duplicate groups (with special
-handling for media and archive-only groups), send confirmed groups to
-quarantine. Single-user, localhost-only, in-memory scan store — this is a
-personal tool for your own machine, not a multi-tenant service.
+"""Local web UI: start a scan in the background, watch real progress, cancel
+it safely, then review duplicate groups and send confirmed ones to quarantine.
+
+Scans run in a worker thread and persist their work to the SQLite index, so
+the HTTP layer here is thin: it starts jobs, reports their progress, and
+serves results. Closing the browser, or restarting the server, never
+destroys completed hashing work — it lives in the index, not in this
+process.
 """
 
 from __future__ import annotations
 
 import io
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -17,10 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from ..dedupe import find_duplicate_groups
-from ..models import MediaKind, ScanReport
+from ..jobs import ScanRegistry
 from ..quarantine import run_quarantine
-from ..scanner import Scanner
+from ..storage import DEFAULT_DB_PATH, ScanIndex
 
 BASE_DIR = Path(__file__).parent
 
@@ -28,11 +30,8 @@ app = FastAPI(title="dupe-cleaner")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# scan_id -> ScanReport. In-memory by design (see module docstring); restart
-# the server and past scan results are gone, but nothing on disk depends on
-# this — a fresh scan is cheap to re-run, and quarantine actions are what
-# get persisted (to manifest.json), not scan results.
-_SCANS: dict[str, ScanReport] = {}
+registry = ScanRegistry()
+DB_PATH: Path | str = DEFAULT_DB_PATH
 
 
 class ScanRequest(BaseModel):
@@ -51,43 +50,62 @@ def index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
+@app.get("/api/index-stats")
+def index_stats():
+    """How much is already in the persistent index — the number that shows a
+    restarted scan won't redo the expensive work.
+    """
+    with ScanIndex(DB_PATH) as index:
+        return index.stats()
+
+
 @app.post("/api/scan")
 def start_scan(req: ScanRequest):
     if not req.paths:
         raise HTTPException(400, "Укажите хотя бы одну папку для сканирования.")
-
-    scanner = Scanner(include_archives=req.include_archives)
-    records = list(scanner.iter_records(req.paths))
-    groups = find_duplicate_groups(records, warnings=scanner.warnings)
-
-    report = ScanReport(
-        scanned_roots=req.paths,
-        total_files_seen=scanner.total_files_seen,
-        groups=groups,
-        warnings=scanner.warnings,
-    )
-    scan_id = str(uuid.uuid4())
-    _SCANS[scan_id] = report
-    return {"scan_id": scan_id, **report.to_dict()}
+    job = registry.create(req.paths, db_path=DB_PATH, include_archives=req.include_archives)
+    return {"scan_id": job.scan_id, **job.progress.to_dict()}
 
 
-@app.get("/api/scan/{scan_id}")
-def get_scan(scan_id: str):
-    report = _SCANS.get(scan_id)
-    if report is None:
-        raise HTTPException(404, "Скан не найден (сервер перезапускался?).")
-    return {"scan_id": scan_id, **report.to_dict()}
+@app.get("/api/scan/{scan_id}/progress")
+def scan_progress(scan_id: str):
+    job = registry.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Скан не найден.")
+    return job.progress.to_dict()
+
+
+@app.post("/api/scan/{scan_id}/cancel")
+def cancel_scan(scan_id: str):
+    job = registry.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Скан не найден.")
+    job.cancel()
+    return {"cancelled": True, "note": "Уже вычисленные хэши сохранены — "
+            "повторный запуск продолжит с этого места."}
+
+
+@app.get("/api/scan/{scan_id}/result")
+def scan_result(scan_id: str):
+    job = registry.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Скан не найден.")
+    if job.report is None:
+        raise HTTPException(
+            409, f"Скан ещё не завершён (статус: {job.progress.status})."
+        )
+    return {"scan_id": scan_id, **job.report.to_dict()}
 
 
 @app.post("/api/scan/{scan_id}/quarantine")
 def quarantine_scan(scan_id: str, req: QuarantineRequest):
-    report = _SCANS.get(scan_id)
-    if report is None:
-        raise HTTPException(404, "Скан не найден (сервер перезапускался?).")
+    job = registry.get(scan_id)
+    if job is None or job.report is None:
+        raise HTTPException(404, "Завершённый скан не найден.")
 
     group_hashes = set(req.group_hashes) if req.group_hashes else None
     result = run_quarantine(
-        report.groups,
+        job.report.groups,
         Path(req.quarantine_dir),
         confirm_media=req.confirm_media,
         group_hashes=group_hashes,
@@ -97,10 +115,8 @@ def quarantine_scan(scan_id: str, req: QuarantineRequest):
 
 @app.get("/api/thumbnail")
 def thumbnail(path: str):
-    """Best-effort small preview for a plain-file image, used by the review
-    UI so you can actually *see* which photo you're about to quarantine.
-    Archive-member images are not thumbnailed in the MVP (would require
-    extracting to a temp file) — shown as a generic icon client-side instead.
+    """Best-effort small preview for a plain-file image, so you can actually
+    *see* which photo you're about to quarantine.
     """
     from PIL import Image
 

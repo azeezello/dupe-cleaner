@@ -102,4 +102,8 @@ class Scanner:
                 is_archive_member=True,
                 archive_path=str(path),
                 member_name=member.name,
+                # The archive's own size/mtime: if the archive is rewritten,
+                # every cached hash taken from inside it is invalidated.
+                source_size=stat.st_size,
+                source_mtime=stat.st_mtime,
             )
