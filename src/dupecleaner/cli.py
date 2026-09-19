@@ -121,6 +121,13 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     print(f"Групп дублей: {len(report.groups)}")
     print(f"Потенциально освободится: {_fmt_bytes(report.total_wasted_bytes)}")
     print(f"Время: {_fmt_duration(time.time() - progress.started_at)}")
+    if report.skipped_archives:
+        skipped_bytes = sum(a.size for a in report.skipped_archives)
+        print(
+            f"Не проверено в этом режиме: {len(report.skipped_archives)} "
+            f"архив(ов), {_fmt_bytes(skipped_bytes)} (см. отчёт, "
+            "skipped_archives) — внутрь не заглядывали, дубли внутри не найдены бы"
+        )
     if report.warnings:
         print(f"Предупреждений: {len(report.warnings)} (см. отчёт)")
     print(f"Отчёт сохранён в {args.report}")

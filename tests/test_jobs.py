@@ -94,3 +94,80 @@ def test_scan_of_missing_root_fails_gracefully_with_a_warning(tmp_path: Path):
     assert job.progress.status == "done"
     assert job.report.groups == []
     assert any("не найдена" in w for w in job.progress.warnings)
+
+
+def test_scan_job_report_carries_skipped_archives_through_json_round_trip(tmp_tree: Path, tmp_path: Path):
+    """Finding A1: the report the CLI writes to disk (and later reloads for
+    `quarantine`) must keep the skipped-archives list, not just the
+    in-memory ScanReport.
+    """
+    import json
+
+    from dupecleaner.models import ScanReport
+
+    db = tmp_path / "index.db"
+    job = ScanJob(roots=[str(tmp_tree)], db_path=db, include_archives=False)
+    job.run()
+
+    assert job.progress.status == "done"
+    assert job.report is not None
+    assert len(job.report.skipped_archives) >= 2  # backup.zip and archive_only.zip
+
+    data = json.loads(json.dumps(job.report.to_dict(), ensure_ascii=False))
+    reloaded = ScanReport.from_dict(data)
+    assert len(reloaded.skipped_archives) == len(job.report.skipped_archives)
+    assert {a.path for a in reloaded.skipped_archives} == {a.path for a in job.report.skipped_archives}
+
+
+def test_scan_job_with_archives_has_no_skipped_archives(tmp_tree: Path, tmp_path: Path):
+    db = tmp_path / "index.db"
+    job = ScanJob(roots=[str(tmp_tree)], db_path=db, include_archives=True)
+    job.run()
+    assert job.report.skipped_archives == []
+
+
+def test_scan_job_hashes_one_tar_archive_in_a_single_pass(tmp_path: Path, monkeypatch):
+    """Finding A2, exercised through the real background-job path: scanning
+    a folder with one tar archive containing several duplicate-size
+    members must open that archive a small, constant number of times
+    (enumeration once, hashing once) — never once per candidate member.
+    """
+    import io
+    import tarfile
+
+    root = tmp_path / "data"
+    root.mkdir()
+
+    pair_a = b"first duplicate pair inside the tar " * 20
+    pair_b = b"second duplicate pair, different bytes " * 15
+    archive = root / "dump.tar"
+    with tarfile.open(archive, "w") as tf:
+        for name, content in [
+            ("a1.jpg", pair_a),
+            ("a2.jpg", pair_a),
+            ("b1.jpg", pair_b),
+            ("b2.jpg", pair_b),
+        ]:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+
+    real_open = tarfile.open
+    open_calls = []
+
+    def _counting_open(*args, **kwargs):
+        open_calls.append(1)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(tarfile, "open", _counting_open)
+
+    db = tmp_path / "index.db"
+    job = ScanJob(roots=[str(root)], db_path=db, include_archives=True)
+    job.run()
+
+    assert job.progress.status == "done"
+    assert len(job.report.groups) == 2
+    # One open to list members during enumeration, one more to hash all
+    # four candidates in a single sequential pass — not four (one per
+    # member, the pre-fix behaviour).
+    assert len(open_calls) == 2

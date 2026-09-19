@@ -12,7 +12,7 @@ from typing import Iterator
 
 from . import archives
 from .config import DEFAULT_EXCLUDE_DIR_NAMES, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-from .models import FileRecord, MediaKind
+from .models import FileRecord, MediaKind, SkippedArchive
 
 
 def classify_media(name: str) -> MediaKind:
@@ -40,6 +40,11 @@ class Scanner:
         self.exclude_dir_names = exclude_dir_names
         self.warnings: list[str] = []
         self.total_files_seen = 0
+        # Archives this run did not look inside — either excluded by
+        # --no-archives/quick mode, or found but unreadable. Kept as its
+        # own list (finding A1) so a fast scan can't be misread as "no
+        # duplicates" when really it never looked: see models.SkippedArchive.
+        self.skipped_archives: list[SkippedArchive] = []
 
     def iter_records(self, roots: list[str | Path]) -> Iterator[FileRecord]:
         for root in roots:
@@ -62,10 +67,19 @@ class Scanner:
             self.warnings.append(f"Не удалось прочитать {path}: {exc}")
             return
 
-        kind = archives.archive_kind_for(path) if self.include_archives else None
+        # Detected regardless of include_archives: a folder mode that skips
+        # archive contents still needs to know a path *is* an archive, so it
+        # can be listed as "not checked in this mode" instead of silently
+        # counted as an ordinary, fully-examined file (finding A1).
+        actual_kind = archives.archive_kind_for(path)
+        kind = actual_kind if self.include_archives else None
 
         if kind is None:
             self.total_files_seen += 1
+            if actual_kind is not None and not self.include_archives:
+                self.skipped_archives.append(
+                    SkippedArchive(path=str(path), size=stat.st_size, reason="excluded_by_mode")
+                )
             yield FileRecord(
                 display_path=str(path),
                 real_path=str(path),
@@ -82,6 +96,9 @@ class Scanner:
             self.warnings.append(
                 f"Пропущен RAR-архив {path}: не найден unrar/unar в PATH."
             )
+            self.skipped_archives.append(
+                SkippedArchive(path=str(path), size=stat.st_size, reason="unreadable")
+            )
             return
 
         try:
@@ -89,6 +106,9 @@ class Scanner:
         except Exception as exc:  # noqa: BLE001 - archive libs raise assorted errors
             self.total_files_seen += 1
             self.warnings.append(f"Не удалось открыть архив {path}: {exc}")
+            self.skipped_archives.append(
+                SkippedArchive(path=str(path), size=stat.st_size, reason="unreadable")
+            )
             return
 
         for member in members:

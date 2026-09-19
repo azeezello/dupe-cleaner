@@ -70,3 +70,165 @@ def test_empty_files_are_ignored(tmp_path: Path):
     ]
     groups = find_duplicate_groups(records)
     assert groups == []
+
+
+def test_hash_archive_members_reads_archive_once_regardless_of_candidate_count(tmp_path: Path):
+    """Finding A2, end to end: hashing several members of the same tar
+    archive must cost one sequential pass, not one archive-open per member.
+    """
+    import tarfile
+    import io
+
+    from dupecleaner import archives
+    from dupecleaner.dedupe import group_by_archive, hash_archive_members
+    from dupecleaner.models import FileRecord
+    from dupecleaner.storage import ScanIndex
+
+    archive = tmp_path / "photos.tar"
+    pair_a = b"duplicate pair A " * 10
+    pair_b = b"duplicate pair B, different length " * 7
+    unique = b"only one of this size"
+    with tarfile.open(archive, "w") as tf:
+        for name, content in [
+            ("a1.jpg", pair_a),
+            ("a2.jpg", pair_a),
+            ("b1.jpg", pair_b),
+            ("b2.jpg", pair_b),
+            ("solo.jpg", unique),
+        ]:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+
+    records = [
+        FileRecord(
+            display_path=f"{archive}::{name}",
+            real_path=str(archive),
+            size=len(content),
+            mtime=0,
+            is_archive_member=True,
+            archive_path=str(archive),
+            member_name=name,
+        )
+        for name, content in [
+            ("a1.jpg", pair_a),
+            ("a2.jpg", pair_a),
+            ("b1.jpg", pair_b),
+            ("b2.jpg", pair_b),
+        ]
+    ]
+
+    real_open = tarfile.open
+    open_calls = []
+
+    def _counting_open(*args, **kwargs):
+        open_calls.append(1)
+        return real_open(*args, **kwargs)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(tarfile, "open", side_effect=_counting_open):
+        with ScanIndex(":memory:") as index:
+            index.upsert_files(records, "s1")
+            index.commit()
+
+            plain, by_archive = group_by_archive(records)
+            assert plain == []
+            assert set(by_archive) == {str(archive)}
+
+            errors = hash_archive_members(index, str(archive), by_archive[str(archive)])
+            assert errors == []
+            index.commit()
+
+            groups = index.duplicate_groups("s1")
+
+    assert len(open_calls) == 1  # one sequential pass for all four members
+    assert len(groups) == 2
+    sizes = sorted(len(g.records) for g in groups)
+    assert sizes == [2, 2]
+
+
+def test_hash_archive_members_reports_missing_member_without_losing_others(tmp_path: Path):
+    import tarfile
+    import io
+
+    from dupecleaner.dedupe import hash_archive_members
+    from dupecleaner.models import FileRecord
+    from dupecleaner.storage import ScanIndex
+
+    archive = tmp_path / "single.tar"
+    content = b"the only real member"
+    with tarfile.open(archive, "w") as tf:
+        info = tarfile.TarInfo(name="real.txt")
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+
+    real_record = FileRecord(
+        display_path=f"{archive}::real.txt",
+        real_path=str(archive),
+        size=len(content),
+        mtime=0,
+        is_archive_member=True,
+        archive_path=str(archive),
+        member_name="real.txt",
+    )
+    ghost_record = FileRecord(
+        display_path=f"{archive}::ghost.txt",
+        real_path=str(archive),
+        size=5,
+        mtime=0,
+        is_archive_member=True,
+        archive_path=str(archive),
+        member_name="ghost.txt",
+    )
+
+    with ScanIndex(":memory:") as index:
+        index.upsert_files([real_record, ghost_record], "s1")
+        index.commit()
+
+        errors = hash_archive_members(index, str(archive), [real_record, ghost_record])
+
+    assert len(errors) == 1
+    failed_record, exc = errors[0]
+    assert failed_record.member_name == "ghost.txt"
+    assert isinstance(exc, FileNotFoundError)
+
+
+def test_find_duplicate_groups_works_for_tar_archives_too(tmp_path: Path):
+    """The existing tmp_tree fixture only exercises .zip; tar/gzip is where
+    finding A2 actually lived, so cover it through the public one-shot API
+    as well.
+    """
+    import tarfile
+    import io
+
+    from dupecleaner.models import FileRecord
+
+    content = b"tar duplicate content " * 5
+    archive = tmp_path / "backup.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for name in ("one.dat", "two.dat"):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+
+    records = [
+        FileRecord(
+            display_path=f"{archive}::{name}",
+            real_path=str(archive),
+            size=len(content),
+            mtime=0,
+            is_archive_member=True,
+            archive_path=str(archive),
+            member_name=name,
+        )
+        for name in ("one.dat", "two.dat")
+    ]
+
+    warnings: list[str] = []
+    groups = find_duplicate_groups(records, warnings=warnings)
+
+    assert warnings == []
+    assert len(groups) == 1
+    assert len(groups[0].records) == 2
+    assert groups[0].only_archive_members

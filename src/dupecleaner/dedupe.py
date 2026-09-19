@@ -19,7 +19,7 @@ lifetimes.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Callable, Iterable
 
 from . import archives
 from .hashing import full_hash, quick_and_full_hash, quick_hash
@@ -54,6 +54,12 @@ def compute_hashes(record: FileRecord) -> tuple[str, str | None]:
     The quick hash is computed by the same formula in both cases, so a file
     inside an archive and the same file loose on disk compare equal — that
     is what makes "вперемешку" detection work.
+
+    This single-record path is a correctness-preserving fallback (e.g. for
+    a lone archive-member record processed outside the normal batch flow).
+    The normal, fast path for hashing many members of the same archive is
+    `hash_archive_members`, which reads the archive once for all of them —
+    see its docstring for why that matters (pilot finding A2).
     """
     if record.is_archive_member:
         with open_record_stream(record) as stream:
@@ -79,6 +85,86 @@ def run_full_stage(index: ScanIndex, record: FileRecord) -> None:
     index.set_full_hash(record.display_path, compute_full_hash(record))
 
 
+def group_by_archive(
+    records: Iterable[FileRecord],
+) -> tuple[list[FileRecord], dict[str, list[FileRecord]]]:
+    """Split records needing the quick-hash stage into plain files and
+    archive members grouped by their containing archive.
+
+    This is the grouping that lets `hash_archive_members` read each
+    archive exactly once for every member that needs hashing, instead of
+    the old per-record loop opening the same archive again for every
+    single member (pilot finding A2).
+    """
+    plain: list[FileRecord] = []
+    by_archive: dict[str, list[FileRecord]] = {}
+    for record in records:
+        if record.is_archive_member:
+            assert record.archive_path is not None
+            by_archive.setdefault(record.archive_path, []).append(record)
+        else:
+            plain.append(record)
+    return plain, by_archive
+
+
+def hash_archive_members(
+    index: ScanIndex,
+    archive_path: str,
+    records: list[FileRecord],
+    on_start: Callable[[FileRecord], None] | None = None,
+) -> list[tuple[FileRecord, Exception]]:
+    """Quick+full-hash every given member of one archive in a single
+    sequential pass over the archive, storing each result as it's found.
+
+    This is the fix for pilot finding A2: the old code opened the whole
+    archive again for every member (`open_record_stream` ->
+    `archives.open_member`), which for a tar/gzip archive costs a full
+    decompression pass *per member* rather than once total — measured at
+    71 seconds per member against 73 seconds for the entire 44.9 GB
+    archive. Here, `archives.open_members_sequential` walks the archive
+    once and hands back a stream per requested member as it's reached, and
+    `hashing.quick_and_full_hash` derives both hashes from that single
+    read — so the whole batch, however many members it contains, costs one
+    pass over the archive.
+
+    `on_start(record)` fires right before each member's stream begins
+    being read, so a caller can drive progress reporting the same way it
+    would for a plain per-record loop (see `jobs.ScanJob._hash_archives`).
+
+    Returns `(record, exception)` pairs for members that failed to read or
+    were not found in the archive, so the caller can turn each into a
+    per-file warning without losing the rest of the batch — matching how
+    `find_duplicate_groups` and `ScanJob` already handle per-record
+    hashing failures.
+    """
+    kind = archives.archive_kind_for(Path(archive_path))
+    if kind is None:  # pragma: no cover - defensive, shouldn't happen
+        raise ValueError(f"Unknown archive kind for {archive_path}")
+
+    by_name = {r.member_name: r for r in records}
+    errors: list[tuple[FileRecord, Exception]] = []
+    found: set[str] = set()
+
+    for name, stream in archives.open_members_sequential(Path(archive_path), kind, by_name.keys()):
+        record = by_name[name]
+        found.add(name)
+        if on_start is not None:
+            on_start(record)
+        try:
+            with stream:
+                quick, full = quick_and_full_hash(stream, record.size)
+            index.set_quick_hash(record.display_path, quick)
+            index.set_full_hash(record.display_path, full)
+        except Exception as exc:  # noqa: BLE001 - assorted archive/OS errors
+            errors.append((record, exc))
+
+    for name, record in by_name.items():
+        if name not in found:
+            errors.append((record, FileNotFoundError(name)))
+
+    return errors
+
+
 def find_duplicate_groups(
     records: Iterable[FileRecord],
     warnings: list[str] | None = None,
@@ -97,11 +183,18 @@ def find_duplicate_groups(
         index.upsert_files(records, scan_id)
         index.commit()
 
-        for record in index.needs_quick_hash(scan_id):
+        plain, by_archive = group_by_archive(index.needs_quick_hash(scan_id))
+
+        for record in plain:
             try:
                 run_quick_stage(index, record)
             except Exception as exc:  # noqa: BLE001 - assorted OS/archive errors
                 warnings.append(f"Не удалось прочитать {record.display_path}: {exc}")
+
+        for archive_path, members in by_archive.items():
+            for record, exc in hash_archive_members(index, archive_path, members):
+                warnings.append(f"Не удалось прочитать {record.display_path}: {exc}")
+
         index.commit()
 
         for record in index.needs_full_hash(scan_id):

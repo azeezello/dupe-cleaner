@@ -46,3 +46,44 @@ def test_missing_root_path_is_warned_not_raised(tmp_path: Path):
     records = list(scanner.iter_records([str(missing)]))
     assert records == []
     assert any("не найдена" in w or "not found" in w.lower() for w in scanner.warnings)
+
+
+def test_no_archives_mode_records_skipped_archives(tmp_tree: Path):
+    """Finding A1: --no-archives must not silently treat an archive as an
+    ordinary, fully-examined file. It's still counted as "seen" (unchanged
+    behaviour), but it must also show up in its own skipped-archives list.
+    """
+    scanner = Scanner(include_archives=False)
+    list(scanner.iter_records([str(tmp_tree)]))
+
+    skipped_paths = {a.path for a in scanner.skipped_archives}
+    assert any(p.endswith("backup.zip") for p in skipped_paths)
+    assert any(p.endswith("archive_only.zip") for p in skipped_paths)
+    assert all(a.reason == "excluded_by_mode" for a in scanner.skipped_archives)
+    assert all(a.size > 0 for a in scanner.skipped_archives)
+
+
+def test_include_archives_mode_has_no_skipped_archives(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    list(scanner.iter_records([str(tmp_tree)]))
+    assert scanner.skipped_archives == []
+
+
+def test_unreadable_archive_is_recorded_as_skipped(tmp_path: Path):
+    root = tmp_path / "data"
+    root.mkdir()
+    broken = root / "broken.zip"
+    broken.write_bytes(b"this is not a real zip file at all")
+
+    scanner = Scanner(include_archives=True)
+    records = list(scanner.iter_records([str(root)]))
+
+    # An archive that fails to open produces no FileRecord at all (nothing
+    # inside it could be enumerated), but it's still counted as "seen" and
+    # explained, rather than just vanishing from the totals.
+    assert records == []
+    assert scanner.total_files_seen == 1
+    assert any("Не удалось открыть архив" in w for w in scanner.warnings)
+    assert len(scanner.skipped_archives) == 1
+    assert scanner.skipped_archives[0].path.endswith("broken.zip")
+    assert scanner.skipped_archives[0].reason == "unreadable"

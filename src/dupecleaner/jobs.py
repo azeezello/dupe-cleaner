@@ -25,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .dedupe import run_full_stage, run_quick_stage
+from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
 from .models import FileRecord, ScanReport
 from .progress import ScanProgress
 from .scanner import Scanner
@@ -112,6 +112,7 @@ class ScanJob:
                 total_files_seen=files_total,
                 groups=groups,
                 warnings=scanner.warnings,
+                skipped_archives=scanner.skipped_archives,
             )
             self.progress.warnings = scanner.warnings
             self.progress.finish("done")
@@ -159,6 +160,12 @@ class ScanJob:
     def _quick_hash_phase(self, index: ScanIndex) -> None:
         """Phase 2: cheap head+tail fingerprint, but only for files that share
         a size with something else. Files with a unique size are never read.
+
+        Archive members are hashed separately from plain files, grouped by
+        their containing archive: `hash_archive_members` reads each archive
+        once for every member that needs hashing, rather than opening it
+        again per member (pilot finding A2 — see dedupe.hash_archive_members
+        for the mechanism and measurements).
         """
         candidates = index.needs_quick_hash(self.scan_id)
         # Reading min(size, 2 * sample) per file is what this phase actually
@@ -168,12 +175,12 @@ class ScanJob:
         bytes_total = sum(min(r.size, 2 * QUICK_HASH_SAMPLE_BYTES) for r in candidates)
         self.progress.enter_phase("quick_hashing", files_total=len(candidates), bytes_total=bytes_total)
 
-        self._hash_loop(
-            index,
-            candidates,
-            work=run_quick_stage,
-            cost=lambda record: min(record.size, 2 * QUICK_HASH_SAMPLE_BYTES),
-        )
+        plain, by_archive = group_by_archive(candidates)
+
+        cost = lambda record: min(record.size, 2 * QUICK_HASH_SAMPLE_BYTES)  # noqa: E731
+
+        self._hash_loop(index, plain, work=run_quick_stage, cost=cost)
+        self._hash_archives_loop(index, by_archive, cost=cost)
 
     def _full_hash_phase(self, index: ScanIndex) -> None:
         """Phase 3: read in full, but only files that matched another file on
@@ -215,6 +222,41 @@ class ScanJob:
                 index.commit()
                 processed_since_commit = 0
                 last_commit = time.time()
+
+        index.commit()
+
+    def _hash_archives_loop(self, index: ScanIndex, by_archive: dict, cost) -> None:
+        """Same progress/commit/warning bookkeeping as `_hash_loop`, but one
+        `hash_archive_members` call per archive — a single sequential pass —
+        instead of one record-at-a-time call per member.
+        """
+        last_commit = time.time()
+        processed_since_commit = 0
+
+        for archive_path, members in by_archive.items():
+            def _on_start(record: FileRecord) -> None:
+                # Raises ScanCancelled (via _check_cancelled) if a cancel
+                # came in mid-archive, so a long archive doesn't have to
+                # finish before Ctrl+C takes effect.
+                self._check_cancelled()
+                self.progress.advance(current_path=record.display_path)
+
+            errors = hash_archive_members(index, archive_path, members, on_start=_on_start)
+            error_by_member = {record.member_name: exc for record, exc in errors}
+
+            for record in members:
+                exc = error_by_member.get(record.member_name)
+                if exc is not None:
+                    self.progress.warnings.append(
+                        f"Не удалось прочитать {record.display_path}: {exc}"
+                    )
+                self.progress.advance(files=1, size_bytes=cost(record))
+                processed_since_commit += 1
+
+                if processed_since_commit >= COMMIT_EVERY_FILES or (time.time() - last_commit) > COMMIT_EVERY_SECONDS:
+                    index.commit()
+                    processed_since_commit = 0
+                    last_commit = time.time()
 
         index.commit()
 

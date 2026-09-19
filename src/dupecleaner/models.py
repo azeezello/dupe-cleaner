@@ -56,6 +56,25 @@ class FileRecord:
         return PurePosixPath(name.replace("\\", "/")).suffix.lower()
 
 
+@dataclass(frozen=True)
+class SkippedArchive:
+    """An archive that was *not* looked inside during a scan run — either
+    because the run used `--no-archives` (finding A1: a fast scan over a
+    folder of archives used to report "0 duplicate groups" with nothing to
+    show it never looked, which reads as "no duplicates" instead of "not
+    checked"), or because the archive itself couldn't be opened.
+
+    Kept separate from `warnings` (plain, unstructured strings) so a report
+    can show "N archives not checked in this mode" as its own list rather
+    than folding it into free-text warnings a person has to read fully to
+    notice.
+    """
+
+    path: str
+    size: int
+    reason: str  # e.g. "excluded_by_mode" or "unreadable"
+
+
 @dataclass
 class DuplicateGroup:
     """A set of >=2 FileRecords that are byte-identical to each other."""
@@ -91,6 +110,10 @@ class ScanReport:
     total_files_seen: int
     groups: list[DuplicateGroup]
     warnings: list[str] = field(default_factory=list)
+    # Archives not looked inside during this run — see SkippedArchive.
+    # Always present (possibly empty), so a reader never has to infer "not
+    # checked" from the absence of a field the way finding A1 describes.
+    skipped_archives: list[SkippedArchive] = field(default_factory=list)
 
     @property
     def total_wasted_bytes(self) -> int:
@@ -102,6 +125,10 @@ class ScanReport:
             "total_files_seen": self.total_files_seen,
             "total_wasted_bytes": self.total_wasted_bytes,
             "warnings": self.warnings,
+            "skipped_archives": [
+                {"path": a.path, "size": a.size, "reason": a.reason}
+                for a in self.skipped_archives
+            ],
             "groups": [
                 {
                     "content_hash": g.content_hash,
@@ -146,9 +173,14 @@ class ScanReport:
                 for r in g["records"]
             ]
             groups.append(DuplicateGroup(content_hash=g["content_hash"], records=records))
+        skipped_archives = [
+            SkippedArchive(path=a["path"], size=a["size"], reason=a["reason"])
+            for a in data.get("skipped_archives", [])
+        ]
         return ScanReport(
             scanned_roots=data["scanned_roots"],
             total_files_seen=data["total_files_seen"],
             groups=groups,
             warnings=data.get("warnings", []),
+            skipped_archives=skipped_archives,
         )
