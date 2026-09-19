@@ -32,7 +32,7 @@ from typing import Iterable, Iterator
 
 from .models import DuplicateGroup, FileRecord, MediaKind
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -64,6 +64,39 @@ CREATE INDEX IF NOT EXISTS idx_files_full_hash  ON files(last_scan_id, full_hash
 CREATE INDEX IF NOT EXISTS idx_files_quick_hash ON files(last_scan_id, size, quick_hash);
 """
 
+# Versioned, additive migrations layered on top of _SCHEMA. Each script must
+# be safe to re-run (IF NOT EXISTS everywhere) so a crash mid-upgrade can
+# simply be retried on the next open, and so opening a brand-new database
+# (schema_version starts at 0) and upgrading an old one go through the exact
+# same code path in __init__ below.
+#
+# v2 adds `content_previews`: one row per unique file *content* (keyed by
+# full_hash, the same content hash duplicate grouping already computes —
+# see thumbnails.py for why that key was chosen over a path or a weaker
+# hash). It holds the thumbnail's size/dimensions now, and is exactly where
+# task 9's quality metrics (resolution is already here; sharpness and
+# recompression columns are pre-created below, NULL until task 9 fills
+# them in) land without another migration or touching `files` at all.
+_MIGRATIONS: dict[int, str] = {
+    2: """
+    CREATE TABLE IF NOT EXISTS content_previews (
+        content_hash         TEXT PRIMARY KEY,
+        thumbnail_bytes      INTEGER NOT NULL,
+        width                INTEGER,
+        height               INTEGER,
+        -- Task 9 (quality metrics): resolution is width/height above;
+        -- these two are left NULL until that task computes them, so it
+        -- only has to start writing, not migrate anything.
+        sharpness_score      REAL,
+        recompression_score  REAL,
+        created_at           REAL NOT NULL,
+        accessed_at          REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_previews_accessed
+        ON content_previews(accessed_at);
+    """,
+}
+
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
 
 # A cached hash is valid only while the bytes it was taken from are
@@ -89,6 +122,15 @@ class ScanIndex:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        current_version = int(row["value"]) if row else 0
+        for version in sorted(v for v in _MIGRATIONS if v > current_version):
+            self._conn.executescript(_MIGRATIONS[version])
+            current_version = version
+
         self._conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -299,6 +341,100 @@ class ScanIndex:
             "bytes_indexed": int(row["bytes"]),
             "files_with_valid_hash": int(row["hashed"] or 0),
         }
+
+    # --- thumbnail cache (see thumbnails.py) -------------------------------
+    #
+    # Keyed by content_hash (full_hash), not by path: a duplicate group's
+    # whole reason for existing is that its records share identical bytes,
+    # so they share one cached preview. This also means quarantining or
+    # restoring a file never touches this table at all — the bytes (and
+    # therefore the key) haven't changed, only the file's location.
+
+    def get_thumbnail_meta(self, content_hash: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM content_previews WHERE content_hash = ?",
+            (content_hash,),
+        ).fetchone()
+
+    def upsert_thumbnail(
+        self,
+        content_hash: str,
+        thumbnail_bytes: int,
+        width: int | None,
+        height: int | None,
+    ) -> None:
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO content_previews (
+                content_hash, thumbnail_bytes, width, height, created_at, accessed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                thumbnail_bytes = excluded.thumbnail_bytes,
+                width           = excluded.width,
+                height          = excluded.height,
+                accessed_at     = excluded.accessed_at
+            """,
+            (content_hash, thumbnail_bytes, width, height, now, now),
+        )
+
+    def touch_thumbnail(self, content_hash: str) -> None:
+        """Bump the access time used for LRU eviction. Called every time a
+        cached thumbnail is actually served, not just when it's generated —
+        so a photo the user is currently reviewing survives eviction over
+        one from a scan nobody has looked at since."""
+        self._conn.execute(
+            "UPDATE content_previews SET accessed_at = ? WHERE content_hash = ?",
+            (time.time(), content_hash),
+        )
+
+    def total_thumbnail_bytes(self) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(thumbnail_bytes), 0) AS n FROM content_previews"
+        ).fetchone()
+        return int(row["n"])
+
+    def lru_thumbnail_hashes(self, limit: int) -> list[str]:
+        """The `limit` least-recently-accessed thumbnails, oldest first —
+        what eviction removes first when the cache is over its size cap."""
+        cursor = self._conn.execute(
+            "SELECT content_hash FROM content_previews ORDER BY accessed_at ASC LIMIT ?",
+            (limit,),
+        )
+        return [row["content_hash"] for row in cursor]
+
+    def delete_thumbnails(self, content_hashes: Iterable[str]) -> None:
+        hashes = [(h,) for h in content_hashes]
+        if not hashes:
+            return
+        self._conn.executemany(
+            "DELETE FROM content_previews WHERE content_hash = ?", hashes
+        )
+
+    def resolve_content_hash(self, path: str) -> str | None:
+        """Look up the content hash for a file by either path form the web
+        layer might be handed. Used only as a fallback when a caller (an
+        older client, a direct link) doesn't already have the group's
+        content_hash on hand — the normal path passes it explicitly.
+
+        Matches `real_path` only for plain files: for an archive member,
+        `real_path` is the *archive's* path (see models.FileRecord), shared
+        by every member inside it, so matching on it there could resolve to
+        an arbitrary member's hash rather than a specific one. Not reachable
+        today — the web UI never requests a thumbnail for an archive member
+        (see thumbnails.py) — but excluded here so this stays correct if
+        that ever changes rather than relying on callers to know not to.
+        """
+        row = self._conn.execute(
+            f"""
+            SELECT full_hash FROM files
+             WHERE (display_path = ? OR (real_path = ? AND is_archive_member = 0))
+               AND full_hash IS NOT NULL AND {_HASH_IS_FRESH}
+             LIMIT 1
+            """,
+            (path, path),
+        ).fetchone()
+        return row["full_hash"] if row else None
 
     def prune_missing(self) -> int:
         """Drop rows whose file no longer exists on disk. Pure housekeeping —

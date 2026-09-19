@@ -187,13 +187,19 @@ async function loadResult() {
   renderReport(currentReport);
 }
 
-function recordEl(record, isKeeper) {
+function recordEl(record, isKeeper, groupHash) {
   const div = document.createElement("div");
   div.className = "dup-record";
-  const isImage = /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(record.display_path);
+  // HEIC/HEIF added alongside pillow-heif (pilot finding P2.8) — the
+  // server can now decode them, so the grid should actually ask for them.
+  const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif)$/i.test(record.display_path);
   if (isImage && !record.is_archive_member) {
     const img = document.createElement("img");
-    img.src = `/api/thumbnail?path=${encodeURIComponent(record.real_path)}`;
+    // `hash` is the group's content hash — the thumbnail cache key
+    // (thumbnails.py). Sending it lets the server skip a path lookup and
+    // serve straight from cache.
+    const hashParam = groupHash ? `&hash=${encodeURIComponent(groupHash)}` : "";
+    img.src = `/api/thumbnail?path=${encodeURIComponent(record.real_path)}${hashParam}`;
     img.loading = "lazy";
     div.appendChild(img);
   }
@@ -226,7 +232,7 @@ function groupEl(group, checkable) {
   const keeperPath = group.records
     .slice()
     .sort((a, b) => a.display_path.length - b.display_path.length)[0].display_path;
-  group.records.forEach((r) => recordsDiv.appendChild(recordEl(r, r.display_path === keeperPath)));
+  group.records.forEach((r) => recordsDiv.appendChild(recordEl(r, r.display_path === keeperPath, group.content_hash)));
   wrap.appendChild(recordsDiv);
 
   return wrap;

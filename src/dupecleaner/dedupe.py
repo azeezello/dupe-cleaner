@@ -21,9 +21,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
 
-from . import archives
+from . import archives, thumbnails
 from .hashing import full_hash, quick_and_full_hash, quick_hash
-from .models import DuplicateGroup, FileRecord
+from .models import DuplicateGroup, FileRecord, MediaKind
 from .storage import ScanIndex
 
 
@@ -82,7 +82,19 @@ def run_quick_stage(index: ScanIndex, record: FileRecord) -> None:
 
 
 def run_full_stage(index: ScanIndex, record: FileRecord) -> None:
-    index.set_full_hash(record.display_path, compute_full_hash(record))
+    content_hash = compute_full_hash(record)
+    index.set_full_hash(record.display_path, content_hash)
+
+    # Thumbnail generation piggybacks on the full hash rather than a
+    # separate pass: by the time a plain file gets here, it has already
+    # matched another file on both size and quick hash (see the funnel
+    # docstring at the top of this module), so it is — bar a rare quick-hash
+    # collision the full hash itself is about to rule out — going to end up
+    # in a duplicate group. Archive members are deliberately excluded here;
+    # see thumbnails.py's module docstring and hash_archive_members below
+    # for why.
+    if record.media_kind is MediaKind.PHOTO and not record.is_archive_member:
+        thumbnails.maybe_generate(index, content_hash, Path(record.real_path))
 
 
 def group_by_archive(
@@ -136,6 +148,15 @@ def hash_archive_members(
     per-file warning without losing the rest of the batch — matching how
     `find_duplicate_groups` and `ScanJob` already handle per-record
     hashing failures.
+
+    Deliberately does not generate thumbnails the way `run_full_stage`
+    does for plain files: the web UI has never requested a preview for an
+    archive member (`recordEl` in app.js only does it for non-archive
+    records), and Р1 treats archive contents as cold, read-only storage.
+    Adding it here would mean decoding image bytes from a stream that's
+    already been consumed for hashing (a second, non-sequential pass over
+    a tar/gzip member — exactly the cost pilot finding A2 exists to avoid)
+    for a preview nothing currently displays.
     """
     kind = archives.archive_kind_for(Path(archive_path))
     if kind is None:  # pragma: no cover - defensive, shouldn't happen

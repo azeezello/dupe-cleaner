@@ -14,12 +14,13 @@ import io
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from .. import thumbnails
 from ..jobs import ScanRegistry
 from ..quarantine import run_quarantine
 from ..storage import DEFAULT_DB_PATH, ScanIndex
@@ -114,21 +115,35 @@ def quarantine_scan(scan_id: str, req: QuarantineRequest):
 
 
 @app.get("/api/thumbnail")
-def thumbnail(path: str):
-    """Best-effort small preview for a plain-file image, so you can actually
-    *see* which photo you're about to quarantine.
+def thumbnail(path: str, content_hash: Optional[str] = Query(default=None, alias="hash")):
+    """Serve a cached preview so you can actually *see* which photo you're
+    about to quarantine — instant once a scan has run, because
+    `dedupe.run_full_stage` already generated and cached it (see
+    thumbnails.py). `hash` is the group's content hash and should always be
+    sent by current clients (it's the cache key); `path` remains required
+    as a fallback identifier and for the on-the-fly path below.
     """
-    from PIL import Image
+    with ScanIndex(DB_PATH) as index:
+        resolved_hash = content_hash or index.resolve_content_hash(path)
+        if resolved_hash:
+            cached = thumbnails.get_cached_path(index, resolved_hash)
+            if cached is not None:
+                return FileResponse(cached, media_type="image/jpeg")
 
-    file_path = Path(path)
-    if not file_path.is_file():
-        raise HTTPException(404, "Файл не найден.")
-    try:
-        with Image.open(file_path) as img:
-            img.thumbnail((240, 240))
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=80)
-            buf.seek(0)
-            return StreamingResponse(buf, media_type="image/jpeg")
-    except Exception as exc:  # noqa: BLE001 - not every "image" opens cleanly
-        raise HTTPException(415, f"Не удалось построить превью: {exc}") from exc
+        # Cache miss: nothing generated yet for this content (file below
+        # the dedupe threshold, scan didn't reach the full-hash phase for
+        # it, or the cache was cleared by hand). Decode once on the spot so
+        # the UI never shows a blank tile, and cache the result if the
+        # content hash is known so the next request is instant.
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise HTTPException(404, "Файл не найден.")
+        try:
+            data, width, height = thumbnails.generate(file_path)
+        except Exception as exc:  # noqa: BLE001 - not every "image" opens cleanly
+            raise HTTPException(415, f"Не удалось построить превью: {exc}") from exc
+
+        if resolved_hash:
+            thumbnails.store(index, resolved_hash, data, width, height)
+
+        return StreamingResponse(io.BytesIO(data), media_type="image/jpeg")
