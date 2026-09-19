@@ -1,4 +1,4 @@
-"""Command-line entry point: `dupecleaner scan|quarantine|serve|index`."""
+"""Command-line entry point: `dupecleaner scan|quarantine|restore|serve|index`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .jobs import ScanJob
 from .models import ScanReport
-from .quarantine import run_quarantine
+from .quarantine import restore_from_journal, run_quarantine
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
 
@@ -145,6 +145,10 @@ def _cmd_quarantine(args: argparse.Namespace) -> int:
     )
 
     print(f"Перемещено файлов: {len(result.moved)}")
+    if result.failed:
+        print(f"Не удалось переместить: {len(result.failed)} (см. журнал)")
+        for item in result.failed:
+            print(f"  - {item['original']}: {item['error']}")
     if result.pending_media_review:
         print(
             f"Пропущено медиа-групп (нужна ручная проверка, затем запуск с "
@@ -152,7 +156,18 @@ def _cmd_quarantine(args: argparse.Namespace) -> int:
         )
     if result.archive_only_notes:
         print(f"Групп внутри архивов (не тронуты): {len(result.archive_only_notes)}")
-    print(f"Манифест: {Path(args.quarantine_dir) / 'manifest.json'}")
+    print(f"Журнал (источник истины для restore): {Path(args.quarantine_dir) / 'journal.jsonl'}")
+    print(f"Манифест (сводка): {Path(args.quarantine_dir) / 'manifest.json'}")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    result = restore_from_journal(Path(args.quarantine_dir))
+
+    print(f"Вернул: {len(result.restored)}")
+    print(f"Пропустил: {len(result.skipped)}")
+    for item in result.skipped:
+        print(f"  - {item['original']}: {item['reason']}")
     return 0
 
 
@@ -210,6 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Также переместить медиа-дубликаты — только после ручного просмотра",
     )
     quarantine_p.set_defaults(func=_cmd_quarantine)
+
+    restore_p = subparsers.add_parser(
+        "restore", help="Вернуть файлы из карантина обратно, по журналу"
+    )
+    restore_p.add_argument("--quarantine-dir", required=True, help="Папка карантина")
+    restore_p.set_defaults(func=_cmd_restore)
 
     index_p = subparsers.add_parser("index", help="Показать состояние индекса хэшей")
     index_p.add_argument(

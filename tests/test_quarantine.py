@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 from pathlib import Path
 
+import pytest
+
+from dupecleaner import quarantine as quarantine_module
 from dupecleaner.dedupe import find_duplicate_groups
-from dupecleaner.quarantine import run_quarantine
+from dupecleaner.quarantine import restore_from_journal, run_quarantine
 from dupecleaner.scanner import Scanner
 
 
@@ -23,6 +28,7 @@ def test_plain_duplicates_are_moved_and_media_is_held_back(tmp_tree: Path):
     assert moved_original.name in {"a1.txt", "a2.txt"}
     assert not moved_original.exists()
     assert Path(result.moved[0]["quarantined"]).exists()
+    assert result.failed == []
 
     # Media duplicates (photo1.jpg/photo2.jpg) must NOT be moved without
     # explicit confirm_media=True, even though they were "confirmed" groups.
@@ -36,6 +42,13 @@ def test_plain_duplicates_are_moved_and_media_is_held_back(tmp_tree: Path):
 
     manifest = json.loads((quarantine_dir / "manifest.json").read_text(encoding="utf-8"))
     assert isinstance(manifest, list) and len(manifest) == 1
+
+    # The journal is written too, and is what restore actually reads.
+    journal_path = quarantine_dir / "journal.jsonl"
+    assert journal_path.exists()
+    journal_lines = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+    events = [entry["event"] for entry in journal_lines]
+    assert events == ["move_pending", "move_done"]
 
 
 def test_confirm_media_moves_media_duplicates_too(tmp_tree: Path):
@@ -65,3 +78,161 @@ def test_group_hashes_filter_limits_which_groups_are_processed(tmp_tree: Path):
 
     assert len(result.moved) == 1
     assert result.moved[0]["group_hash"] == target_hash
+
+
+def test_quarantine_mirrors_source_path_structure(tmp_tree: Path):
+    """README promises the quarantine preserves path structure. Verify the
+    moved file lands nested under a folder named after its original parent
+    directory, not flattened into a `<hash16>/<basename>` bucket (the old
+    layout pilot-findings.md problem P1.5 flagged as unnavigable at
+    real-world scale, and inconsistent with what the docs say).
+    """
+    scanner = Scanner(include_archives=True)
+    records = list(scanner.iter_records([str(tmp_tree)]))
+    groups = find_duplicate_groups(records)
+
+    quarantine_dir = tmp_tree.parent / "quarantine_mirror"
+    result = run_quarantine(groups, quarantine_dir, confirm_media=False)
+
+    assert len(result.moved) == 1
+    original = Path(result.moved[0]["original"])
+    quarantined = Path(result.moved[0]["quarantined"])
+
+    assert quarantined.name == original.name
+    assert quarantined.parent.name == original.parent.name
+
+    hash16 = re.compile(r"^[0-9a-f]{16}$")
+    mirrored_parts = quarantined.relative_to(quarantine_dir).parts
+    assert not any(hash16.match(part) for part in mirrored_parts)
+
+
+def test_restore_from_journal_moves_files_back(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    records = list(scanner.iter_records([str(tmp_tree)]))
+    groups = find_duplicate_groups(records)
+
+    quarantine_dir = tmp_tree.parent / "quarantine_restore"
+    result = run_quarantine(groups, quarantine_dir, confirm_media=False)
+    assert len(result.moved) == 1
+    moved = result.moved[0]
+    quarantined_path = Path(moved["quarantined"])
+    original_path = Path(moved["original"])
+    original_bytes = quarantined_path.read_bytes()
+    assert quarantined_path.exists()
+    assert not original_path.exists()
+
+    restore_result = restore_from_journal(quarantine_dir)
+    assert len(restore_result.restored) == 1
+    assert restore_result.skipped == []
+    assert original_path.exists()
+    assert original_path.read_bytes() == original_bytes
+    assert not quarantined_path.exists()
+
+    # Idempotent: nothing left to restore, nothing to complain about either.
+    again = restore_from_journal(quarantine_dir)
+    assert again.restored == []
+    assert again.skipped == []
+
+
+def test_restore_refuses_to_overwrite_a_file_that_reappeared_at_original_path(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    records = list(scanner.iter_records([str(tmp_tree)]))
+    groups = find_duplicate_groups(records)
+
+    quarantine_dir = tmp_tree.parent / "quarantine_conflict"
+    result = run_quarantine(groups, quarantine_dir, confirm_media=False)
+    original_path = Path(result.moved[0]["original"])
+
+    # Someone (or something else) put an unrelated file back at the
+    # original path before restore ran.
+    original_path.write_bytes(b"a completely different file now lives here")
+
+    restore_result = restore_from_journal(quarantine_dir)
+    assert restore_result.restored == []
+    assert len(restore_result.skipped) == 1
+    assert "не затираю" in restore_result.skipped[0]["reason"]
+    assert original_path.read_bytes() == b"a completely different file now lives here"
+
+
+def _make_duplicate_pairs(root: Path, n: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        content = f"payload-{i}-".encode() * 50
+        (root / f"group{i}_a.txt").write_bytes(content)
+        (root / f"group{i}_b.txt").write_bytes(content)
+
+
+def test_journal_survives_a_crash_mid_run_and_restore_fully_recovers(tmp_path: Path, monkeypatch):
+    """Reproduces pilot-findings.md P1.3: a failure partway through a large
+    batch used to leave files quarantined with no journal at all, because
+    manifest.json was only written once, at the very end. Here `shutil.move`
+    is made to blow up (an exception that our per-file `except OSError`
+    does *not* catch, standing in for the process dying mid-run) partway
+    through several groups, and we verify that:
+
+    - the final manifest.json is never written (proving the crash is real
+      — the old source of truth is genuinely gone), yet
+    - `journal.jsonl` alone is enough for `restore_from_journal` to bring
+      every already-quarantined file back, and to correctly recognize that
+      the file that was mid-flight when the crash hit was never actually
+      moved (no action needed, not an error).
+    """
+    root = tmp_path / "data"
+    _make_duplicate_pairs(root, 5)
+
+    scanner = Scanner(include_archives=False)
+    records = list(scanner.iter_records([str(root)]))
+    groups = find_duplicate_groups(records)
+    assert len(groups) == 5
+
+    quarantine_dir = tmp_path / "quarantine"
+
+    real_move = shutil.move
+    call_count = {"n": 0}
+    CRASH_AT = 3
+
+    def flaky_move(src, dst):
+        call_count["n"] += 1
+        if call_count["n"] == CRASH_AT:
+            raise RuntimeError("simulated crash mid-move")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(quarantine_module.shutil, "move", flaky_move)
+
+    with pytest.raises(RuntimeError):
+        run_quarantine(groups, quarantine_dir, confirm_media=False)
+
+    # The crash aborted the run before the final manifest.json write — this
+    # is exactly the bug being fixed: the old summary file never gets
+    # written, so it cannot be the thing restore depends on.
+    assert not (quarantine_dir / "manifest.json").exists()
+    journal_path = quarantine_dir / "journal.jsonl"
+    assert journal_path.exists()
+
+    # Two groups' files were fully moved before the crash; one group's file
+    # was mid-flight (never actually moved, since flaky_move raises before
+    # calling the real move); the remaining two groups were never reached.
+    moved_groups = [
+        i for i in range(5)
+        if not (root / f"group{i}_a.txt").exists() or not (root / f"group{i}_b.txt").exists()
+    ]
+    assert len(moved_groups) == 2
+
+    restore_result = restore_from_journal(quarantine_dir)
+
+    assert len(restore_result.restored) == 2
+    assert len(restore_result.skipped) == 1
+    assert (
+        "не завершилось" in restore_result.skipped[0]["reason"]
+        or "восстанавливать нечего" in restore_result.skipped[0]["reason"]
+    )
+
+    # Every file, across all five groups, is back — nothing was lost.
+    for i in range(5):
+        a, b = root / f"group{i}_a.txt", root / f"group{i}_b.txt"
+        assert a.exists() and a.read_bytes()
+        assert b.exists() and b.read_bytes()
+
+    # Idempotent: a second restore finds nothing left to do.
+    second = restore_from_journal(quarantine_dir)
+    assert second.restored == []

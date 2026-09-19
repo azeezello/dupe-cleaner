@@ -2,9 +2,9 @@
 
 Nothing here ever calls os.remove(). The only destructive-looking action is
 `shutil.move` into the quarantine folder, which is reversible (see
-docs/SAFETY.md for the manual restore procedure) — actual permanent
-deletion of the quarantine folder is a separate, explicit step the user
-takes themselves once they're satisfied.
+docs/SAFETY.md for the manual restore procedure, or `dupecleaner restore`)
+— actual permanent deletion of the quarantine folder is a separate,
+explicit step the user takes themselves once they're satisfied.
 
 Two categories are *never* auto-moved, even when a group is "confirmed":
 - Archive members: modifying an archive in place risks corrupting it, so
@@ -14,23 +14,57 @@ Two categories are *never* auto-moved, even when a group is "confirmed":
   explicitly for that call, on top of being in the confirmed group list —
   a deliberate extra step so a batch confirmation of "regular file"
   duplicates can never accidentally sweep up a family photo.
+
+Journal and restore (Р5: "каждая операция пишется в журнал до её
+выполнения")
+-----------------------------------------------------------------
+Every single-file move is recorded in an append-only journal
+(`journal.jsonl` in the quarantine root) *before* the move happens, and the
+outcome is appended right after. Each line is flushed and fsync'd
+immediately, so the journal reflects reality even if the process is killed
+between two file moves — the original bug this fixes was `manifest.json`
+being written once, after the whole batch, which meant a crash on file
+3000 of 6000 left 3000 files quarantined with no record of where they
+came from and no way back.
+
+`manifest.json` is still written once per `run_quarantine` call, as a
+convenience summary of that run — but it is no longer the source of truth
+for anything. `restore_from_journal` reads only `journal.jsonl`, and a
+missing or stale `manifest.json` doesn't affect its correctness.
+
+Quarantine layout mirrors the source path structure (matching what
+README.md promises), e.g. `D:\Photos\Wedding\a.jpg` -> `<quarantine
+root>/D/Photos/Wedding/a.jpg`. Earlier this flattened everything into
+`<quarantine root>/<hash prefix>/<basename>`, which made a 6299-file
+quarantine unnavigable and wasn't what the docs described. Restore never
+has to guess a destination name back from this layout, though — it always
+uses the exact `original`/`quarantined` paths recorded in the journal.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import DuplicateGroup, FileRecord
+
+JOURNAL_FILENAME = "journal.jsonl"
+MANIFEST_FILENAME = "manifest.json"
+
+_WINDOWS_DRIVE_RE = re.compile(r"^([A-Za-z]):/(.*)$")
 
 
 @dataclass
 class QuarantineResult:
     kept: dict[str, str] = field(default_factory=dict)  # group hash -> kept path
     moved: list[dict] = field(default_factory=list)      # [{original, quarantined, group_hash}]
+    failed: list[dict] = field(default_factory=list)     # [{original, quarantined, group_hash, error}]
     pending_media_review: list[dict] = field(default_factory=list)
     archive_only_notes: list[dict] = field(default_factory=list)
 
@@ -39,9 +73,91 @@ class QuarantineResult:
             "generated_at": time.time(),
             "kept": self.kept,
             "moved": self.moved,
+            "failed": self.failed,
             "pending_media_review": self.pending_media_review,
             "archive_only_notes": self.archive_only_notes,
         }
+
+
+@dataclass
+class RestoreResult:
+    restored: list[dict] = field(default_factory=list)  # [{original, quarantined, group_hash}]
+    skipped: list[dict] = field(default_factory=list)    # [{original, quarantined, group_hash, reason}]
+
+    def to_dict(self) -> dict:
+        return {
+            "generated_at": time.time(),
+            "restored": self.restored,
+            "skipped": self.skipped,
+        }
+
+
+class _JournalWriter:
+    """Append-only writer for `journal.jsonl`. Every `write()` is flushed
+    and fsync'd before returning, so the line is durable on disk before the
+    caller goes on to do the thing the line describes (or, for a
+    completion line, before anything else can happen that might crash).
+    This is what makes the journal — not `manifest.json` — the safe source
+    of truth for `restore_from_journal`.
+    """
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(path, "a", encoding="utf-8")
+
+    def write(self, entry: dict) -> None:
+        self._fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        self._fh.close()
+
+    def __enter__(self) -> "_JournalWriter":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+
+def _read_journal(journal_path: Path) -> list[dict]:
+    if not journal_path.exists():
+        return []
+    entries: list[dict] = []
+    for line in journal_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Each write() is flushed+fsync'd as a whole line before the
+            # next one starts, so a torn line can only ever be the very
+            # last one (process killed mid-write). Drop it rather than
+            # fail the whole read — everything before it is still intact.
+            continue
+    return entries
+
+
+def _operations_from_journal(entries: list[dict]) -> dict[str, dict]:
+    """Collapse a flat event stream into one record per op_id, keeping the
+    original move_pending fields plus which events were seen for it.
+    """
+    ops: dict[str, dict] = {}
+    for entry in entries:
+        op_id = entry.get("op_id")
+        if not op_id:
+            continue
+        op = ops.setdefault(op_id, {"events": []})
+        event = entry.get("event")
+        op["events"].append(event)
+        if event == "move_pending":
+            op.update({k: v for k, v in entry.items() if k not in ("event",)})
+        elif event == "move_failed":
+            op["move_error"] = entry.get("error")
+        elif event == "restore_failed":
+            op["restore_error"] = entry.get("reason")
+    return ops
 
 
 def choose_keeper(records: list[FileRecord]) -> FileRecord:
@@ -53,6 +169,32 @@ def choose_keeper(records: list[FileRecord]) -> FileRecord:
     non_archive = [r for r in records if not r.is_archive_member]
     candidates = non_archive or records
     return min(candidates, key=lambda r: (len(r.display_path), r.mtime))
+
+
+def _mirrored_relative_parts(source: Path) -> list[str]:
+    """Turn an absolute source path into path segments to nest under the
+    quarantine root, preserving directory structure end to end (README:
+    "с сохранением структуры путей"). Works on the path's *text*, not
+    `pathlib`'s host-OS parsing, so a Windows-style path (`D:\\Photos\\x`)
+    mirrors correctly even when this code runs on Linux, and vice versa.
+
+    A Windows drive letter becomes a top-level folder (`D:\\Photos\\x.jpg`
+    -> `D/Photos/x.jpg`) since `:` isn't a legal path character on
+    Windows. A POSIX absolute path keeps its segments as-is.
+    """
+    normalized = str(source).replace("\\", "/")
+    m = _WINDOWS_DRIVE_RE.match(normalized)
+    if m:
+        drive, rest = m.group(1).upper(), m.group(2)
+        parts = [drive] + [p for p in rest.split("/") if p]
+    else:
+        parts = [p for p in normalized.split("/") if p]
+    return parts or ["_root"]
+
+
+def _mirrored_destination(quarantine_root: Path, source: Path) -> Path:
+    parts = _mirrored_relative_parts(source)
+    return quarantine_root.joinpath(*parts)
 
 
 def _unique_destination(directory: Path, filename: str) -> Path:
@@ -69,10 +211,61 @@ def _unique_destination(directory: Path, filename: str) -> Path:
         n += 1
 
 
+def _move_one(
+    source: Path,
+    quarantine_root: Path,
+    group: DuplicateGroup,
+    record: FileRecord,
+    result: QuarantineResult,
+    journal: _JournalWriter,
+) -> None:
+    mirrored = _mirrored_destination(quarantine_root, source)
+    destination = _unique_destination(mirrored.parent, mirrored.name)
+
+    op_id = uuid.uuid4().hex
+    journal.write(
+        {
+            "op_id": op_id,
+            "event": "move_pending",
+            "ts": time.time(),
+            "group_hash": group.content_hash,
+            "original": str(source),
+            "quarantined": str(destination),
+            "size": record.size,
+        }
+    )
+
+    try:
+        shutil.move(str(source), str(destination))
+    except OSError as exc:
+        journal.write(
+            {"op_id": op_id, "event": "move_failed", "ts": time.time(), "error": str(exc)}
+        )
+        result.failed.append(
+            {
+                "group_hash": group.content_hash,
+                "original": str(source),
+                "quarantined": str(destination),
+                "error": str(exc),
+            }
+        )
+        return
+
+    journal.write({"op_id": op_id, "event": "move_done", "ts": time.time()})
+    result.moved.append(
+        {
+            "group_hash": group.content_hash,
+            "original": str(source),
+            "quarantined": str(destination),
+        }
+    )
+
+
 def quarantine_group(
     group: DuplicateGroup,
     quarantine_root: Path,
     result: QuarantineResult,
+    journal: _JournalWriter,
     confirm_media: bool = False,
 ) -> None:
     if group.only_archive_members:
@@ -103,7 +296,6 @@ def quarantine_group(
     keeper = choose_keeper(group.records)
     result.kept[group.content_hash] = keeper.display_path
 
-    group_dir = quarantine_root / group.content_hash[:16]
     for record in group.records:
         if record is keeper:
             continue
@@ -122,15 +314,7 @@ def quarantine_group(
             continue
 
         source = Path(record.real_path)
-        destination = _unique_destination(group_dir, source.name)
-        shutil.move(str(source), str(destination))
-        result.moved.append(
-            {
-                "group_hash": group.content_hash,
-                "original": str(source),
-                "quarantined": str(destination),
-            }
-        )
+        _move_one(source, quarantine_root, group, record, result, journal)
 
 
 def run_quarantine(
@@ -140,19 +324,23 @@ def run_quarantine(
     group_hashes: set[str] | None = None,
 ) -> QuarantineResult:
     """Process every group (optionally filtered to `group_hashes`, e.g. the
-    ones a user explicitly ticked in the web review UI) and write a
-    manifest.json into the quarantine root describing exactly what happened,
-    so it can be audited or reversed later.
+    ones a user explicitly ticked in the web review UI). Every individual
+    file move is written to `journal.jsonl` before it happens and confirmed
+    right after (see module docstring) — that journal, not `manifest.json`,
+    is what `restore_from_journal` reads. `manifest.json` is still written
+    once at the end as a human-readable summary of this run.
     """
     result = QuarantineResult()
     quarantine_root.mkdir(parents=True, exist_ok=True)
 
-    for group in groups:
-        if group_hashes is not None and group.content_hash not in group_hashes:
-            continue
-        quarantine_group(group, quarantine_root, result, confirm_media=confirm_media)
+    journal_path = quarantine_root / JOURNAL_FILENAME
+    with _JournalWriter(journal_path) as journal:
+        for group in groups:
+            if group_hashes is not None and group.content_hash not in group_hashes:
+                continue
+            quarantine_group(group, quarantine_root, result, journal, confirm_media=confirm_media)
 
-    manifest_path = quarantine_root / "manifest.json"
+    manifest_path = quarantine_root / MANIFEST_FILENAME
     existing = []
     if manifest_path.exists():
         try:
@@ -163,5 +351,94 @@ def run_quarantine(
             existing = []
     existing.append(result.to_dict())
     manifest_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return result
+
+
+def restore_from_journal(
+    quarantine_root: Path,
+    op_ids: set[str] | None = None,
+) -> RestoreResult:
+    """Reverse quarantine moves using `journal.jsonl` as the sole source of
+    truth — never by guessing a destination name back from the quarantine
+    layout, since `_unique_destination` can rename on collision
+    (`<stem>__1<suffix>`).
+
+    For each recorded move (optionally filtered to `op_ids`):
+    - if the quarantined copy is gone and the original is back in place,
+      the move never actually completed (crash before the rename) —
+      nothing to do, not an error;
+    - if the quarantined copy is gone and the original is *also* gone,
+      both copies are lost — flagged for manual attention rather than
+      silently skipped;
+    - if a file already sits at the original path, it is never
+      overwritten — the restore is skipped and reported so the user can
+      look at it themselves;
+    - otherwise the quarantined file is checked to be actually readable,
+      then moved back, and a `restored` event is appended so re-running
+      restore is idempotent.
+    """
+    journal_path = quarantine_root / JOURNAL_FILENAME
+    ops = _operations_from_journal(_read_journal(journal_path))
+
+    result = RestoreResult()
+    with _JournalWriter(journal_path) as journal:
+        for op_id, op in ops.items():
+            if "move_pending" not in op.get("events", []):
+                continue
+            if op_ids is not None and op_id not in op_ids:
+                continue
+            if "restored" in op.get("events", []):
+                continue  # already restored in a previous run; idempotent no-op
+
+            original = Path(op["original"])
+            quarantined = Path(op["quarantined"])
+            group_hash = op.get("group_hash")
+            entry = {
+                "original": str(original),
+                "quarantined": str(quarantined),
+                "group_hash": group_hash,
+            }
+
+            if not quarantined.exists():
+                if original.exists():
+                    reason = "перемещение не завершилось (файл остался на исходном месте) — восстанавливать нечего"
+                else:
+                    reason = "файла нет ни в карантине, ни на исходном пути — требуется ручная проверка"
+                result.skipped.append({**entry, "reason": reason})
+                continue
+
+            try:
+                with open(quarantined, "rb") as fh:
+                    fh.read(1)
+            except OSError as exc:
+                result.skipped.append(
+                    {**entry, "reason": f"файл в карантине не читается: {exc}"}
+                )
+                continue
+
+            if original.exists():
+                result.skipped.append(
+                    {**entry, "reason": "по исходному пути уже лежит другой файл — не затираю"}
+                )
+                continue
+
+            original.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(quarantined), str(original))
+            except OSError as exc:
+                journal.write(
+                    {
+                        "op_id": op_id,
+                        "event": "restore_failed",
+                        "ts": time.time(),
+                        "reason": str(exc),
+                    }
+                )
+                result.skipped.append({**entry, "reason": f"перемещение не удалось: {exc}"})
+                continue
+
+            journal.write({"op_id": op_id, "event": "restored", "ts": time.time()})
+            result.restored.append(entry)
 
     return result
