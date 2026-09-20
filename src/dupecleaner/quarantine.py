@@ -53,7 +53,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .archive_classify import MemberTwins, member_twins, verify_members
-from .models import ArchiveClass, ArchiveVerdict, DuplicateGroup, FileRecord, ScanReport
+from .models import (
+    ArchiveClass,
+    ArchiveVerdict,
+    DuplicateGroup,
+    FileRecord,
+    ScanMode,
+    ScanReport,
+)
 
 JOURNAL_FILENAME = "journal.jsonl"
 MANIFEST_FILENAME = "manifest.json"
@@ -528,8 +535,35 @@ def quarantine_archives(
     `confirm_media=True`, matching the rule for loose media files: the
     content is the user's photos either way, and the fact that it arrived
     wrapped in a .tgz is not a reason to apply a weaker safeguard.
+
+    A report produced in quick mode (Р7) is refused outright, before any of
+    the above. A quick run never opened an archive, so every archive in its
+    report is UNREAD and step 1 would already skip it — but that is the
+    mechanism agreeing with the rule by coincidence, and the rule is the
+    part worth defending. Stating it here means the guarantee survives
+    someone later teaching classification to be cleverer about archives it
+    has not read, and it produces an answer a person can act on ("run it
+    in full mode") instead of four identical "not fully redundant" lines.
     """
     result = ArchiveQuarantineResult()
+
+    if report.mode is not ScanMode.FULL:
+        for verdict in verdicts:
+            if archive_paths is not None and verdict.path not in archive_paths:
+                continue
+            result.refused.append(
+                {
+                    "archive": verdict.path,
+                    "size": verdict.size,
+                    "reason": "отчёт получен в быстром режиме: внутрь архива не "
+                    "заглядывали, значит его содержимое не подтверждено "
+                    "байт-в-байт. Нужен полный режим "
+                    "(dupecleaner scan --mode full) — тогда появится и право "
+                    "на перемещение.",
+                }
+            )
+        return result
+
     quarantine_root.mkdir(parents=True, exist_ok=True)
     twins_by_archive: dict[str, list[MemberTwins]] = member_twins(report)
 

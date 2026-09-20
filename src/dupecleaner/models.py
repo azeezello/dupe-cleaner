@@ -13,6 +13,50 @@ class MediaKind(str, Enum):
     VIDEO = "video"
 
 
+class ScanMode(str, Enum):
+    """How much of the disk a scan run actually looks at (Р7).
+
+    The difference between the two modes is **coverage, never confidence**.
+    Both run the same three-stage funnel through to a full, byte-for-byte
+    hash, so a duplicate group means exactly the same thing in either one
+    and the Р0 invariant — only byte-confirmed content may be quarantined —
+    holds unchanged. Р7 considered and rejected the other reading of
+    "fast" (group by name and size, act on that): it would have traded the
+    guarantee rather than the amount of work, and on a real photo archive
+    two different shots named `IMG_0001.jpg` of equal size are common, not
+    hypothetical.
+
+    What QUICK gives up, and nothing else:
+
+    - **Archives are not opened at all.** They land in
+      `ScanReport.skipped_archives` with reason ``excluded_by_mode``, so a
+      run that never looked inside cannot be misread as one that looked
+      and found nothing (finding A1). A consequence worth stating out
+      loud: a quick run can only ever hand an archive the Р1 verdict
+      UNREAD, so it can never grant permission to move one. That is
+      enforced explicitly in `quarantine.quarantine_archives` rather than
+      left to fall out of the mechanism.
+    - **No previews, and later no quality metrics.** Those cost a whole
+      image decode per unique content hash — measured at roughly 4.5–9
+      minutes over the pilot's 6000 groups (задача 8) — for something only
+      the review screen needs.
+
+    Neither omission touches how a duplicate is established, which is the
+    whole point of the split.
+    """
+
+    QUICK = "quick"
+    FULL = "full"
+
+    @property
+    def include_archives(self) -> bool:
+        return self is ScanMode.FULL
+
+    @property
+    def generate_previews(self) -> bool:
+        return self is ScanMode.FULL
+
+
 @dataclass(frozen=True)
 class FileRecord:
     """One discovered file — either a real file on disk, or a member inside
@@ -234,6 +278,13 @@ class ScanReport:
     # `archive_classify.classify_archives` needs to give each archive a Р1
     # verdict. See ArchiveStat for why the groups alone aren't enough.
     archives: list[ArchiveStat] = field(default_factory=list)
+    # Which mode produced this report. Carried on the report rather than
+    # kept in the caller, because the report outlives the run: it is
+    # written to report.json and read back by `quarantine`, possibly days
+    # later, and the answer to "may this report authorise moving an
+    # archive?" has to travel with it. A report from before this field
+    # existed reads back as FULL, which is what those runs did.
+    mode: ScanMode = ScanMode.FULL
 
     @property
     def total_wasted_bytes(self) -> int:
@@ -250,6 +301,7 @@ class ScanReport:
                 for a in self.skipped_archives
             ],
             "archives": [a.to_dict() for a in self.archives],
+            "mode": self.mode.value,
             "groups": [
                 {
                     "content_hash": g.content_hash,
@@ -305,4 +357,5 @@ class ScanReport:
             warnings=data.get("warnings", []),
             skipped_archives=skipped_archives,
             archives=[ArchiveStat.from_dict(a) for a in data.get("archives", [])],
+            mode=ScanMode(data.get("mode", ScanMode.FULL.value)),
         )

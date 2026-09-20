@@ -21,7 +21,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from .. import thumbnails
+from ..dedupe import verify_group
 from ..jobs import ScanRegistry
+from ..models import ScanMode
 from ..quarantine import run_quarantine
 from ..storage import DEFAULT_DB_PATH, ScanIndex
 
@@ -37,7 +39,11 @@ DB_PATH: Path | str = DEFAULT_DB_PATH
 
 class ScanRequest(BaseModel):
     paths: list[str]
-    include_archives: bool = True
+    # Р7: quick is the default, here and in the CLI. The two modes differ
+    # in coverage only — see models.ScanMode.
+    mode: ScanMode = ScanMode.QUICK
+    # Legacy/escape hatch: may only narrow what the mode allows.
+    include_archives: bool | None = None
 
 
 class QuarantineRequest(BaseModel):
@@ -64,8 +70,13 @@ def index_stats():
 def start_scan(req: ScanRequest):
     if not req.paths:
         raise HTTPException(400, "Укажите хотя бы одну папку для сканирования.")
-    job = registry.create(req.paths, db_path=DB_PATH, include_archives=req.include_archives)
-    return {"scan_id": job.scan_id, **job.progress.to_dict()}
+    job = registry.create(
+        req.paths,
+        db_path=DB_PATH,
+        include_archives=req.include_archives,
+        mode=req.mode,
+    )
+    return {"scan_id": job.scan_id, "mode": job.mode.value, **job.progress.to_dict()}
 
 
 @app.get("/api/scan/{scan_id}/progress")
@@ -95,7 +106,75 @@ def scan_result(scan_id: str):
         raise HTTPException(
             409, f"Скан ещё не завершён (статус: {job.progress.status})."
         )
-    return {"scan_id": scan_id, **job.report.to_dict()}
+    # `to_dict` already carries "mode"; the counts below save the client
+    # from re-deriving "what did this mode not look at" from the list.
+    by_mode = [
+        a for a in job.report.skipped_archives if a.reason == "excluded_by_mode"
+    ]
+    return {
+        "scan_id": scan_id,
+        "skipped_by_mode_count": len(by_mode),
+        "skipped_by_mode_bytes": sum(a.size for a in by_mode),
+        **job.report.to_dict(),
+    }
+
+
+@app.post("/api/scan/{scan_id}/upgrade")
+def upgrade_scan(scan_id: str):
+    """«Досчитать полностью» — Р7's promise of reaching full coverage
+    without scanning from scratch.
+
+    This starts a *new* job in full mode over the same roots and, crucially,
+    the same index. That is the whole trick, and it is not a new mechanism:
+    Р6 already decided that resuming means "re-run and let the cache
+    answer", because enumeration is the cheap phase and hashing is the
+    expensive one. Every plain file whose size and mtime are unchanged
+    keeps its cached hashes, so the second run re-walks the tree (seconds)
+    and then reads only what the first run never looked at — archive
+    contents — plus the previews quick mode skipped
+    (`ScanJob._preview_phase`).
+
+    The new scan gets its own id, and the quick report stays readable at
+    its own. Nothing is discarded to make the upgrade: if the full run is
+    cancelled halfway, the quick answer is still there.
+    """
+    job = registry.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Скан не найден.")
+    if job.mode is ScanMode.FULL:
+        raise HTTPException(409, "Этот скан уже выполнен в полном режиме.")
+    if job.is_running:
+        raise HTTPException(409, "Дождитесь окончания текущего скана.")
+
+    full_job = registry.create(job.roots, db_path=DB_PATH, mode=ScanMode.FULL)
+    return {
+        "scan_id": full_job.scan_id,
+        "mode": full_job.mode.value,
+        "upgraded_from": scan_id,
+        **full_job.progress.to_dict(),
+    }
+
+
+@app.post("/api/scan/{scan_id}/group/{content_hash}/verify")
+def verify_scan_group(scan_id: str, content_hash: str):
+    """«Сверить полностью» for one group: re-read every copy right now.
+
+    See `dedupe.GroupVerification` for what this proves. Short version: the
+    group was already byte-confirmed when the scan ran — this re-confirms
+    it against the disk as it is at this moment, which is a different and
+    useful question once a report is hours old.
+    """
+    job = registry.get(scan_id)
+    if job is None or job.report is None:
+        raise HTTPException(404, "Завершённый скан не найден.")
+
+    group = next(
+        (g for g in job.report.groups if g.content_hash == content_hash), None
+    )
+    if group is None:
+        raise HTTPException(404, "Группа не найдена в этом скане.")
+
+    return verify_group(group).to_dict()
 
 
 @app.post("/api/scan/{scan_id}/quarantine")

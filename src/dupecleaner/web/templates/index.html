@@ -16,7 +16,34 @@
     <h2>Сканирование</h2>
     <label for="paths">Папки или диски (по одной на строку)</label>
     <textarea id="paths" rows="3" placeholder="D:\Photos&#10;E:\Backup"></textarea>
-    <label class="inline"><input type="checkbox" id="include-archives" checked> Заглядывать внутрь архивов (.zip / .tar / .7z / .rar)</label>
+    <fieldset class="mode-picker">
+      <legend>Что проверять</legend>
+
+      <label class="mode-option">
+        <input type="radio" name="scan-mode" value="quick" checked>
+        <span>
+          <span class="mode-title">Быстро</span>
+          <span class="mode-desc">Точные дубликаты среди обычных файлов. Внутрь архивов
+            (.zip / .tar / .7z / .rar) не заглядываем, превью не строим — это и есть
+            вся экономия времени.</span>
+        </span>
+      </label>
+
+      <label class="mode-option">
+        <input type="radio" name="scan-mode" value="full">
+        <span>
+          <span class="mode-title">Полно</span>
+          <span class="mode-desc">То же самое плюс содержимое архивов и превью для
+            просмотра. Дольше — зато видно дубликаты, спрятанные внутри выгрузок.</span>
+        </span>
+      </label>
+
+      <p class="hint mode-guarantee">
+        Ни один из режимов не теряет файлы. Разница только в том, что просматривается:
+        в карантин в обоих случаях уходит только подтверждённое байт-в-байт.
+        Начали с быстрого — досчитать до полного можно потом, не сканируя заново.
+      </p>
+    </fieldset>
 
     <div class="row">
       <button id="scan-btn" class="primary">Начать скан</button>
@@ -61,6 +88,12 @@
   <section class="card" id="results" hidden>
     <h2>Найденные дубликаты</h2>
     <div id="summary" class="summary"></div>
+
+    <div id="mode-note" class="mode-note" hidden>
+      <p id="mode-note-text"></p>
+      <button id="upgrade-btn">Досчитать полностью</button>
+      <span id="upgrade-status" class="hint"></span>
+    </div>
 
     <details open class="group-block">
       <summary><h3>Обычные файлы</h3></summary>

@@ -9,10 +9,13 @@ import time
 from pathlib import Path
 
 from .archive_classify import classify_archives
+from .dedupe import verify_group
 from .jobs import ScanJob
-from .models import ArchiveClass, ScanReport
+from .models import ArchiveClass, ScanMode, ScanReport
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
 from .storage import DEFAULT_DB_PATH, ScanIndex
+
+MODE_LABEL = {ScanMode.QUICK: "быстрый", ScanMode.FULL: "полный"}
 
 
 def _fmt_bytes(n: float) -> str:
@@ -65,12 +68,45 @@ def _render_progress_line(progress) -> str:
     return line
 
 
+def _mode_banner(job: ScanJob) -> str:
+    """One line, before anything runs, saying what this run will and will
+    not look at.
+
+    Worth printing even though it reads as obvious: the modes differ only
+    in coverage, and coverage is invisible in the result. A quick run over
+    a folder of archives finds fewer duplicates than a full one and looks
+    exactly like a folder with fewer duplicates in it. Finding A1 is the
+    same mistake one level down.
+    """
+    if job.mode is ScanMode.QUICK:
+        return (
+            "Режим: быстрый — точные дубликаты среди обычных файлов "
+            "(размер → быстрый хэш → полный хэш). Внутрь архивов не "
+            "заглядываем, превью не строим. В карантин, как и в полном "
+            "режиме, уходит только подтверждённое байт-в-байт."
+        )
+    if not job.include_archives:
+        return (
+            "Режим: полный, но с --no-archives — архивы будут перечислены "
+            "как непроверенные."
+        )
+    return (
+        "Режим: полный — то же самое плюс содержимое архивов (Р1) и превью "
+        "для просмотра."
+    )
+
+
 def _cmd_scan(args: argparse.Namespace) -> int:
+    mode = ScanMode(args.mode)
     job = ScanJob(
         roots=args.paths,
         db_path=args.db,
-        include_archives=not args.no_archives,
+        # None means "whatever the mode says"; --no-archives may only
+        # narrow that, never widen it (see ScanJob.__init__).
+        include_archives=False if args.no_archives else None,
+        mode=mode,
     )
+    print(_mode_banner(job))
     job.start()
     # Live single-line progress only makes sense on a terminal. When output
     # is redirected to a file or a CI log, escape codes would just be noise,
@@ -140,10 +176,20 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             f"{_fmt_bytes(sum(a.size for a in unread))} — содержимое неизвестно, "
             "к таким архивам инструмент не притрагивается"
         )
-    _print_archive_verdicts(report)
+    # In quick mode every archive is UNREAD by construction, so printing
+    # the Р1 breakdown would just repeat the "не проверено в этом режиме"
+    # line above in four different words.
+    if report.mode is ScanMode.FULL:
+        _print_archive_verdicts(report)
     if report.warnings:
         print(f"Предупреждений: {len(report.warnings)} (см. отчёт)")
     print(f"Отчёт сохранён в {args.report}")
+    if report.mode is ScanMode.QUICK:
+        print(
+            "Досчитать полностью: та же команда с --mode full и тем же --db. "
+            "Уже посчитанные хэши берутся из индекса — заново читаются только "
+            "архивы и недостающие превью."
+        )
     return 0
 
 
@@ -246,7 +292,21 @@ def _cmd_quarantine(args: argparse.Namespace) -> int:
         print(f"Групп внутри архивов (не тронуты): {len(result.archive_only_notes)}")
 
     if args.archives:
-        _quarantine_archives_step(report, Path(args.quarantine_dir), args.confirm_media)
+        if report.mode is not ScanMode.FULL:
+            # `quarantine_archives` refuses this too, one archive at a
+            # time. Catching it here says it once, before anything runs,
+            # and names the command that fixes it.
+            print(
+                "Архивы не перемещены: отчёт получен в быстром режиме "
+                f"({MODE_LABEL[report.mode]}), внутрь архивов никто не "
+                "заглядывал. Перезапустите скан с --mode full — и с тем же "
+                "--db, тогда обычные файлы не будут перечитываться.",
+                file=sys.stderr,
+            )
+        else:
+            _quarantine_archives_step(
+                report, Path(args.quarantine_dir), args.confirm_media
+            )
 
     print(f"Журнал (источник истины для restore): {Path(args.quarantine_dir) / 'journal.jsonl'}")
     print(f"Манифест (сводка): {Path(args.quarantine_dir) / 'manifest.json'}")
@@ -282,6 +342,48 @@ def _quarantine_archives_step(
             f"  Архивов с медиа, ожидают ручной проверки "
             f"(затем --confirm-media): {len(archive_result.pending_media_review)}"
         )
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Re-read one or more groups against the disk as it is right now.
+
+    The command-line half of Р7's «сверить полностью». See
+    `dedupe.GroupVerification` for what this does and does not prove: it
+    is a freshness check on an ageing report, not a promotion from a
+    weaker kind of match — there is no weaker kind of match in either mode.
+    """
+    data = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    report = ScanReport.from_dict(data)
+    by_hash = {g.content_hash: g for g in report.groups}
+
+    exit_code = 0
+    for wanted in args.group:
+        group = by_hash.get(wanted)
+        if group is None:
+            print(f"Группа {wanted}: в отчёте не найдена.", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        result = verify_group(group)
+        print(f"Группа {wanted} ({_fmt_bytes(group.size)}):")
+        for check in result.checked:
+            mark = "  ✓" if check.ok else "  ✗"
+            suffix = "" if check.ok else f" — {check.reason}"
+            print(f"{mark} {check.display_path}{suffix}")
+        if result.ok:
+            print(
+                f"  Подтверждено копий: {len(result.confirmed_paths)} из "
+                f"{len(result.checked)} — байты совпадают прямо сейчас."
+            )
+        else:
+            exit_code = 1
+            confirmed = len(result.confirmed_paths)
+            print(
+                f"  Не подтверждено: живых одинаковых копий {confirmed}. "
+                "Дубликатом это больше не является — перезапустите скан.",
+                file=sys.stderr,
+            )
+    return exit_code
 
 
 def _cmd_restore(args: argparse.Namespace) -> int:
@@ -334,7 +436,21 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p = subparsers.add_parser("scan", help="Найти дубликаты в указанных папках")
     scan_p.add_argument("paths", nargs="+", help="Папки или диски для сканирования")
     scan_p.add_argument("--report", default="report.json", help="Куда сохранить отчёт (JSON)")
-    scan_p.add_argument("--no-archives", action="store_true", help="Не заглядывать внутрь архивов")
+    scan_p.add_argument(
+        "--mode",
+        choices=[ScanMode.QUICK.value, ScanMode.FULL.value],
+        default=ScanMode.QUICK.value,
+        help="quick (по умолчанию) — точные дубликаты среди обычных файлов, без "
+        "архивов и без превью; full — то же плюс содержимое архивов (Р1) и "
+        "превью. Разница только в охвате: в карантин в обоих режимах уходит "
+        "только подтверждённое байт-в-байт.",
+    )
+    scan_p.add_argument(
+        "--no-archives",
+        action="store_true",
+        help="Не заглядывать внутрь архивов даже в режиме full "
+        "(в quick они и так не открываются).",
+    )
     scan_p.set_defaults(func=_cmd_scan)
 
     quarantine_p = subparsers.add_parser(
@@ -356,6 +472,21 @@ def build_parser() -> argparse.ArgumentParser:
         "отменяет перемещение всего архива.",
     )
     quarantine_p.set_defaults(func=_cmd_quarantine)
+
+    verify_p = subparsers.add_parser(
+        "verify",
+        help="Сверить конкретную группу заново: перечитать все копии и "
+        "сравнить байты прямо сейчас",
+    )
+    verify_p.add_argument("--report", default="report.json", help="Отчёт команды scan")
+    verify_p.add_argument(
+        "--group",
+        action="append",
+        required=True,
+        metavar="HASH",
+        help="content_hash группы из отчёта; можно указать несколько раз",
+    )
+    verify_p.set_defaults(func=_cmd_verify)
 
     restore_p = subparsers.add_parser(
         "restore", help="Вернуть файлы из карантина обратно, по журналу"

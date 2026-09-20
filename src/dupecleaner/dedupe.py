@@ -18,6 +18,7 @@ lifetimes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
 
@@ -81,7 +82,9 @@ def run_quick_stage(index: ScanIndex, record: FileRecord) -> None:
         index.set_full_hash(record.display_path, full)
 
 
-def run_full_stage(index: ScanIndex, record: FileRecord) -> None:
+def run_full_stage(
+    index: ScanIndex, record: FileRecord, generate_previews: bool = True
+) -> None:
     content_hash = compute_full_hash(record)
     index.set_full_hash(record.display_path, content_hash)
 
@@ -93,7 +96,18 @@ def run_full_stage(index: ScanIndex, record: FileRecord) -> None:
     # in a duplicate group. Archive members are deliberately excluded here;
     # see thumbnails.py's module docstring and hash_archive_members below
     # for why.
-    if record.media_kind is MediaKind.PHOTO and not record.is_archive_member:
+    #
+    # `generate_previews=False` is how a quick-mode run (Р7) skips the only
+    # expensive thing it skips outside archives. It does not change what
+    # gets hashed or grouped — the full hash above is computed and stored
+    # either way — so a quick run's groups are byte-confirmed exactly like
+    # a full run's. `jobs.ScanJob._preview_phase` fills in the previews
+    # afterwards if the same folders are later re-run in full mode.
+    if (
+        generate_previews
+        and record.media_kind is MediaKind.PHOTO
+        and not record.is_archive_member
+    ):
         thumbnails.maybe_generate(index, content_hash, Path(record.real_path))
 
 
@@ -184,6 +198,174 @@ def hash_archive_members(
             errors.append((record, FileNotFoundError(name)))
 
     return errors
+
+
+
+@dataclass(frozen=True)
+class RecordVerification:
+    """What re-reading one copy of a group proved, right now."""
+
+    display_path: str
+    ok: bool
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {"display_path": self.display_path, "ok": self.ok, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class GroupVerification:
+    """Outcome of re-reading every copy in one duplicate group.
+
+    This is the "сверить полностью" action from Р7's interface section, and
+    it is worth being precise about what it does and does not add, because
+    the obvious reading is wrong.
+
+    It is **not** an upgrade from a weaker kind of match. A group only ever
+    exists because every record in it produced the same full hash, in both
+    modes alike — there is no name-and-size grouping anywhere in this
+    project to promote. What this re-check adds is *freshness*: a report is
+    a photograph of the disk at the moment the scan ran, and by the time
+    someone reviews 8814 groups the disk has moved on. A copy may have been
+    edited, half-restored from a backup, truncated by a failed sync, or
+    replaced by a different file of the same size.
+
+    So this answers "are these still identical, as of this second?" — the
+    same question `archive_classify.verify_member` asks before an archive
+    moves, applied to an ordinary group on request. It re-reads each copy
+    in full and re-hashes it rather than checking that a file of the right
+    size exists at the path; reading is the only thing that proves readable,
+    and hashing bytes already in hand is nearly free next to the read.
+    """
+
+    content_hash: str
+    size: int
+    checked: list[RecordVerification]
+
+    @property
+    def ok(self) -> bool:
+        """True only if at least two copies still hold the group's bytes.
+
+        A "verified" group of one is not a duplicate group any more, so it
+        must not read as a confirmation that something can be reclaimed.
+        """
+        return sum(1 for c in self.checked if c.ok) >= 2
+
+    @property
+    def confirmed_paths(self) -> list[str]:
+        return [c.display_path for c in self.checked if c.ok]
+
+    @property
+    def failures(self) -> list[RecordVerification]:
+        return [c for c in self.checked if not c.ok]
+
+    def to_dict(self) -> dict:
+        return {
+            "content_hash": self.content_hash,
+            "size": self.size,
+            "ok": self.ok,
+            "confirmed": len(self.confirmed_paths),
+            "checked": [c.to_dict() for c in self.checked],
+        }
+
+
+def _verify_plain(record: FileRecord, content_hash: str) -> RecordVerification:
+    path = Path(record.real_path)
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return RecordVerification(record.display_path, False, f"не найден: {exc}")
+    if stat.st_size != record.size:
+        return RecordVerification(
+            record.display_path,
+            False,
+            f"размер изменился ({stat.st_size} вместо {record.size})",
+        )
+    try:
+        with open(path, "rb") as stream:
+            digest = full_hash(stream)
+    except OSError as exc:
+        return RecordVerification(record.display_path, False, f"не читается: {exc}")
+    if digest != content_hash:
+        return RecordVerification(record.display_path, False, "содержимое изменилось")
+    return RecordVerification(record.display_path, True)
+
+
+def _verify_archive_members(
+    archive_path: str, members: list[FileRecord], content_hash: str
+) -> list[RecordVerification]:
+    """Re-read several members of one archive in a single sequential pass.
+
+    The straightforward loop — `open_record_stream` per record — would pay
+    a full decompression pass per member, which is pilot finding A2 all
+    over again (71 seconds per member on the real Takeout). A group can
+    genuinely hold more than one member of the same archive, so this takes
+    the same one-pass route `hash_archive_members` does.
+    """
+    kind = archives.archive_kind_for(Path(archive_path))
+    if kind is None:  # pragma: no cover - defensive, shouldn't happen
+        return [
+            RecordVerification(r.display_path, False, "неизвестный тип архива")
+            for r in members
+        ]
+
+    by_name = {r.member_name: r for r in members}
+    results: list[RecordVerification] = []
+    seen: set[str] = set()
+    try:
+        streams = archives.open_members_sequential(
+            Path(archive_path), kind, by_name.keys()
+        )
+        for name, stream in streams:
+            record = by_name[name]
+            seen.add(name)
+            try:
+                with stream:
+                    digest = full_hash(stream)
+            except Exception as exc:  # noqa: BLE001 - assorted archive errors
+                results.append(
+                    RecordVerification(record.display_path, False, f"не читается: {exc}")
+                )
+                continue
+            if digest != content_hash:
+                results.append(
+                    RecordVerification(record.display_path, False, "содержимое изменилось")
+                )
+            else:
+                results.append(RecordVerification(record.display_path, True))
+    except Exception as exc:  # noqa: BLE001 - the archive failed as a whole
+        for name, record in by_name.items():
+            if name not in seen:
+                results.append(
+                    RecordVerification(
+                        record.display_path, False, f"архив не читается: {exc}"
+                    )
+                )
+        return results
+
+    for name, record in by_name.items():
+        if name not in seen:
+            results.append(
+                RecordVerification(record.display_path, False, "участник не найден в архиве")
+            )
+    return results
+
+
+def verify_group(group: DuplicateGroup) -> GroupVerification:
+    """Re-read and re-hash every copy in `group` against the live disk."""
+    plain, by_archive = group_by_archive(group.records)
+
+    results = [_verify_plain(record, group.content_hash) for record in plain]
+    for archive_path, members in by_archive.items():
+        results.extend(
+            _verify_archive_members(archive_path, members, group.content_hash)
+        )
+
+    order = {record.display_path: i for i, record in enumerate(group.records)}
+    results.sort(key=lambda v: order.get(v.display_path, len(order)))
+    return GroupVerification(
+        content_hash=group.content_hash, size=group.size, checked=results
+    )
 
 
 def find_duplicate_groups(

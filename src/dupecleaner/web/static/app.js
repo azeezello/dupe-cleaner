@@ -2,6 +2,11 @@ let currentScanId = null;
 let currentReport = null;
 let pollTimer = null;
 
+function selectedMode() {
+  const picked = document.querySelector('input[name="scan-mode"]:checked');
+  return picked ? picked.value : "quick";
+}
+
 const $ = (id) => document.getElementById(id);
 
 function fmtBytes(n) {
@@ -52,7 +57,7 @@ $("scan-btn").addEventListener("click", async () => {
   const resp = await fetch("/api/scan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths, include_archives: $("include-archives").checked }),
+    body: JSON.stringify({ paths, mode: selectedMode() }),
   });
 
   if (!resp.ok) {
@@ -234,8 +239,84 @@ function groupEl(group, checkable) {
     .sort((a, b) => a.display_path.length - b.display_path.length)[0].display_path;
   group.records.forEach((r) => recordsDiv.appendChild(recordEl(r, r.display_path === keeperPath, group.content_hash)));
   wrap.appendChild(recordsDiv);
+  wrap.appendChild(verifyControls(group));
 
   return wrap;
+}
+
+// "Сверить полностью" for one group. Not a promotion from a weaker kind of
+// match — there is no weaker kind, in either mode — but a re-read against
+// the disk as it is now. A report on thousands of groups gets reviewed over
+// hours, and in that time a copy can be edited, truncated by a failed sync,
+// or replaced by a different file of the same size.
+function verifyControls(group) {
+  const actions = document.createElement("div");
+  actions.className = "group-actions";
+
+  const button = document.createElement("button");
+  button.className = "verify-btn";
+  button.textContent = "Сверить полностью";
+  actions.appendChild(button);
+
+  const out = document.createElement("div");
+  out.className = "verify-result";
+  actions.appendChild(out);
+
+  button.addEventListener("click", async () => {
+    if (!currentScanId) return;
+    button.disabled = true;
+    out.className = "verify-result pending";
+    out.textContent = "Перечитываю копии...";
+    try {
+      const resp = await fetch(
+        `/api/scan/${currentScanId}/group/${encodeURIComponent(group.content_hash)}/verify`,
+        { method: "POST" }
+      );
+      if (!resp.ok) {
+        out.className = "verify-result bad";
+        out.textContent = `Ошибка: ${await resp.text()}`;
+        return;
+      }
+      const result = await resp.json();
+      if (result.ok) {
+        out.className = "verify-result ok";
+        out.textContent =
+          `Подтверждено: ${result.confirmed} из ${result.checked.length} копий ` +
+          `совпадают байт-в-байт прямо сейчас.`;
+      } else {
+        out.className = "verify-result bad";
+        const bad = result.checked.filter((c) => !c.ok);
+        out.textContent =
+          `Не подтверждено (живых одинаковых копий ${result.confirmed}): ` +
+          bad.map((c) => `${c.display_path} — ${c.reason}`).join("; ");
+      }
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  return actions;
+}
+
+// A quick run's results are complete about what it looked at and silent
+// about what it didn't — which is exactly the shape of misreading finding A1
+// describes. This banner says what was skipped, in archives and bytes, and
+// offers the way to finish the job.
+function renderModeNote(report) {
+  const note = $("mode-note");
+  if (report.mode !== "quick") {
+    note.hidden = true;
+    return;
+  }
+  note.hidden = false;
+  const count = report.skipped_by_mode_count ?? 0;
+  $("mode-note-text").textContent = count
+    ? `Быстрый режим: ${fmtNumber(count)} арх. на ${fmtBytes(report.skipped_by_mode_bytes ?? 0)} ` +
+      `не проверено — внутрь не заглядывали, и дубликаты внутри них здесь не показаны. ` +
+      `Превью тоже не строились.`
+    : `Быстрый режим: архивов не встретилось, но превью не строились.`;
+  $("upgrade-status").textContent = "";
+  $("upgrade-btn").disabled = false;
 }
 
 function renderReport(report) {
@@ -243,6 +324,7 @@ function renderReport(report) {
   $("summary").textContent =
     `Групп дублей: ${fmtNumber(report.groups.length)}. ` +
     `Потенциально можно освободить: ${fmtBytes(report.total_wasted_bytes)}.`;
+  renderModeNote(report);
 
   const plain = $("plain-groups");
   const media = $("media-groups");
@@ -281,6 +363,39 @@ $("quarantine-btn").addEventListener("click", async () => {
 
   const result = await resp.json();
   status.textContent = `Перемещено файлов: ${result.moved.length}. Манифест: ${quarantineDir}\\manifest.json`;
+});
+
+// "Досчитать полностью": start a full-mode run over the same roots and the
+// same index. Nothing the quick run already hashed is read again — the index
+// answers for it (Р6) — so this costs the archive contents and the previews,
+// which is precisely what the quick run skipped.
+$("upgrade-btn").addEventListener("click", async () => {
+  if (!currentScanId) return;
+  const status = $("upgrade-status");
+  $("upgrade-btn").disabled = true;
+  status.textContent = "Запускаю полный проход...";
+
+  const resp = await fetch(`/api/scan/${currentScanId}/upgrade`, { method: "POST" });
+  if (!resp.ok) {
+    status.textContent = `Ошибка: ${await resp.text()}`;
+    $("upgrade-btn").disabled = false;
+    return;
+  }
+
+  const started = await resp.json();
+  currentScanId = started.scan_id;
+  currentReport = null;
+  status.textContent = "";
+
+  $("mode-note").hidden = true;
+  $("progress-card").hidden = false;
+  $("results").hidden = true;
+  $("warnings-card").hidden = true;
+  $("scan-error").hidden = true;
+  $("scan-btn").disabled = true;
+  $("cancel-btn").hidden = false;
+
+  startPolling();
 });
 
 refreshIndexStats();

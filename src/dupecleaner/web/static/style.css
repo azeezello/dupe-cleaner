@@ -108,6 +108,35 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 #warnings-list { font-size: 0.8rem; color: var(--muted); padding-left: 1.1rem; max-height: 220px; overflow-y: auto; }
 
+/* --- scan mode (Р7) ---
+   The mode switch is the main visible choice on this screen, not a setting
+   tucked away somewhere, so it gets the room to explain itself: a person
+   picking "fast" needs to see that fast means *less looked at*, not
+   *less sure*. */
+.mode-picker { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.85rem 0.35rem; margin: 0.85rem 0 0; }
+.mode-picker legend { font-size: 0.8rem; color: var(--muted); padding: 0 0.3rem; }
+.mode-option { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0 0 0.55rem; cursor: pointer; }
+.mode-option input { margin-top: 0.25rem; flex: none; }
+.mode-title { display: block; font-size: 0.95rem; font-weight: 600; }
+.mode-desc { display: block; font-size: 0.8rem; color: var(--muted); }
+.mode-guarantee { margin: 0.4rem 0 0.5rem; }
+
+.mode-note {
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 0.9rem;
+}
+.mode-note p { margin: 0 0 0.5rem; font-size: 0.875rem; }
+.mode-note button { margin-right: 0.5rem; }
+
+.group-actions { margin-top: 0.35rem; }
+.verify-btn { font-size: 0.78rem; padding: 0.2rem 0.55rem; }
+.verify-result { font-size: 0.8rem; margin-top: 0.3rem; overflow-wrap: anywhere; }
+.verify-result.ok { color: var(--ok); }
+.verify-result.bad { color: var(--danger); }
+.verify-result.pending { color: var(--muted); }
+
 @media (max-width: 480px) {
   body { padding: 1rem; }
   .row { flex-direction: column; }

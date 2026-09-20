@@ -30,6 +30,7 @@ PHASE_LABELS = {
     "quick_hashing": "Этап 2/3: быстрая проверка кандидатов",
     "full_hashing": "Этап 3/3: полное хэширование",
     "grouping": "Формирование групп",
+    "previewing": "Миниатюры для просмотра",
     "done": "Готово",
     "cancelled": "Остановлено",
     "failed": "Ошибка",
@@ -54,6 +55,7 @@ class ScanProgress:
     # Cumulative across the whole run and never reset by a phase change —
     # `phase_files_done` belongs to the current phase, so it can't answer
     # "how much did this run actually have to read?" once the run is over.
+    # Counts hashing work only; see `advance(count_as_hashed=...)`.
     files_hashed: int = 0
     groups_found: int = 0
 
@@ -80,10 +82,29 @@ class ScanProgress:
             self.phase_started_at = time.time()
             self.updated_at = time.time()
 
-    def advance(self, *, files: int = 0, size_bytes: int = 0, current_path: str | None = None) -> None:
+    def advance(
+        self,
+        *,
+        files: int = 0,
+        size_bytes: int = 0,
+        current_path: str | None = None,
+        count_as_hashed: bool = True,
+    ) -> None:
+        """Move the current phase forward.
+
+        `count_as_hashed=False` advances the phase without touching
+        `files_hashed`, which answers a narrower question than "how many
+        files did this phase process": it answers "how much did this run
+        have to *re-read for hashing*", and that is the number proving the
+        cache did its job on a resumed or upgraded scan. The preview phase
+        reads files too, but hashing is not what it does, and counting its
+        work there would make a fully cached re-run look like it re-hashed
+        things.
+        """
         with self._lock:
             self.phase_files_done += files
-            self.files_hashed += files
+            if count_as_hashed:
+                self.files_hashed += files
             self.phase_bytes_done += size_bytes
             if current_path is not None:
                 self.current_path = current_path
