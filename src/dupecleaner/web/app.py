@@ -111,12 +111,42 @@ def scan_result(scan_id: str):
     by_mode = [
         a for a in job.report.skipped_archives if a.reason == "excluded_by_mode"
     ]
-    return {
+    payload = {
         "scan_id": scan_id,
         "skipped_by_mode_count": len(by_mode),
         "skipped_by_mode_bytes": sum(a.size for a in by_mode),
         **job.report.to_dict(),
     }
+    _attach_quality(payload["groups"])
+    return payload
+
+
+def _attach_quality(groups: list[dict]) -> None:
+    """Hang each group's quality metrics (task 9) off its entry, in place.
+
+    Done here rather than in `ScanReport.to_dict` because the report is a
+    pure in-memory object that travels to `report.json` and back, while the
+    metrics live in the index — and the index is precisely where they need
+    to live, because they outlive any one report (Р6) and are keyed by
+    content, not by scan.
+
+    One object per *group*, not per record: every copy in a group is
+    byte-identical, so they share one measurement, exactly as they share one
+    thumbnail. That keeps the cost of this against pilot finding P2.9 (the
+    whole report is one 10.4 MB response) proportional to groups rather than
+    files — on the real 8814-group report, a few hundred kilobytes.
+
+    A group with no metrics simply has `quality: null`: quick-mode runs
+    never measured anything, non-photo groups have nothing to measure, and
+    a photo that would not decode honestly has no numbers. None of those is
+    a zero.
+    """
+    if not groups:
+        return
+    with ScanIndex(DB_PATH) as index:
+        quality = index.quality_for_hashes(g["content_hash"] for g in groups)
+    for group in groups:
+        group["quality"] = quality.get(group["content_hash"])
 
 
 @app.post("/api/scan/{scan_id}/upgrade")
@@ -218,11 +248,14 @@ def thumbnail(path: str, content_hash: Optional[str] = Query(default=None, alias
         if not file_path.is_file():
             raise HTTPException(404, "Файл не найден.")
         try:
-            data, width, height = thumbnails.generate(file_path)
+            preview = thumbnails.generate(file_path)
         except Exception as exc:  # noqa: BLE001 - not every "image" opens cleanly
             raise HTTPException(415, f"Не удалось построить превью: {exc}") from exc
 
         if resolved_hash:
-            thumbnails.store(index, resolved_hash, data, width, height)
+            # Stores the quality metrics from this same decode too, so a
+            # photo first seen through this fallback is as measured as one
+            # the scan reached (thumbnails.store).
+            thumbnails.store(index, resolved_hash, preview)
 
-        return StreamingResponse(io.BytesIO(data), media_type="image/jpeg")
+        return StreamingResponse(io.BytesIO(preview.data), media_type="image/jpeg")

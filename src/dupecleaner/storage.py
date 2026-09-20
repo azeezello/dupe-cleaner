@@ -28,11 +28,17 @@ import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 from .models import DuplicateGroup, FileRecord, MediaKind
 
-SCHEMA_VERSION = 2
+if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
+    # Only needed for annotations. Importing it for real would pull Pillow
+    # into every process that merely opens the index — the CLI's `index
+    # --stats`, a quarantine run reading a saved report — for a type name.
+    from .quality import QualityMetrics
+
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -73,20 +79,58 @@ CREATE INDEX IF NOT EXISTS idx_files_quick_hash ON files(last_scan_id, size, qui
 # v2 adds `content_previews`: one row per unique file *content* (keyed by
 # full_hash, the same content hash duplicate grouping already computes —
 # see thumbnails.py for why that key was chosen over a path or a weaker
-# hash). It holds the thumbnail's size/dimensions now, and is exactly where
-# task 9's quality metrics (resolution is already here; sharpness and
-# recompression columns are pre-created below, NULL until task 9 fills
-# them in) land without another migration or touching `files` at all.
-_MIGRATIONS: dict[int, str] = {
+# hash). It holds the thumbnail's size and dimensions, and pre-created the
+# `sharpness_score`/`recompression_score` columns task 9 fills in. Its
+# comment claimed resolution was "already here" in `width`/`height`; it was
+# not — those are the *thumbnail's* dimensions — so v3 adds the source
+# resolution rather than quietly redefining them.
+# v3 adds the rest of task 9's quality metrics next to the two columns v2
+# pre-created for them. Four columns, each earning its place:
+#
+# - `source_width`/`source_height` — the *source* photo's resolution. Not a
+#   re-reading of `width`/`height`, which hold the thumbnail's size and
+#   always did: re-interpreting those would have turned every preview
+#   already in the index into a claim that the photo is 240 px wide.
+# - `jpeg_quality` — the quality factor recovered from the file's own
+#   quantization tables. Kept rather than folded into the score because it
+#   is the one number a person can act on ("saved at ~62"), and UX-BRIEF's
+#   first principle is to show the evidence rather than assert a verdict.
+# - `recompression_basis` — which of the three derivations produced
+#   `recompression_score`. Scores from different bases are not comparable
+#   (quality.py says why), so whatever ranks copies in task 17 has to be
+#   able to read this, not guess it from `jpeg_quality IS NULL`.
+#
+# Written as a Python step rather than a SQL script because SQLite has no
+# `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the invariant above —
+# every migration safe to re-run — is what makes a crash between the
+# migration and the version bump recoverable.
+def _migrate_v3_quality_metrics(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(content_previews)")
+    }
+    for column, declaration in (
+        ("source_width", "INTEGER"),
+        ("source_height", "INTEGER"),
+        ("jpeg_quality", "INTEGER"),
+        ("recompression_basis", "TEXT"),
+    ):
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE content_previews ADD COLUMN {column} {declaration}"
+            )
+
+
+_MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     2: """
     CREATE TABLE IF NOT EXISTS content_previews (
         content_hash         TEXT PRIMARY KEY,
         thumbnail_bytes      INTEGER NOT NULL,
         width                INTEGER,
         height               INTEGER,
-        -- Task 9 (quality metrics): resolution is width/height above;
-        -- these two are left NULL until that task computes them, so it
-        -- only has to start writing, not migrate anything.
+        -- Task 9 (quality metrics). Left NULL by task 8 so task 9 only
+        -- had to start writing. Note `width`/`height` above are the
+        -- thumbnail's, not the photo's: the source resolution arrives in
+        -- v3 as source_width/source_height.
         sharpness_score      REAL,
         recompression_score  REAL,
         created_at           REAL NOT NULL,
@@ -95,6 +139,7 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS idx_content_previews_accessed
         ON content_previews(accessed_at);
     """,
+    3: _migrate_v3_quality_metrics,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -128,7 +173,11 @@ class ScanIndex:
         ).fetchone()
         current_version = int(row["value"]) if row else 0
         for version in sorted(v for v in _MIGRATIONS if v > current_version):
-            self._conn.executescript(_MIGRATIONS[version])
+            migration = _MIGRATIONS[version]
+            if callable(migration):
+                migration(self._conn)
+            else:
+                self._conn.executescript(migration)
             current_version = version
 
         self._conn.execute(
@@ -362,7 +411,16 @@ class ScanIndex:
         thumbnail_bytes: int,
         width: int | None,
         height: int | None,
+        metrics: "QualityMetrics | None" = None,
     ) -> None:
+        """Record a cached thumbnail, and — when the same decode produced
+        them — the quality metrics that belong to the same content.
+
+        The conflict clause deliberately leaves the metric columns alone:
+        they are written by `set_quality_metrics` below, called right after,
+        so a thumbnail rewrite can never blank out metrics that are already
+        there.
+        """
         now = time.time()
         self._conn.execute(
             """
@@ -377,6 +435,91 @@ class ScanIndex:
             """,
             (content_hash, thumbnail_bytes, width, height, now, now),
         )
+        if metrics is not None:
+            self.set_quality_metrics(content_hash, metrics)
+
+    def set_quality_metrics(self, content_hash: str, metrics: "QualityMetrics") -> None:
+        """Write the task-9 metrics for one content hash.
+
+        Separate from `upsert_thumbnail` because the two are not always
+        written together: an index built before task 9 has thumbnails
+        without metrics, and backfilling those must not rewrite the JPEG or
+        disturb its LRU position (see `thumbnails.maybe_generate`).
+
+        Does nothing if the row does not exist — metrics describe a cached
+        preview, and a metrics row with no preview would be invisible to
+        eviction and never reclaimed.
+        """
+        self._conn.execute(
+            """
+            UPDATE content_previews
+               SET source_width        = ?,
+                   source_height       = ?,
+                   sharpness_score     = ?,
+                   recompression_score = ?,
+                   recompression_basis = ?,
+                   jpeg_quality        = ?
+             WHERE content_hash = ?
+            """,
+            (
+                metrics.source_width,
+                metrics.source_height,
+                metrics.sharpness,
+                metrics.recompression,
+                metrics.recompression_basis,
+                metrics.jpeg_quality,
+                content_hash,
+            ),
+        )
+
+    def quality_for_hashes(self, content_hashes: Iterable[str]) -> dict[str, dict]:
+        """Metrics for many content hashes at once, keyed by hash.
+
+        Batched on purpose: the review screen asks about every group it is
+        about to draw, and the real report has 8814 of them (task 4). One
+        query per group would be 8814 round trips to answer a question the
+        index can answer in one.
+
+        Hashes with no metrics are simply absent from the result — a photo
+        that would not decode, a group of non-photo files, or a preview
+        cached before task 9 and not yet revisited. The caller shows the
+        group without the numbers rather than inventing zeroes for it;
+        UX-BRIEF's "честность в цифрах" applies to this exactly as much as
+        to scan progress.
+        """
+        wanted = list(dict.fromkeys(content_hashes))
+        if not wanted:
+            return {}
+
+        out: dict[str, dict] = {}
+        # SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; chunk rather
+        # than assume the modern 32766.
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self._conn.execute(
+                f"""
+                SELECT content_hash, width, height, source_width, source_height,
+                       sharpness_score, recompression_score, recompression_basis,
+                       jpeg_quality
+                  FROM content_previews
+                 WHERE content_hash IN ({placeholders})
+                   AND recompression_basis IS NOT NULL
+                """,
+                chunk,
+            )
+            for row in cursor:
+                out[row["content_hash"]] = _row_to_quality_dict(row)
+        return out
+
+    def count_quality_metrics(self) -> int:
+        """How many cached previews carry metrics. The number that shows a
+        re-run actually backfilled an index built before task 9."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM content_previews "
+            "WHERE recompression_basis IS NOT NULL"
+        ).fetchone()
+        return int(row["n"])
 
     def touch_thumbnail(self, content_hash: str) -> None:
         """Bump the access time used for LRU eviction. Called every time a
@@ -450,6 +593,42 @@ class ScanIndex:
             self._conn.executemany("DELETE FROM files WHERE display_path = ?", gone)
             self._conn.commit()
         return len(gone)
+
+
+def _row_to_quality_dict(row: sqlite3.Row) -> dict:
+    """Shape one `content_previews` row for the web layer.
+
+    `megapixels` is derived here rather than stored: it is the form a
+    person reads ("12.2 МП"), while the pixel counts are the form a
+    comparison needs, and deriving is cheaper than keeping two columns
+    honest about each other.
+    """
+    source_width = row["source_width"]
+    source_height = row["source_height"]
+    megapixels = (
+        round(source_width * source_height / 1_000_000, 2)
+        if source_width and source_height
+        else None
+    )
+    return {
+        "source_width": source_width,
+        "source_height": source_height,
+        "megapixels": megapixels,
+        "sharpness": (
+            round(row["sharpness_score"], 2)
+            if row["sharpness_score"] is not None
+            else None
+        ),
+        "recompression": (
+            round(row["recompression_score"], 3)
+            if row["recompression_score"] is not None
+            else None
+        ),
+        "recompression_basis": row["recompression_basis"],
+        "jpeg_quality": row["jpeg_quality"],
+        "thumbnail_width": row["width"],
+        "thumbnail_height": row["height"],
+    }
 
 
 def _row_to_record(row: sqlite3.Row) -> FileRecord:

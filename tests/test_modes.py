@@ -366,6 +366,62 @@ def test_quick_mode_builds_no_previews_and_the_upgrade_fills_them_in(
     assert meta is not None  # ...yet the preview is now there
 
 
+def test_quality_metrics_follow_the_same_rule_as_previews(tmp_path: Path):
+    """Task 9's metrics are part of «Полная обработка» by Р7, and they ride
+    on the preview's decode — so they must appear and disappear with it,
+    not on some second rule of their own.
+    """
+    root = tmp_path / "photos"
+    root.mkdir()
+    _write_jpeg(root / "shot.jpg", (120, 180, 60))
+    (root / "copy.jpg").write_bytes((root / "shot.jpg").read_bytes())
+
+    db = tmp_path / "index.db"
+    quick = _run(root, db, ScanMode.QUICK)
+    content_hash = quick.report.groups[0].content_hash
+    with ScanIndex(db) as index:
+        assert index.quality_for_hashes([content_hash]) == {}
+
+    upgrade = _run(root, db, ScanMode.FULL)
+    assert upgrade.progress.files_hashed == 0  # still nothing re-hashed
+    with ScanIndex(db) as index:
+        measured = index.quality_for_hashes([content_hash])
+    assert content_hash in measured
+    assert measured[content_hash]["source_width"] > 0
+    assert measured[content_hash]["recompression_basis"] is not None
+
+
+def test_a_full_scan_backfills_metrics_onto_task_8s_previews(tmp_path: Path):
+    """The upgrade path that has no test above it anywhere else: an index
+    whose previews were cached before task 9 existed. The preview check
+    alone would call those done, and Aziz's real index is entirely made of
+    them.
+    """
+    root = tmp_path / "photos"
+    root.mkdir()
+    _write_jpeg(root / "shot.jpg", (10, 10, 200))
+    (root / "copy.jpg").write_bytes((root / "shot.jpg").read_bytes())
+
+    db = tmp_path / "index.db"
+    first = _run(root, db, ScanMode.FULL)
+    content_hash = first.report.groups[0].content_hash
+
+    with ScanIndex(db) as index:
+        before = index.get_thumbnail_meta(content_hash)["thumbnail_bytes"]
+        index._conn.execute(
+            "UPDATE content_previews SET source_width = NULL, source_height = NULL, "
+            "sharpness_score = NULL, recompression_score = NULL, "
+            "recompression_basis = NULL, jpeg_quality = NULL"
+        )
+        index.commit()
+
+    _run(root, db, ScanMode.FULL)
+
+    with ScanIndex(db) as index:
+        assert content_hash in index.quality_for_hashes([content_hash])
+        assert index.get_thumbnail_meta(content_hash)["thumbnail_bytes"] == before
+
+
 def test_full_scan_from_scratch_builds_previews_too(tmp_path: Path):
     root = tmp_path / "photos"
     root.mkdir()

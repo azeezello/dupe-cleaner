@@ -125,3 +125,50 @@ def test_verify_unknown_group_is_404(client: TestClient, tmp_tree: Path):
     report = _scan(client, tmp_tree)
     response = client.post(f"/api/scan/{report['scan_id']}/group/deadbeef/verify")
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Task 9: the metrics reach the interface without it reopening any file
+# --------------------------------------------------------------------------
+
+
+def test_result_carries_quality_metrics_for_photo_groups(
+    client: TestClient, tmp_path: Path
+):
+    """«доступны интерфейсу без дочитывания файла» — the acceptance line of
+    task 9. One object per group, since every copy in a group is
+    byte-identical and therefore shares one measurement.
+    """
+    from PIL import Image
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    Image.new("RGB", (900, 600), (180, 40, 90)).save(root / "shot.jpg", quality=92)
+    (root / "copy.jpg").write_bytes((root / "shot.jpg").read_bytes())
+
+    result = _scan(client, root, mode="full")
+    group = next(g for g in result["groups"] if len(g["records"]) == 2)
+
+    quality = group["quality"]
+    assert quality is not None
+    assert (quality["source_width"], quality["source_height"]) == (900, 600)
+    assert quality["sharpness"] is not None
+    assert quality["recompression_basis"] == "jpeg_quant_tables"
+    assert quality["jpeg_quality"] == pytest.approx(92, abs=3)
+
+
+def test_quick_mode_result_says_null_rather_than_zero(client: TestClient, tmp_path: Path):
+    """A quick run measured nothing. Reporting a sharpness of 0 for it
+    would be a number the scan never established — UX-BRIEF's «честность в
+    цифрах» applied to metrics instead of progress.
+    """
+    from PIL import Image
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    Image.new("RGB", (640, 480), (20, 160, 200)).save(root / "shot.jpg", quality=88)
+    (root / "copy.jpg").write_bytes((root / "shot.jpg").read_bytes())
+
+    result = _scan(client, root, mode="quick")
+    group = next(g for g in result["groups"] if len(g["records"]) == 2)
+    assert group["quality"] is None

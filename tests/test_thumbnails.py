@@ -19,15 +19,15 @@ def test_generate_produces_a_bounded_jpeg(tmp_path: Path):
     src = tmp_path / "photo.jpg"
     _make_photo(src)
 
-    data, width, height = thumbnails.generate(src)
+    preview = thumbnails.generate(src)
 
-    assert width <= thumbnails.THUMBNAIL_MAX_DIMENSION
-    assert height <= thumbnails.THUMBNAIL_MAX_DIMENSION
-    assert len(data) <= thumbnails.THUMBNAIL_MAX_BYTES_PER_FILE
+    assert preview.width <= thumbnails.THUMBNAIL_MAX_DIMENSION
+    assert preview.height <= thumbnails.THUMBNAIL_MAX_DIMENSION
+    assert len(preview.data) <= thumbnails.THUMBNAIL_MAX_BYTES_PER_FILE
 
-    with Image.open(__import__("io").BytesIO(data)) as decoded:
+    with Image.open(__import__("io").BytesIO(preview.data)) as decoded:
         assert decoded.format == "JPEG"
-        assert decoded.size == (width, height)
+        assert decoded.size == (preview.width, preview.height)
 
 
 def test_generate_raises_on_unreadable_input(tmp_path: Path):
@@ -51,6 +51,10 @@ def test_maybe_generate_is_a_noop_for_an_already_cached_hash(tmp_path: Path):
         thumbnails.maybe_generate(index, "contenthash1", real_photo)
         meta_before = index.get_thumbnail_meta("contenthash1")
         assert meta_before is not None
+        # Both halves of the decode landed, which is what makes the second
+        # call below a true no-op rather than a silent re-measurement (see
+        # maybe_generate: a thumbnail without metrics is unfinished work).
+        assert meta_before["recompression_basis"] is not None
 
         # A path that would raise if actually opened — proves the second
         # call short-circuits on the cache check and never calls generate().
@@ -171,8 +175,66 @@ def test_heic_decodes_when_pillow_heif_is_available(tmp_path: Path):
     except Exception as exc:  # pragma: no cover - depends on libheif build
         pytest.skip(f"pillow-heif build here can't encode HEIF: {exc}")
 
-    data, width, height = thumbnails.generate(heic_path)
-    assert width <= thumbnails.THUMBNAIL_MAX_DIMENSION
-    assert height <= thumbnails.THUMBNAIL_MAX_DIMENSION
-    with Image.open(__import__("io").BytesIO(data)) as decoded:
+    preview = thumbnails.generate(heic_path)
+    assert preview.width <= thumbnails.THUMBNAIL_MAX_DIMENSION
+    assert preview.height <= thumbnails.THUMBNAIL_MAX_DIMENSION
+    with Image.open(__import__("io").BytesIO(preview.data)) as decoded:
         assert decoded.format == "JPEG"
+    # HEIC carries no readable quantization tables, so the recompression
+    # score has to fall back to bits-per-pixel rather than claim a JPEG
+    # quality it cannot know (quality.py).
+    assert preview.metrics is not None
+    assert preview.metrics.source_width == 400
+    assert preview.metrics.jpeg_quality is None
+
+
+def test_metrics_are_backfilled_for_a_preview_cached_before_task_9(tmp_path: Path):
+    """An index written by task 8 holds thumbnails with no metrics beside
+    them. The cheap "already cached?" check would call those done forever —
+    on the only index that matters, the one on Aziz's machine, that is every
+    photo already scanned. So a row with a thumbnail and no metrics counts
+    as work: decode once more, write the numbers, leave the JPEG alone.
+    """
+    db_path = tmp_path / "index.db"
+    with ScanIndex(db_path) as index:
+        photo = tmp_path / "a.jpg"
+        _make_photo(photo, size=(900, 600))
+        thumbnails.maybe_generate(index, "legacy-hash", photo)
+
+        # Rewind this row to exactly what task 8 would have left behind.
+        index._conn.execute(
+            "UPDATE content_previews SET source_width = NULL, source_height = NULL, "
+            "sharpness_score = NULL, recompression_score = NULL, "
+            "recompression_basis = NULL, jpeg_quality = NULL "
+            "WHERE content_hash = ?",
+            ("legacy-hash",),
+        )
+        stale = index.get_thumbnail_meta("legacy-hash")
+        cached_jpeg = thumbnails.get_cached_path(index, "legacy-hash")
+        assert cached_jpeg is not None
+        jpeg_before = cached_jpeg.read_bytes()
+
+        thumbnails.maybe_generate(index, "legacy-hash", photo)
+
+        filled = index.get_thumbnail_meta("legacy-hash")
+        assert filled["recompression_basis"] == "jpeg_quant_tables"
+        assert filled["source_width"] == 900 and filled["source_height"] == 600
+        # The thumbnail itself was neither re-encoded nor re-written: same
+        # bytes, same recorded size. Identical content, identical preview.
+        assert cached_jpeg.read_bytes() == jpeg_before
+        assert filled["thumbnail_bytes"] == stale["thumbnail_bytes"]
+
+
+def test_store_refuses_a_metrics_only_preview(tmp_path: Path):
+    """`generate(encode=False)` exists for the backfill path above and
+    returns no JPEG. Handing that to `store` would write a zero-byte
+    thumbnail over a good one, so it is refused rather than tolerated."""
+    db_path = tmp_path / "index.db"
+    with ScanIndex(db_path) as index:
+        photo = tmp_path / "a.jpg"
+        _make_photo(photo)
+        preview = thumbnails.generate(photo, encode=False)
+        assert preview.data == b""
+        assert preview.metrics is not None
+        with pytest.raises(ValueError):
+            thumbnails.store(index, "hash-y", preview)

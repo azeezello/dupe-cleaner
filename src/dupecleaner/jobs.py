@@ -263,7 +263,19 @@ class ScanJob:
         )
 
     def _preview_phase(self, index: ScanIndex, groups: list[DuplicateGroup]) -> None:
-        """Make sure every photo group in a full run has a cached preview.
+        """Make sure every photo group in a full run has a cached preview
+        and the quality metrics of task 9.
+
+        The two are one job, not two phases: both come out of a single
+        decode of the photo (`thumbnails.generate`), and the decode is the
+        entire cost. Adding a second pass for the metrics would have been
+        the only expensive thing in this task.
+
+        This is also where an index built before task 9 gets caught up.
+        Those rows have thumbnails and no metrics, so the previews look
+        cached and nothing would ever measure them;
+        `thumbnails.maybe_generate` treats "thumbnail but no metrics" as
+        work to do, decodes once more and writes only the numbers.
 
         On a fresh full scan this phase does almost nothing: `run_full_stage`
         already cached a preview for each of these hashes on the way past,
@@ -288,9 +300,9 @@ class ScanJob:
         if not self.mode.generate_previews:
             return
 
-        # One preview per group: every record in a group holds identical
-        # bytes, and the cache is keyed by content hash, so the first
-        # readable photo answers for all of them.
+        # One preview and one measurement per group: every record in a
+        # group holds identical bytes, and both are keyed by content hash,
+        # so the first readable photo answers for all of them.
         targets: list[tuple[str, FileRecord]] = []
         for group in groups:
             for record in group.records:

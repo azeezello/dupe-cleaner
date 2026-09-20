@@ -206,6 +206,80 @@ def test_reopening_an_already_migrated_database_is_a_noop(tmp_path: Path):
         assert index.get_thumbnail_meta("h2") is not None
 
 
+def _create_v2_database(db_path: Path) -> None:
+    """A database as task 8 left it: `content_previews` exists with the two
+    pre-created metric columns, but none of task 9's four. Stands in for
+    Aziz's real ~/.dupecleaner/index.db, which is in exactly this shape.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE content_previews (
+            content_hash         TEXT PRIMARY KEY,
+            thumbnail_bytes      INTEGER NOT NULL,
+            width                INTEGER,
+            height               INTEGER,
+            sharpness_score      REAL,
+            recompression_score  REAL,
+            created_at           REAL NOT NULL,
+            accessed_at          REAL NOT NULL
+        );
+        """
+    )
+    conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '2')")
+    conn.execute(
+        "INSERT INTO content_previews (content_hash, thumbnail_bytes, width, "
+        "height, created_at, accessed_at) VALUES ('oldhash', 4096, 240, 180, 1.0, 2.0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_opening_a_v2_database_adds_the_quality_columns_in_place(tmp_path: Path):
+    from dupecleaner.storage import SCHEMA_VERSION
+
+    db_path = tmp_path / "v2.db"
+    _create_v2_database(db_path)
+
+    with ScanIndex(db_path) as index:
+        version = index._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+
+        meta = index.get_thumbnail_meta("oldhash")
+        # The cached thumbnail is untouched — the migration adds columns,
+        # it does not re-measure anything. Backfilling is a scan's job
+        # (thumbnails.maybe_generate), not an open's.
+        assert meta["thumbnail_bytes"] == 4096
+        assert meta["width"] == 240 and meta["height"] == 180
+        assert meta["source_width"] is None
+        assert meta["recompression_basis"] is None
+        # ...and it is therefore not yet reported as measured.
+        assert index.quality_for_hashes(["oldhash"]) == {}
+        assert index.count_quality_metrics() == 0
+
+
+def test_the_v3_migration_is_safe_to_run_again(tmp_path: Path):
+    """SQLite has no `ADD COLUMN IF NOT EXISTS`, so v3 is a Python step
+    that checks first. If it ever stopped checking, a crash between the
+    ALTER and the version bump would leave a database that can never be
+    opened again — which is the failure the whole migration mechanism
+    exists to avoid.
+    """
+    from dupecleaner.storage import _migrate_v3_quality_metrics
+
+    db_path = tmp_path / "v2.db"
+    _create_v2_database(db_path)
+    with ScanIndex(db_path) as index:
+        _migrate_v3_quality_metrics(index._conn)  # already applied on open
+        _migrate_v3_quality_metrics(index._conn)  # and again, for good measure
+        assert index.get_thumbnail_meta("oldhash")["source_width"] is None
+
+
 # --- content_previews CRUD ---------------------------------------------------
 
 

@@ -82,9 +82,11 @@ import io
 import logging
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, UnidentifiedImageError
 
+from . import quality
 from .storage import ScanIndex
 
 logger = logging.getLogger(__name__)
@@ -149,20 +151,54 @@ def _encode_bounded(img: Image.Image) -> bytes:
         quality -= 15
 
 
-def generate(source_path: Path) -> tuple[bytes, int, int]:
-    """Decode `source_path` and produce a bounded JPEG thumbnail.
+class Preview(NamedTuple):
+    """One decode's output: the thumbnail to show, and what that same
+    decode was able to say about the photo's quality.
 
-    Returns `(jpeg_bytes, width, height)` — width/height are the
-    *thumbnail's* dimensions (post-resize), stored for the UI's benefit and
-    as the "resolution" half of task 9's quality metrics is expected to
-    want the source's, but that's a task-9 concern; this task only needs
-    something to show.
+    `width`/`height` are the *thumbnail's* dimensions, as they always were
+    — the source image's resolution lives in `metrics.source_width/height`
+    and is deliberately not folded into these (see quality.py for why
+    re-interpreting the old columns would have been wrong).
+
+    `data` is empty when the thumbnail was not asked for (`encode=False`,
+    the metrics-backfill path below); `store` refuses such a Preview.
+    """
+
+    data: bytes
+    width: int
+    height: int
+    metrics: quality.QualityMetrics | None
+
+
+def generate(source_path: Path, *, encode: bool = True) -> Preview:
+    """Decode `source_path` once and produce a bounded JPEG thumbnail plus
+    the quality metrics of task 9.
+
+    The two come out of the *same* decode on purpose. Decoding a 12 MP
+    photo is the whole cost of this area — task 8 measured 54-90 ms for it
+    against sub-millisecond bookkeeping — so a separate metrics pass would
+    have roughly doubled the one phase that was already the slowest thing
+    a full scan does beyond hashing. Measuring while the pixels are in
+    memory makes task 9 nearly free; the measurement of exactly how free is
+    in plan.md under task 9.
+
+    `encode=False` skips only the JPEG encoding step, for the one caller
+    that has a cached thumbnail already but no metrics beside it (an index
+    written before this task existed). The decode still happens — it has
+    to, the numbers come from pixels — but nothing is re-encoded or
+    rewritten.
 
     Raises `OSError`/`UnidentifiedImageError`/`ValueError` on anything
     Pillow can't open — callers treat that exactly like any other
     unreadable file (log and move on), never let it fail a scan.
     """
+    file_bytes = Path(source_path).stat().st_size
     with Image.open(source_path) as img:
+        # Read before draft(): draft() rewrites img.size to the reduced
+        # decode size, and the source's true resolution is one of the three
+        # metrics. Free — this comes from the header, not the pixels.
+        source_size = img.size
+        image_format = img.format
         # For JPEG (the vast majority of real photos — ~96% in sampled
         # passes over D:\Photos, see decisions.md Р9 for the measurement),
         # this asks libjpeg to decode directly at a reduced resolution from
@@ -176,24 +212,46 @@ def generate(source_path: Path) -> tuple[bytes, int, int]:
         # doesn't implement it; HEIC stays ~520-540 ms regardless.
         img.draft("RGB", (THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION))
         img.load()
+        # The compressor's own settings, written into the JPEG itself —
+        # the strongest evidence available for "how hard was this
+        # squeezed" (quality.py). Absent for every other format.
+        quantization = getattr(img, "quantization", None) or None
         img.thumbnail((THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION))
-        data = _encode_bounded(img)
-        return data, img.width, img.height
+        metrics = quality.measure(
+            img,
+            source_size=source_size,
+            image_format=image_format,
+            quantization=quantization,
+            file_bytes=file_bytes,
+        )
+        data = _encode_bounded(img) if encode else b""
+        return Preview(data, img.width, img.height, metrics)
 
 
-def store(index: ScanIndex, content_hash: str, data: bytes, width: int | None, height: int | None) -> None:
+def store(index: ScanIndex, content_hash: str, preview: Preview) -> None:
     """Write already-encoded thumbnail bytes into the cache and record
-    their metadata. Shared by `maybe_generate` (the scan-time path) and the
-    web layer's on-the-fly fallback, so both go through the same eviction
-    bookkeeping."""
+    their metadata, including the quality metrics that came out of the same
+    decode. Shared by `maybe_generate` (the scan-time path) and the web
+    layer's on-the-fly fallback, so both go through the same eviction
+    bookkeeping and both leave metrics behind."""
+    if not preview.data:
+        raise ValueError("store() needs an encoded thumbnail; "
+                         "use index.set_quality_metrics for a metrics-only write")
+
     cache_dir = cache_dir_for(index.db_path)
     dest = _thumbnail_path(cache_dir, content_hash)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.parent / f".{content_hash}.{uuid.uuid4().hex}.tmp"
-    tmp.write_bytes(data)
+    tmp.write_bytes(preview.data)
     tmp.replace(dest)  # atomic rename on both POSIX and Windows/NTFS
 
-    index.upsert_thumbnail(content_hash, len(data), width, height)
+    index.upsert_thumbnail(
+        content_hash,
+        len(preview.data),
+        preview.width,
+        preview.height,
+        metrics=preview.metrics,
+    )
     _evict_if_needed(index, cache_dir)
 
 
@@ -205,20 +263,39 @@ def maybe_generate(index: ScanIndex, content_hash: str, source_path: Path) -> No
     already has a preview waiting — the review grid never decodes on
     request.
 
+    Since task 9 it also fills in the quality metrics, from the same decode
+    (see `generate`). That makes the "already cached" test two questions
+    rather than one: an index written by task 8 holds thumbnails with no
+    metrics beside them, and the cheap check that used to mean "nothing to
+    do here" would have meant "those photos never get measured" — on Aziz's
+    own index, the only one that matters, that is every photo he has
+    already scanned. So a row that has a thumbnail but no metrics is
+    decoded again, once, and only the metrics are written.
+
     Best-effort: a broken/unreadable image never raises out of here — one
     bad photo must not stop the scan, matching how jobs.py already treats
     a hashing failure (turn it into a warning, keep going).
     """
-    if index.get_thumbnail_meta(content_hash) is not None:
-        return  # an earlier copy in this group (or an earlier scan) already cached it
+    meta = index.get_thumbnail_meta(content_hash)
+    if meta is not None and meta["recompression_basis"] is not None:
+        # an earlier copy in this group (or an earlier scan) already cached
+        # both halves — the no-op that proves the content hash is a
+        # sufficient key, see test_thumbnails.py
+        return
 
     try:
-        data, width, height = generate(source_path)
+        preview = generate(source_path, encode=meta is None)
     except (OSError, UnidentifiedImageError, ValueError) as exc:
         logger.debug("Не удалось построить миниатюру для %s: %s", source_path, exc)
         return
 
-    store(index, content_hash, data, width, height)
+    if meta is None:
+        store(index, content_hash, preview)
+    elif preview.metrics is not None:
+        # Thumbnail bytes are already on disk and unchanged (same content
+        # hash, therefore the same image) — rewriting them would be pure
+        # churn, and would reset accessed_at for no reason.
+        index.set_quality_metrics(content_hash, preview.metrics)
 
 
 def get_cached_path(index: ScanIndex, content_hash: str) -> Path | None:

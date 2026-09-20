@@ -36,10 +36,11 @@ class ScanMode(str, Enum):
       UNREAD, so it can never grant permission to move one. That is
       enforced explicitly in `quarantine.quarantine_archives` rather than
       left to fall out of the mechanism.
-    - **No previews, and later no quality metrics.** Those cost a whole
-      image decode per unique content hash — measured at roughly 4.5–9
-      minutes over the pilot's 6000 groups (задача 8) — for something only
-      the review screen needs.
+    - **No previews and no quality metrics.** Both come out of one image
+      decode per unique content hash — measured at roughly 4.5–9 minutes
+      over the pilot's 6000 groups (задача 8; задача 9 added the metrics
+      to that same decode for a few percent more) — for something only the
+      review screen needs.
 
     Neither omission touches how a duplicate is established, which is the
     whole point of the split.

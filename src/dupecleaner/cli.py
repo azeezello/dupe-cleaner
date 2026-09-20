@@ -11,7 +11,7 @@ from pathlib import Path
 from .archive_classify import classify_archives
 from .dedupe import verify_group
 from .jobs import ScanJob
-from .models import ArchiveClass, ScanMode, ScanReport
+from .models import ArchiveClass, MediaKind, ScanMode, ScanReport
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
@@ -82,8 +82,9 @@ def _mode_banner(job: ScanJob) -> str:
         return (
             "Режим: быстрый — точные дубликаты среди обычных файлов "
             "(размер → быстрый хэш → полный хэш). Внутрь архивов не "
-            "заглядываем, превью не строим. В карантин, как и в полном "
-            "режиме, уходит только подтверждённое байт-в-байт."
+            "заглядываем, превью и метрики качества не считаем. В карантин, "
+            "как и в полном режиме, уходит только подтверждённое "
+            "байт-в-байт."
         )
     if not job.include_archives:
         return (
@@ -91,8 +92,9 @@ def _mode_banner(job: ScanJob) -> str:
             "как непроверенные."
         )
     return (
-        "Режим: полный — то же самое плюс содержимое архивов (Р1) и превью "
-        "для просмотра."
+        "Режим: полный — то же самое плюс содержимое архивов (Р1), превью "
+        "для просмотра и метрики качества (Р2: считаются и показываются, "
+        "на выбор копий не влияют)."
     )
 
 
@@ -181,6 +183,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     # line above in four different words.
     if report.mode is ScanMode.FULL:
         _print_archive_verdicts(report)
+        _print_quality_metrics(report, args.db)
     if report.warnings:
         print(f"Предупреждений: {len(report.warnings)} (см. отчёт)")
     print(f"Отчёт сохранён в {args.report}")
@@ -191,6 +194,32 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             "архивы и недостающие превью."
         )
     return 0
+
+
+def _print_quality_metrics(report: ScanReport, db_path: str) -> None:
+    """One line on the task-9 metrics: how many of this run's photo groups
+    have them.
+
+    Worth printing even though nothing consumes the numbers yet (Р2 forbids
+    them from doing anything on their own until task 17 ranks near-duplicate
+    copies). The line is what tells you whether re-running a full scan over
+    an index built before task 9 actually backfilled it, which is the one
+    thing about this that can silently not happen.
+    """
+    photo_groups = [
+        g for g in report.groups
+        if any(r.media_kind is MediaKind.PHOTO and not r.is_archive_member
+               for r in g.records)
+    ]
+    if not photo_groups:
+        return
+    with ScanIndex(db_path) as index:
+        measured = len(index.quality_for_hashes(g.content_hash for g in photo_groups))
+    print(
+        f"Метрики качества: {measured} из {len(photo_groups)} фото-групп "
+        "(разрешение, резкость, признаки пережатия — в индексе, на выбор "
+        "копий пока не влияют)"
+    )
 
 
 _VERDICT_LABEL = {
@@ -441,8 +470,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[ScanMode.QUICK.value, ScanMode.FULL.value],
         default=ScanMode.QUICK.value,
         help="quick (по умолчанию) — точные дубликаты среди обычных файлов, без "
-        "архивов и без превью; full — то же плюс содержимое архивов (Р1) и "
-        "превью. Разница только в охвате: в карантин в обоих режимах уходит "
+        "архивов, без превью и без метрик качества; full — то же плюс "
+        "содержимое архивов (Р1), превью и метрики. Разница только в "
+        "охвате: в карантин в обоих режимах уходит "
         "только подтверждённое байт-в-байт.",
     )
     scan_p.add_argument(
