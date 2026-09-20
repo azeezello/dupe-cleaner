@@ -232,7 +232,7 @@ def test_thumbnail_metadata_roundtrip(tmp_path: Path):
         assert index.total_thumbnail_bytes() == 0
 
 
-def test_lru_thumbnail_hashes_orders_oldest_first(tmp_path: Path):
+def test_lru_thumbnail_hashes_orders_oldest_first(tmp_path: Path, monkeypatch):
     import dupecleaner.storage as storage_module
 
     fake_now = [0.0]
@@ -242,16 +242,36 @@ def test_lru_thumbnail_hashes_orders_oldest_first(tmp_path: Path):
         return fake_now[0]
 
     with ScanIndex(tmp_path / "index.db") as index:
-        storage_module.time.time = fake_time
-        try:
-            index.upsert_thumbnail("first", 10, 1, 1)
-            index.upsert_thumbnail("second", 10, 1, 1)
-            index.upsert_thumbnail("third", 10, 1, 1)
-            index.touch_thumbnail("first")  # now newest
-        finally:
-            storage_module.time.time = __import__("time").time
+        # `storage_module.time` is the real `time` module, so this patches a
+        # clock the whole process shares. It has to be undone by monkeypatch
+        # rather than by hand: the obvious manual restore —
+        # `storage_module.time.time = __import__("time").time` — looks up
+        # the attribute *after* it has been replaced and therefore reassigns
+        # the fake over itself, leaving `time.time()` returning single-digit
+        # values for every test that runs afterwards. That went unnoticed
+        # until a later test tried to build a zip and hit "ZIP does not
+        # support timestamps before 1980".
+        monkeypatch.setattr(storage_module.time, "time", fake_time)
+
+        index.upsert_thumbnail("first", 10, 1, 1)
+        index.upsert_thumbnail("second", 10, 1, 1)
+        index.upsert_thumbnail("third", 10, 1, 1)
+        index.touch_thumbnail("first")  # now newest
 
         assert index.lru_thumbnail_hashes(2) == ["second", "third"]
+
+
+def test_the_fake_clock_from_the_lru_test_does_not_leak(tmp_path: Path):
+    """Guards the fix above rather than any production code.
+
+    A leaked clock does not fail the test that leaks it — it fails
+    something unrelated, later, in a way that reads as a bug in whatever
+    ran next. Pinning it here means the next person to reach for a fake
+    clock finds out immediately.
+    """
+    import time as real_time
+
+    assert real_time.time() > 1_600_000_000
 
 
 def test_resolve_content_hash_matches_either_path_form(tmp_path: Path):
