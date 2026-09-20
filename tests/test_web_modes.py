@@ -172,3 +172,38 @@ def test_quick_mode_result_says_null_rather_than_zero(client: TestClient, tmp_pa
     result = _scan(client, root, mode="quick")
     group = next(g for g in result["groups"] if len(g["records"]) == 2)
     assert group["quality"] is None
+
+
+# --------------------------------------------------------------------------
+# Task 11 / pilot finding P2.9: the report is one JSON response with no
+# pagination. Gzip is the explicit, cheap mitigation (see app.py) -- this
+# proves it actually engages on a report large enough to matter, not just
+# that the middleware line exists.
+# --------------------------------------------------------------------------
+
+
+def test_large_result_is_gzip_compressed(client: TestClient, tmp_path: Path):
+    """A report with enough groups crosses GZipMiddleware's minimum_size and
+    comes back compressed. `httpx`'s TestClient decodes the body for us, so
+    what this actually checks is the `Content-Encoding` header the server
+    set -- the proof the bytes went over compressed, not the (already
+    trivially true) fact that decoded JSON round-trips.
+    """
+    root = tmp_path / "many"
+    root.mkdir()
+    for i in range(80):
+        content = f"duplicate payload number {i} ".encode() * 20
+        (root / f"file_{i}_a.txt").write_bytes(content)
+        (root / f"file_{i}_b_copy.txt").write_bytes(content)
+
+    scan_id = client.post("/api/scan", json={"paths": [str(root)], "mode": "full"}).json()["scan_id"]
+    _finish(scan_id)
+
+    response = client.get(
+        f"/api/scan/{scan_id}/result",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "gzip"
+    body = response.json()
+    assert len(body["groups"]) == 80

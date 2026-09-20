@@ -1,16 +1,21 @@
 :root {
   color-scheme: light dark;
   --border: color-mix(in srgb, currentColor 18%, transparent);
+  --border-soft: color-mix(in srgb, currentColor 10%, transparent);
   --muted: color-mix(in srgb, currentColor 60%, transparent);
+  --surface-sunken: color-mix(in srgb, currentColor 4%, transparent);
+  --surface-elev: color-mix(in srgb, currentColor 7%, transparent);
   --accent: #2f6fd0;
   --warn: #d9822b;
   --danger: #c0392b;
   --ok: #2b8a3e;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --warn-soft: color-mix(in srgb, var(--warn) 16%, transparent);
 }
 
 body {
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  max-width: 940px;
+  max-width: 960px;
   margin: 0 auto;
   padding: 1.5rem;
   line-height: 1.5;
@@ -93,18 +98,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .error { color: var(--danger); font-size: 0.875rem; }
 
 /* --- results --- */
-.summary { margin-bottom: 0.85rem; font-size: 0.95rem; }
-.group-block { border-top: 1px solid var(--border); padding: 0.6rem 0; }
-.group-block summary { cursor: pointer; }
-.media-block summary h3 { color: var(--warn); }
-.dup-group { border-top: 1px solid var(--border); padding: 0.55rem 0; }
-.dup-group:first-child { border-top: none; }
-.dup-records { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.4rem 0; }
-.dup-record { font-size: 0.8rem; max-width: 210px; overflow-wrap: anywhere; }
-.dup-record img { max-width: 120px; max-height: 120px; display: block; border-radius: 4px; margin-bottom: 0.2rem; }
+.summary { margin-bottom: 0.6rem; font-size: 0.95rem; }
 .keeper-badge { color: var(--ok); font-weight: 600; }
-.quarantine-controls { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.85rem; }
-.quarantine-controls button { margin-top: 0.5rem; }
 
 #warnings-list { font-size: 0.8rem; color: var(--muted); padding-left: 1.1rem; max-height: 220px; overflow-y: auto; }
 
@@ -125,17 +120,119 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   border: 1px solid var(--warn);
   border-radius: 8px;
   padding: 0.6rem 0.85rem;
-  margin-bottom: 0.9rem;
+  margin-bottom: 0.7rem;
 }
 .mode-note p { margin: 0 0 0.5rem; font-size: 0.875rem; }
 .mode-note button { margin-right: 0.5rem; }
 
-.group-actions { margin-top: 0.35rem; }
+.group-actions { margin-top: 0.5rem; }
 .verify-btn { font-size: 0.78rem; padding: 0.2rem 0.55rem; }
 .verify-result { font-size: 0.8rem; margin-top: 0.3rem; overflow-wrap: anywhere; }
 .verify-result.ok { color: var(--ok); }
 .verify-result.bad { color: var(--danger); }
 .verify-result.pending { color: var(--muted); }
+
+/* ============================================================
+   Task 11: type tabs + virtualized group grid.
+
+   Tabs replace the old three always-open <details> blocks: with three
+   accordions all open at once (the previous behaviour) nothing was
+   actually collapsed on an 8814-group report, so the "collapsible"
+   affordance cost UI complexity without buying anything. A tab keeps
+   exactly one grid mounted and hands its whole vertical space to it
+   instead (see docs/design-decisions.md and docs/UX-MOCKUPS.html,
+   screen 2).
+   ============================================================ */
+.type-tabs {
+  display: flex; gap: 0.3rem; flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  margin: 0.7rem 0 0.7rem;
+}
+.type-tab {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); padding: 0.5rem 0.2rem; margin-right: 0.6rem;
+  font-size: 0.88rem; cursor: pointer;
+}
+.type-tab.active { color: inherit; border-bottom-color: var(--accent); font-weight: 600; }
+.type-tab .cnt { color: var(--muted); font-size: 0.78rem; font-weight: 400; }
+
+.grid-card {
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-sunken);
+  padding: 0.55rem;
+}
+
+/* The scrollable window virtualization actually recycles tiles inside —
+   a fixed height keeps the page itself from growing to 8814 rows tall,
+   which is the whole point (see createVirtualGrid in app.js). */
+.grid-viewport {
+  position: relative;
+  height: min(62vh, 620px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.grid-sizer { position: relative; width: 100%; }
+.grid-pool { position: absolute; top: 0; left: 0; }
+.grid-empty { padding: 1rem; text-align: center; }
+
+.tile {
+  position: absolute; width: 168px; height: 196px;
+  background: var(--surface-elev);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+}
+.tile:hover, .tile:focus-visible { border-color: var(--accent); }
+.tile.has-quality-flag { box-shadow: inset 0 0 0 1px var(--warn-soft); }
+
+.tile-thumb {
+  position: relative; width: 100%; height: 128px;
+  background: var(--surface-sunken);
+  display: flex; align-items: center; justify-content: center;
+}
+.tile-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tile-thumb.no-preview {
+  flex-direction: column; gap: 0.15rem;
+}
+.tile-thumb.no-preview.kind-image { background: var(--accent-soft); }
+.tile-thumb.no-preview.kind-video { background: var(--warn-soft); }
+.tile-ext { font-family: ui-monospace, Consolas, monospace; font-weight: 700; font-size: 0.95rem; }
+.tile-kind { font-size: 0.68rem; color: var(--muted); }
+
+.tile-count-badge {
+  position: absolute; left: 6px; top: 6px;
+  background: color-mix(in srgb, black 55%, transparent);
+  color: #fff; font-size: 0.68rem; font-weight: 600;
+  padding: 0.05rem 0.4rem; border-radius: 999px;
+}
+
+.tile-info { padding: 0.4rem 0.5rem; }
+.tile-size { font-size: 0.72rem; color: var(--muted); }
+.tile-keeper {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.7rem; margin-top: 0.15rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* --- detail panel: what a clicked tile expands into, docked below the
+   grid rather than inline. Tiles are recycled DOM nodes of a fixed size
+   (that is what makes the pool above cheap); letting one of them grow to
+   show a full record list would break the row-height arithmetic every
+   other tile's position depends on. A docked panel gets the same
+   "composition visible without losing your place in the grid" result
+   without that trade-off. --- */
+.group-detail { margin-top: 0.7rem; }
+.detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.6rem; margin-bottom: 0.5rem; }
+.btn-close { padding: 0.1rem 0.5rem; font-size: 0.85rem; line-height: 1; }
+.detail-records { list-style: none; margin: 0 0 0.5rem; padding: 0; }
+.detail-record {
+  font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem;
+  padding: 0.2rem 0; overflow-wrap: anywhere;
+  border-top: 1px solid var(--border-soft);
+}
+.detail-record:first-child { border-top: none; }
 
 @media (max-width: 480px) {
   body { padding: 1rem; }

@@ -95,28 +95,33 @@
       <span id="upgrade-status" class="hint"></span>
     </div>
 
-    <details open class="group-block">
-      <summary><h3>Обычные файлы</h3></summary>
-      <div id="plain-groups"></div>
-    </details>
+    <p class="hint">Только просмотр — клавиатурная навигация и решения по группе (что оставить,
+      что отправить в карантин) появятся отдельным экраном.</p>
 
-    <details class="group-block media-block">
-      <summary><h3>⚠️ Медиа (фото/видео) — ручная проверка</h3></summary>
-      <p class="hint">Эти группы никогда не отправляются в карантин автоматически.</p>
-      <div id="media-groups"></div>
-    </details>
+    <div class="type-tabs" role="tablist">
+      <button class="type-tab active" data-tab="plain" role="tab">Обычные файлы <span class="cnt">0</span></button>
+      <button class="type-tab" data-tab="media" role="tab">⚠️ Медиа — ручная проверка <span class="cnt">0</span></button>
+      <button class="type-tab" data-tab="archive" role="tab">📦 Только внутри архивов <span class="cnt">0</span></button>
+    </div>
 
-    <details class="group-block archive-block">
-      <summary><h3>📦 Только внутри архивов — только отчёт</h3></summary>
-      <p class="hint">Архивы не изменяются автоматически. Лишнюю копию удалите вручную.</p>
-      <div id="archive-groups"></div>
-    </details>
+    <div class="grid-card">
+      <div class="grid-viewport" id="grid-viewport">
+        <div class="grid-sizer" id="grid-sizer"><div class="grid-pool" id="grid-pool"></div></div>
+      </div>
+      <p class="hint grid-empty" id="grid-empty" hidden>В этой вкладке групп нет.</p>
+    </div>
 
-    <div class="quarantine-controls">
-      <label for="quarantine-dir">Папка карантина</label>
-      <input type="text" id="quarantine-dir" placeholder="D:\DupeQuarantine">
-      <button id="quarantine-btn" class="primary">Отправить отмеченное в карантин</button>
-      <div id="quarantine-status" class="hint"></div>
+    <div class="card group-detail" id="group-detail" hidden>
+      <div class="detail-head">
+        <strong id="detail-title"></strong>
+        <button id="detail-close-btn" class="btn-close" aria-label="Закрыть">✕</button>
+      </div>
+      <ul id="detail-records" class="detail-records"></ul>
+      <p class="hint" id="detail-quality" hidden></p>
+      <div class="group-actions">
+        <button id="detail-verify-btn" class="verify-btn">Сверить полностью</button>
+        <div id="detail-verify-result" class="verify-result"></div>
+      </div>
     </div>
   </section>
 

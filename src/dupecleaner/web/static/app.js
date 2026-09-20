@@ -183,88 +183,344 @@ function renderWarnings(warnings) {
   }
 }
 
-// --- results ----------------------------------------------------------------
+// --- results ------------------------------------------------------------
+//
+// Task 11: a virtualized tile grid over the groups a scan found. One tile
+// per *group*, not per record — every copy in a group is byte-identical
+// (that is what makes it a group), so a thumbnail repeated three times in
+// a row would only lengthen the scroll, not add information (see the
+// grid-full screen in docs/UX-MOCKUPS.html).
+//
+// The report itself still arrives as one JSON response (pilot finding
+// P2.9: no pagination, 10.4 MB / 8814 groups on the real disk this was
+// built against — see claude/design-decisions.md for the numbers behind
+// that call and the gzip middleware added in app.py to shrink the actual
+// transfer). What this file is responsible for is not re-litigating that
+// call — it is making sure the DOM cost of *displaying* 8814 groups is
+// independent of their count, because that is the part that used to
+// freeze the page: the old renderReport() below built one full DOM
+// subtree (including an <img> tag) per group, eagerly, for every group in
+// the report, all three blocks at once.
 
-async function loadResult() {
-  const resp = await fetch(`/api/scan/${currentScanId}/result`);
-  if (!resp.ok) return;
-  currentReport = await resp.json();
-  renderReport(currentReport);
+// --- pooled/windowed virtualization ----------------------------------------
+//
+// Chosen over an IntersectionObserver-per-tile approach (docs/design-
+// decisions.md's original sketch) once the actual layout turned out to be
+// a fixed-size tile *grid*, not a variable-height list: observing 8814
+// elements individually buys nothing a grid with known tile dimensions
+// doesn't already get for free from arithmetic. A fixed pool of DOM nodes
+// is positioned with `transform: translate(...)` from the scroll offset,
+// and content is rewritten into whichever pool node a given index maps to
+// — the same technique the reference implementation in
+// docs/UX-MOCKUPS.html (screens 3 and 4) demonstrates. Memory is bounded
+// by the pool size (visible rows + overscan) times columns, never by the
+// item count, which is the property task 11 actually needs.
+function createVirtualGrid({ viewport, sizer, pool, tileWidth, tileHeight, gap, overscan, renderTile }) {
+  let items = [];
+  let columns = 1;
+  let slots = [];
+  let rafPending = false;
+
+  function computeColumns() {
+    const w = viewport.clientWidth || tileWidth;
+    columns = Math.max(1, Math.floor((w + gap) / (tileWidth + gap)));
+    const rows = Math.ceil(items.length / columns);
+    sizer.style.height = items.length ? `${rows * (tileHeight + gap)}px` : "0px";
+  }
+
+  function ensurePool() {
+    const visibleRows = Math.ceil((viewport.clientHeight || 1) / (tileHeight + gap)) + overscan * 2;
+    const needed = Math.max(1, visibleRows) * columns;
+    while (slots.length < needed) {
+      const node = document.createElement("div");
+      node.className = "tile";
+      node.tabIndex = 0;
+      pool.appendChild(node);
+      slots.push({ node, hash: null });
+    }
+    while (slots.length > needed && slots.length > columns * 4) {
+      const extra = slots.pop();
+      extra.node.remove();
+    }
+  }
+
+  function render() {
+    rafPending = false;
+    const scrollTop = viewport.scrollTop;
+    const startRow = Math.max(0, Math.floor(scrollTop / (tileHeight + gap)) - overscan);
+    const startIndex = startRow * columns;
+
+    slots.forEach((slot, i) => {
+      const idx = startIndex + i;
+      if (idx >= items.length) {
+        slot.node.style.display = "none";
+        slot.hash = null;
+        return;
+      }
+      const item = items[idx];
+      slot.node.style.display = "";
+      const row = Math.floor(idx / columns);
+      const col = idx % columns;
+      slot.node.style.transform = `translate(${col * (tileWidth + gap)}px, ${row * (tileHeight + gap)}px)`;
+      if (slot.hash !== item.content_hash) {
+        renderTile(slot.node, item);
+        slot.hash = item.content_hash;
+      }
+    });
+  }
+
+  function scheduleRender() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(render);
+  }
+
+  viewport.addEventListener("scroll", scheduleRender);
+  window.addEventListener("resize", () => {
+    computeColumns();
+    ensurePool();
+    scheduleRender();
+  });
+
+  return {
+    setItems(newItems) {
+      items = newItems;
+      viewport.scrollTop = 0;
+      computeColumns();
+      ensurePool();
+      render();
+    },
+    get itemCount() {
+      return items.length;
+    },
+    get domNodeCount() {
+      return slots.length;
+    },
+  };
 }
 
-function recordEl(record, isKeeper, groupHash) {
-  const div = document.createElement("div");
-  div.className = "dup-record";
-  // HEIC/HEIF added alongside pillow-heif (pilot finding P2.8) — the
-  // server can now decode them, so the grid should actually ask for them.
-  const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif)$/i.test(record.display_path);
-  if (isImage && !record.is_archive_member) {
+const IMAGE_RE = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif)$/i;
+const VIDEO_RE = /\.(mp4|mov|avi|mkv|webm|m4v|3gp)$/i;
+
+function recordName(record) {
+  return record.is_archive_member ? record.member_name : record.real_path;
+}
+
+// The record a tile's thumbnail (or fallback icon) is based on: the copy
+// Р8 would keep when one exists, because that is the copy most worth
+// looking at, and otherwise the first plain-file image in the group —
+// archive members never have cached previews (thumbnails.py skips them
+// to avoid reopening the archive, finding A2's whole point).
+function representativeRecord(group) {
+  const keeper = group.records.find((r) => r.display_path === group.keeper_display_path);
+  const candidates = keeper ? [keeper, ...group.records] : group.records;
+  return candidates.find((r) => !r.is_archive_member && IMAGE_RE.test(recordName(r))) || keeper || group.records[0];
+}
+
+function tileKind(group) {
+  const rec = representativeRecord(group);
+  const name = recordName(rec) || "";
+  if (IMAGE_RE.test(name)) return { kind: "image", label: "изображение" };
+  if (VIDEO_RE.test(name)) return { kind: "video", label: "видео" };
+  return { kind: "file", label: "файл" };
+}
+
+function fileExtension(record) {
+  const name = recordName(record) || "";
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toUpperCase() : "—";
+}
+
+function showFallbackThumb(thumbEl, group) {
+  const { kind, label } = tileKind(group);
+  thumbEl.className = "tile-thumb no-preview kind-" + kind;
+  thumbEl.innerHTML = "";
+  const ext = document.createElement("div");
+  ext.className = "tile-ext";
+  ext.textContent = fileExtension(representativeRecord(group));
+  const sub = document.createElement("div");
+  sub.className = "tile-kind";
+  sub.textContent = label;
+  thumbEl.appendChild(ext);
+  thumbEl.appendChild(sub);
+}
+
+// Builds one tile's DOM structure once; renderGridTile() below only ever
+// rewrites its content, never recreates it, since it is reused from the
+// pool.
+function buildTileSkeleton() {
+  const thumb = document.createElement("div");
+  thumb.className = "tile-thumb";
+  const countBadge = document.createElement("div");
+  countBadge.className = "tile-count-badge";
+  const info = document.createElement("div");
+  info.className = "tile-info";
+  const sizeEl = document.createElement("div");
+  sizeEl.className = "tile-size";
+  const keeperEl = document.createElement("div");
+  keeperEl.className = "tile-keeper";
+  info.appendChild(sizeEl);
+  info.appendChild(keeperEl);
+  return { thumb, countBadge, info, sizeEl, keeperEl };
+}
+
+let gridState = null; // { withPreview: bool }
+
+function renderGridTile(node, group) {
+  node.dataset.hash = group.content_hash;
+  node.setAttribute("aria-label", `${group.records.length} копии, ${fmtBytes(group.size)}`);
+
+  let refs = node._refs;
+  if (!refs) {
+    refs = buildTileSkeleton();
+    node.appendChild(refs.thumb);
+    node.appendChild(refs.countBadge);
+    node.appendChild(refs.info);
+    node._refs = refs;
+    node.addEventListener("click", () => showGroupDetail(node.dataset.hash));
+    node.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        showGroupDetail(node.dataset.hash);
+      }
+    });
+  }
+
+  refs.countBadge.textContent = `×${group.records.length}`;
+
+  const withPreview = gridState && gridState.withPreview;
+  const rec = representativeRecord(group);
+  const isImage = withPreview && rec && !rec.is_archive_member && IMAGE_RE.test(recordName(rec));
+
+  if (isImage) {
+    refs.thumb.className = "tile-thumb";
+    refs.thumb.innerHTML = "";
     const img = document.createElement("img");
-    // `hash` is the group's content hash — the thumbnail cache key
-    // (thumbnails.py). Sending it lets the server skip a path lookup and
-    // serve straight from cache.
-    const hashParam = groupHash ? `&hash=${encodeURIComponent(groupHash)}` : "";
-    img.src = `/api/thumbnail?path=${encodeURIComponent(record.real_path)}${hashParam}`;
     img.loading = "lazy";
-    div.appendChild(img);
+    img.alt = "";
+    img.src = `/api/thumbnail?path=${encodeURIComponent(rec.real_path)}&hash=${encodeURIComponent(group.content_hash)}`;
+    img.addEventListener("error", () => showFallbackThumb(refs.thumb, group), { once: true });
+    refs.thumb.appendChild(img);
+  } else {
+    showFallbackThumb(refs.thumb, group);
   }
-  const label = document.createElement("div");
-  label.textContent = record.display_path + (isKeeper ? " (оставить)" : "");
-  if (isKeeper) label.className = "keeper-badge";
-  div.appendChild(label);
-  return div;
+
+  refs.sizeEl.textContent = `${fmtBytes(group.size)} · освободится ${fmtBytes(group.wasted_bytes)}`;
+  refs.keeperEl.textContent = group.keeper_display_path
+    ? shortenPath(group.keeper_display_path)
+    : "—";
+  refs.keeperEl.title = group.keeper_display_path || "";
+
+  node.classList.toggle("has-quality-flag", Boolean(group.quality));
 }
 
-function groupEl(group, checkable) {
-  const wrap = document.createElement("div");
-  wrap.className = "dup-group";
+function shortenPath(path) {
+  // Compact display for the tile face — the full path is always in the
+  // detail panel and in the title attribute above.
+  const parts = path.replace(/\\/g, "/").split("/");
+  return parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : path;
+}
 
-  if (checkable) {
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.className = "group-check";
-    checkbox.dataset.hash = group.content_hash;
-    checkbox.checked = true;
-    wrap.appendChild(checkbox);
-  }
+let grid = null;
+let groupsByHash = new Map();
 
-  const title = document.createElement("strong");
-  title.textContent = ` ${group.records.length} копии, по ${fmtBytes(group.size)} — освободится ${fmtBytes(group.wasted_bytes)}`;
-  wrap.appendChild(title);
+function initGrid() {
+  if (grid) return grid;
+  grid = createVirtualGrid({
+    viewport: $("grid-viewport"),
+    sizer: $("grid-sizer"),
+    pool: $("grid-pool"),
+    tileWidth: 168,
+    tileHeight: 196,
+    gap: 9,
+    overscan: 3,
+    renderTile: renderGridTile,
+  });
+  return grid;
+}
 
-  const recordsDiv = document.createElement("div");
-  recordsDiv.className = "dup-records";
-  // Р8 decides which copy stays, and the server sends its answer with the
-  // group. This used to be re-derived here as "the shortest path", which
-  // was the same rule the server used at the time — and stopped being it,
-  // so the badge would have pointed at the copy about to be quarantined.
+function bucketGroups(groups) {
+  const plain = [], media = [], archive = [];
+  groups.forEach((g) => {
+    if (g.only_archive_members) archive.push(g);
+    else if (g.is_media) media.push(g);
+    else plain.push(g);
+  });
+  return { plain, media, archive };
+}
+
+let buckets = { plain: [], media: [], archive: [] };
+let activeTab = "plain";
+
+function setActiveTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll(".type-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tab);
+  });
+  const items = buckets[tab];
+  $("grid-empty").hidden = items.length > 0;
+  $("grid-viewport").hidden = items.length === 0;
+  hideGroupDetail();
+  initGrid().setItems(items);
+}
+
+function showGroupDetail(hash) {
+  const group = groupsByHash.get(hash);
+  if (!group) return;
+  const panel = $("group-detail");
+  panel.hidden = false;
+
   const keeperPath = group.keeper_display_path;
-  group.records.forEach((r) => recordsDiv.appendChild(recordEl(r, r.display_path === keeperPath, group.content_hash)));
-  wrap.appendChild(recordsDiv);
-  wrap.appendChild(verifyControls(group));
+  $("detail-title").textContent =
+    `${group.records.length} копии, по ${fmtBytes(group.size)} — освободится ${fmtBytes(group.wasted_bytes)}`;
 
-  return wrap;
+  const list = $("detail-records");
+  list.innerHTML = "";
+  group.records.forEach((r) => {
+    const li = document.createElement("li");
+    li.className = "detail-record" + (r.display_path === keeperPath ? " keeper-badge" : "");
+    const archiveNote = r.is_archive_member ? " (внутри архива)" : "";
+    li.textContent = r.display_path + archiveNote + (r.display_path === keeperPath ? " — оставить" : "");
+    list.appendChild(li);
+  });
+
+  const qualityEl = $("detail-quality");
+  if (group.quality) {
+    const q = group.quality;
+    const bits = [];
+    if (q.source_width && q.source_height) bits.push(`${q.source_width}×${q.source_height}` + (q.megapixels ? ` (${q.megapixels} МП)` : ""));
+    if (q.sharpness != null) bits.push(`резкость: ${q.sharpness}`);
+    if (q.jpeg_quality != null) bits.push(`качество сжатия: ~${q.jpeg_quality}`);
+    if (q.recompression != null) bits.push(`признак пережатия: ${q.recompression} (${q.recompression_basis})`);
+    qualityEl.hidden = bits.length === 0;
+    qualityEl.textContent = "Метрики качества: " + bits.join(" · ");
+  } else {
+    qualityEl.hidden = true;
+    qualityEl.textContent = "";
+  }
+
+  wireVerify(group);
+  panel.scrollIntoView({ block: "nearest" });
 }
 
-// "Сверить полностью" for one group. Not a promotion from a weaker kind of
-// match — there is no weaker kind, in either mode — but a re-read against
-// the disk as it is now. A report on thousands of groups gets reviewed over
-// hours, and in that time a copy can be edited, truncated by a failed sync,
-// or replaced by a different file of the same size.
-function verifyControls(group) {
-  const actions = document.createElement("div");
-  actions.className = "group-actions";
+function hideGroupDetail() {
+  $("group-detail").hidden = true;
+}
 
-  const button = document.createElement("button");
-  button.className = "verify-btn";
-  button.textContent = "Сверить полностью";
-  actions.appendChild(button);
-
-  const out = document.createElement("div");
+// "Сверить полностью" for one group — unchanged from before task 11, just
+// re-homed into the detail panel. Not a promotion from a weaker kind of
+// match (there is no weaker kind, in either mode) but a re-read against
+// the disk as it is now: a report on thousands of groups is reviewed over
+// hours, during which a copy can be edited, truncated by a failed sync, or
+// replaced by a different file of the same size.
+function wireVerify(group) {
+  const button = $("detail-verify-btn");
+  const out = $("detail-verify-result");
   out.className = "verify-result";
-  actions.appendChild(out);
+  out.textContent = "";
+  button.disabled = false;
 
-  button.addEventListener("click", async () => {
+  button.onclick = async () => {
     if (!currentScanId) return;
     button.disabled = true;
     out.className = "verify-result pending";
@@ -295,15 +551,20 @@ function verifyControls(group) {
     } finally {
       button.disabled = false;
     }
-  });
+  };
+}
 
-  return actions;
+async function loadResult() {
+  const resp = await fetch(`/api/scan/${currentScanId}/result`);
+  if (!resp.ok) return;
+  currentReport = await resp.json();
+  renderReport(currentReport);
 }
 
 // A quick run's results are complete about what it looked at and silent
-// about what it didn't — which is exactly the shape of misreading finding A1
-// describes. This banner says what was skipped, in archives and bytes, and
-// offers the way to finish the job.
+// about what it didn't — which is exactly the shape of misreading finding
+// A1 describes. This banner says what was skipped, in archives and bytes,
+// and offers the way to finish the job.
 function renderModeNote(report) {
   const note = $("mode-note");
   if (report.mode !== "quick") {
@@ -315,8 +576,8 @@ function renderModeNote(report) {
   $("mode-note-text").textContent = count
     ? `Быстрый режим: ${fmtNumber(count)} арх. на ${fmtBytes(report.skipped_by_mode_bytes ?? 0)} ` +
       `не проверено — внутрь не заглядывали, и дубликаты внутри них здесь не показаны. ` +
-      `Превью тоже не строились.`
-    : `Быстрый режим: архивов не встретилось, но превью не строились.`;
+      `Превью тоже не строились — ниже показаны иконки вместо снимков.`
+    : `Быстрый режим: архивов не встретилось, но превью не строились — ниже показаны иконки вместо снимков.`;
   $("upgrade-status").textContent = "";
   $("upgrade-btn").disabled = false;
 }
@@ -328,49 +589,43 @@ function renderReport(report) {
     `Потенциально можно освободить: ${fmtBytes(report.total_wasted_bytes)}.`;
   renderModeNote(report);
 
-  const plain = $("plain-groups");
-  const media = $("media-groups");
-  const archiveOnly = $("archive-groups");
-  plain.innerHTML = media.innerHTML = archiveOnly.innerHTML = "";
+  // Screen 4 (docs/UX-MOCKUPS.html): a quick-mode report never generated
+  // previews (task 7), so the grid must not even try to fetch thumbnails —
+  // `/api/thumbnail` would decode every requested file on the spot, one
+  // synchronous image decode per tile scrolled into view, which is exactly
+  // the "6000 grey rectangles, slowly" failure this task exists to avoid.
+  gridState = { withPreview: report.mode === "full" };
 
-  report.groups.forEach((g) => {
-    if (g.only_archive_members) archiveOnly.appendChild(groupEl(g, false));
-    else if (g.is_media) media.appendChild(groupEl(g, true));
-    else plain.appendChild(groupEl(g, true));
+  groupsByHash = new Map(report.groups.map((g) => [g.content_hash, g]));
+  buckets = bucketGroups(report.groups);
+
+  document.querySelectorAll(".type-tab").forEach((btn) => {
+    const tab = btn.dataset.tab;
+    btn.querySelector(".cnt").textContent = fmtNumber(buckets[tab].length);
   });
+
+  // "Обычные файлы" is the natural first tab, but a real personal photo
+  // library (the one this was tested against: D:\Photos plus a Google
+  // Photos takeout) can be almost entirely media -- 8812 of 8814 groups on
+  // that report, 0 in "plain". Landing on an empty tab reads as "no
+  // duplicates found", which is the opposite of true, so the default
+  // follows the data: the first tab in the usual order that actually has
+  // something in it.
+  const tabOrder = ["plain", "media", "archive"];
+  const defaultTab = tabOrder.find((t) => buckets[t].length > 0) || "plain";
+  setActiveTab(defaultTab);
 }
 
-$("quarantine-btn").addEventListener("click", async () => {
-  const status = $("quarantine-status");
-  const quarantineDir = $("quarantine-dir").value.trim();
-  if (!currentScanId || !currentReport) { status.textContent = "Сначала выполните скан."; return; }
-  if (!quarantineDir) { status.textContent = "Укажите папку карантина."; return; }
-
-  const checked = Array.from(document.querySelectorAll(".group-check:checked")).map((c) => c.dataset.hash);
-  const hasMediaChecked = currentReport.groups.some(
-    (g) => g.is_media && !g.only_archive_members && checked.includes(g.content_hash)
-  );
-  if (hasMediaChecked) {
-    status.textContent = "Медиа-группы подтверждаются отдельно, после ручного просмотра.";
-    return;
-  }
-
-  status.textContent = "Перемещение в карантин...";
-  const resp = await fetch(`/api/scan/${currentScanId}/quarantine`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ quarantine_dir: quarantineDir, group_hashes: checked, confirm_media: false }),
-  });
-  if (!resp.ok) { status.textContent = `Ошибка: ${await resp.text()}`; return; }
-
-  const result = await resp.json();
-  status.textContent = `Перемещено файлов: ${result.moved.length}. Манифест: ${quarantineDir}\\manifest.json`;
+document.querySelectorAll(".type-tab").forEach((btn) => {
+  btn.addEventListener("click", () => setActiveTab(btn.dataset.tab));
 });
 
+$("detail-close-btn").addEventListener("click", hideGroupDetail);
+
 // "Досчитать полностью": start a full-mode run over the same roots and the
-// same index. Nothing the quick run already hashed is read again — the index
-// answers for it (Р6) — so this costs the archive contents and the previews,
-// which is precisely what the quick run skipped.
+// same index. Nothing the quick run already hashed is read again — the
+// index answers for it (Р6) — so this costs the archive contents and the
+// previews, which is precisely what the quick run skipped.
 $("upgrade-btn").addEventListener("click", async () => {
   if (!currentScanId) return;
   const status = $("upgrade-status");

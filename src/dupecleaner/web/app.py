@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
 
 from .. import thumbnails
 from ..dedupe import verify_group
@@ -30,6 +31,20 @@ from ..storage import DEFAULT_DB_PATH, ScanIndex
 BASE_DIR = Path(__file__).parent
 
 app = FastAPI(title="dupe-cleaner")
+# Task 11 / pilot finding P2.9: `/api/scan/{id}/result` is one JSON response
+# with no pagination -- on the real 8814-group report this project was built
+# against, that is 7.5 MB uncompressed. Gzip alone (repeated keys, long
+# shared path prefixes) brings it to ~0.7 MB, a ~10x cut, for the cost of
+# one middleware line. That is not "solved": a report an order of magnitude
+# larger would still be a single multi-megabyte fetch. It is the explicit
+# call task 11 asks for when it isn't paginating -- see
+# claude/design-decisions.md for the measurement this is based on and why a
+# single (now compressed) response stays tolerable at this scale: the
+# server is loopback-only, the fetch happens once per completed scan (not
+# per scroll -- the grid's own virtualization is what makes scrolling
+# cheap), and minimum_size skips compressing the small responses where
+# gzip's own overhead would not pay for itself.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
