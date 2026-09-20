@@ -234,9 +234,11 @@ function groupEl(group, checkable) {
 
   const recordsDiv = document.createElement("div");
   recordsDiv.className = "dup-records";
-  const keeperPath = group.records
-    .slice()
-    .sort((a, b) => a.display_path.length - b.display_path.length)[0].display_path;
+  // Р8 decides which copy stays, and the server sends its answer with the
+  // group. This used to be re-derived here as "the shortest path", which
+  // was the same rule the server used at the time — and stopped being it,
+  // so the badge would have pointed at the copy about to be quarantined.
+  const keeperPath = group.keeper_display_path;
   group.records.forEach((r) => recordsDiv.appendChild(recordEl(r, r.display_path === keeperPath, group.content_hash)));
   wrap.appendChild(recordsDiv);
   wrap.appendChild(verifyControls(group));

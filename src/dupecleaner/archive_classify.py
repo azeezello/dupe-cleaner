@@ -68,6 +68,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .hashing import full_hash
+from .keeper import rank_keepers
 from .models import (
     ArchiveClass,
     ArchiveStat,
@@ -80,10 +81,17 @@ from .models import (
 @dataclass(frozen=True)
 class MemberTwins:
     """One archive member together with the loose files on disk that hold
-    the same bytes. `twin_paths` is ordered with the most "canonical" path
-    first (shortest, then oldest), which is also the copy a file-level
-    quarantine keeps in place — so the first candidate is normally the one
-    that will still be there afterwards.
+    the same bytes. `twin_paths` is ordered by Р8 (`keeper.rank_keepers`),
+    the same rule a file-level quarantine uses to decide which copy stays
+    in place — so the first candidate is the one that will normally still
+    be there afterwards, and `verify_member` asks about it first.
+
+    This has to be the *same* rule, not a similar one: if the order here
+    disagreed with `quarantine.choose_keeper`, the check that runs right
+    before an archive is moved would vouch for a copy that a file-level
+    quarantine run had already taken away, and only fall back to the
+    surviving one after a failed read. Sharing the function is what keeps
+    them from drifting apart.
     """
 
     archive_path: str
@@ -105,8 +113,7 @@ def member_twins(report: ScanReport) -> dict[str, list[MemberTwins]]:
         plain = [r for r in group.records if not r.is_archive_member]
         if not plain:
             continue
-        plain.sort(key=lambda r: (len(r.display_path), r.mtime))
-        twin_paths = tuple(r.real_path for r in plain)
+        twin_paths = tuple(r.real_path for r in rank_keepers(plain))
 
         for record in group.records:
             if not record.is_archive_member or record.archive_path is None:

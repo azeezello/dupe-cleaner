@@ -264,6 +264,27 @@ class DuplicateGroup:
     def only_archive_members(self) -> bool:
         return all(r.is_archive_member for r in self.records)
 
+    @property
+    def keeper_display_path(self) -> str | None:
+        """Which copy Р8 would leave in place, as a path.
+
+        Exposed on the group, and serialized with it, so there is exactly
+        one implementation of the rule. Before this, `web/static/app.js`
+        computed the keeper badge itself by picking the shortest
+        `display_path` — a second copy of the rule that Р8 turned into a
+        wrong one, showing "(оставить)" on the very copy the quarantine
+        was about to move.
+
+        `keeper` is imported here rather than at module scope because
+        `keeper` describes records, so it is the layer above this one; the
+        local import keeps the dependency pointing one way.
+        """
+        if not self.records:
+            return None
+        from .keeper import choose_keeper
+
+        return choose_keeper(self.records).display_path
+
 
 @dataclass
 class ScanReport:
@@ -311,6 +332,7 @@ class ScanReport:
                     "is_media": g.is_media,
                     "has_archive_members": g.has_archive_members,
                     "only_archive_members": g.only_archive_members,
+                    "keeper_display_path": g.keeper_display_path,
                     "records": [
                         {
                             "display_path": r.display_path,

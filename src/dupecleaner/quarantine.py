@@ -53,11 +53,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .archive_classify import MemberTwins, member_twins, verify_members
+# Р8 lives in its own module because `archive_classify` needs the same
+# ordering and importing it from here would be circular. Re-exported under
+# this name because `quarantine.choose_keeper` is where it has always been.
+from .keeper import choose_keeper
 from .models import (
     ArchiveClass,
     ArchiveVerdict,
     DuplicateGroup,
-    FileRecord,
     ScanMode,
     ScanReport,
 )
@@ -200,17 +203,6 @@ def _operations_from_journal(entries: list[dict]) -> dict[str, dict]:
         elif event == "restore_failed":
             op["restore_error"] = entry.get("reason")
     return ops
-
-
-def choose_keeper(records: list[FileRecord]) -> FileRecord:
-    """Pick which copy survives in place. Preference order: a plain file
-    over an archive member (plain files are trivial to keep working with),
-    then the shortest/most "canonical-looking" path, then the oldest
-    modification time (more likely to be the original rather than a copy).
-    """
-    non_archive = [r for r in records if not r.is_archive_member]
-    candidates = non_archive or records
-    return min(candidates, key=lambda r: (len(r.display_path), r.mtime))
 
 
 def _mirrored_relative_parts(source: Path) -> list[str]:
