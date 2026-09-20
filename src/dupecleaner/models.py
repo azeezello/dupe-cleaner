@@ -57,6 +57,20 @@ class ScanMode(str, Enum):
     def generate_previews(self) -> bool:
         return self is ScanMode.FULL
 
+    @property
+    def classify_origin(self) -> bool:
+        """Whether origin classification (Р3, task 15) runs.
+
+        Its own property rather than a second reading of
+        `generate_previews`, because the two answer different questions
+        and cost different things. A preview is one decode per duplicate
+        group; a verdict is one header read per photo in the library,
+        duplicated or not. They happen to agree today — Р7 puts both in
+        "Полная обработка" — and the point of naming them separately is
+        that a future mode can disagree without either becoming a lie.
+        """
+        return self is ScanMode.FULL
+
 
 @dataclass(frozen=True)
 class FileRecord:

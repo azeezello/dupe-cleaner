@@ -25,6 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import origin as origin_module
 from . import thumbnails
 from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
 from .archive_classify import classify_archives, unread_skipped_entries
@@ -157,6 +158,7 @@ class ScanJob:
             self.progress.groups_found = len(groups)
 
             self._preview_phase(index, groups)
+            self._origin_phase(index)
 
             files_total, _ = index.scan_totals(self.scan_id)
             report = ScanReport(
@@ -327,6 +329,67 @@ class ScanJob:
             )
             # Not hashing work: an upgraded scan that re-hashes nothing must
             # still report files_hashed == 0 (see ScanProgress.advance).
+            self.progress.advance(files=1, count_as_hashed=False)
+            processed_since_commit += 1
+
+            if processed_since_commit >= COMMIT_EVERY_FILES or (
+                time.time() - last_commit
+            ) > COMMIT_EVERY_SECONDS:
+                index.commit()
+                processed_since_commit = 0
+                last_commit = time.time()
+
+        index.commit()
+
+    def _origin_phase(self, index: ScanIndex) -> None:
+        """Give every photo on disk an origin verdict (Р3, task 15).
+
+        Runs over the whole scan, not over the duplicate groups — the one
+        place this pipeline deliberately does *not* follow the preview
+        phase above. A preview exists to be looked at, so only files a
+        person will open need one; an origin verdict exists to keep
+        screenshots out of albums, and task 16 builds those from the whole
+        library. A screenshot with no duplicate is exactly as important to
+        label as one with three.
+
+        Cost is a header read per photo: `origin.read_signals` never
+        decodes pixels, measured at about 8 ms per file over the real
+        photo folder through the device bridge (`D:\\Photos`) and rather less natively. That is what
+        makes "every photo" affordable where "every photo, decoded" would
+        not have been.
+
+        Like the preview phase this is resumable and idempotent: a verdict
+        is stamped with the bytes it was read from, so a re-run classifies
+        only what is new or changed, and an upgrade from a quick scan
+        classifies everything the quick run skipped without re-reading a
+        byte for hashing.
+        """
+        if not self.mode.classify_origin:
+            return
+
+        targets = index.needs_origin(self.scan_id)
+        if not targets:
+            return
+
+        self.progress.enter_phase("classifying_origin", files_total=len(targets))
+        last_commit = time.time()
+        processed_since_commit = 0
+
+        for record in targets:
+            self._check_cancelled()
+            self.progress.advance(current_path=record.display_path)
+            # read_signals never raises: a file that will not open still
+            # yields a verdict from its path, which is most of the
+            # evidence anyway. A scan must not die over one bad JPEG.
+            verdict = origin_module.classify_file(
+                Path(record.real_path), display_path=record.display_path
+            )
+            index.set_origin(
+                record.display_path,
+                verdict.origin.value,
+                verdict.confidence.value,
+                verdict.evidence,
+            )
             self.progress.advance(files=1, count_as_hashed=False)
             processed_since_commit += 1
 

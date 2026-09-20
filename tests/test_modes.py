@@ -585,3 +585,68 @@ def test_cli_quarantine_refuses_archives_from_a_quick_report(
     assert "--mode full" in err
     for name in ("backup.zip", "archive_only.zip"):
         assert (tmp_tree / name).exists()
+
+
+def test_origin_classification_is_part_of_full_processing(tmp_path: Path):
+    """Р7 puts task 15 in «Полная обработка» alongside previews and
+    metrics, so it must appear and disappear with the mode."""
+    root = tmp_path / "photos"
+    root.mkdir()
+    _write_jpeg(root / "Screenshot_20240812_204426_Instagram.jpg", (10, 20, 30))
+    _write_jpeg(root / "IMG_1234.JPG", (40, 50, 60))
+
+    db = tmp_path / "index.db"
+    quick = _run(root, db, ScanMode.QUICK)
+    with ScanIndex(db) as index:
+        assert index.origin_breakdown(quick.scan_id) == {}
+        assert index.screenshot_paths(quick.scan_id) == []
+
+    full = _run(root, db, ScanMode.FULL)
+    with ScanIndex(db) as index:
+        breakdown = index.origin_breakdown(full.scan_id)
+        screenshots = index.screenshot_paths(full.scan_id)
+    assert breakdown == {("screenshot_phone", "high"): 1, ("camera", "medium"): 1}
+    assert [Path(p).name for p in screenshots] == [
+        "Screenshot_20240812_204426_Instagram.jpg"
+    ]
+
+
+def test_origin_covers_every_photo_not_only_the_duplicated_ones(tmp_path: Path):
+    """The one place this deliberately differs from the preview phase.
+
+    A preview exists to be looked at, so only files in a group need one.
+    An origin verdict exists to keep screenshots out of albums, and task
+    16 builds those from the whole library — a screenshot with no copy is
+    exactly as important to label as one with three.
+    """
+    root = tmp_path / "photos"
+    root.mkdir()
+    _write_jpeg(root / "Screenshot_20240101_000000_Chrome.jpg", (1, 2, 3))
+    _write_jpeg(root / "lonely.jpg", (9, 9, 9))
+
+    db = tmp_path / "index.db"
+    job = _run(root, db, ScanMode.FULL)
+    assert job.report.groups == []  # nothing is a duplicate of anything
+
+    with ScanIndex(db) as index:
+        assert sum(index.origin_breakdown(job.scan_id).values()) == 2
+        assert len(index.screenshot_paths(job.scan_id)) == 1
+
+
+def test_a_second_full_scan_does_not_reclassify_what_it_already_knows(tmp_path: Path):
+    root = tmp_path / "photos"
+    root.mkdir()
+    _write_jpeg(root / "IMG_1234.JPG", (40, 50, 60))
+
+    db = tmp_path / "index.db"
+    first = _run(root, db, ScanMode.FULL)
+    with ScanIndex(db) as index:
+        assert index.needs_origin(first.scan_id) == []
+        second_scan_leftovers = index.needs_origin("does-not-exist")
+    assert second_scan_leftovers == []
+
+    second = _run(root, db, ScanMode.FULL)
+    with ScanIndex(db) as index:
+        # The verdict survived the re-scan's upsert rather than being
+        # dropped and recomputed: the bytes did not change.
+        assert index.needs_origin(second.scan_id) == []

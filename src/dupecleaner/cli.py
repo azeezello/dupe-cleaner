@@ -82,7 +82,8 @@ def _mode_banner(job: ScanJob) -> str:
         return (
             "Режим: быстрый — точные дубликаты среди обычных файлов "
             "(размер → быстрый хэш → полный хэш). Внутрь архивов не "
-            "заглядываем, превью и метрики качества не считаем. В карантин, "
+            "заглядываем, превью, метрики качества и происхождение снимков "
+            "не считаем. В карантин, "
             "как и в полном режиме, уходит только подтверждённое "
             "байт-в-байт."
         )
@@ -93,8 +94,9 @@ def _mode_banner(job: ScanJob) -> str:
         )
     return (
         "Режим: полный — то же самое плюс содержимое архивов (Р1), превью "
-        "для просмотра и метрики качества (Р2: считаются и показываются, "
-        "на выбор копий не влияют)."
+        "для просмотра, метрики качества (Р2: считаются и показываются, "
+        "на выбор копий не влияют) и происхождение снимков (Р3: метка и "
+        "будущий фильтр альбомов, не повод что-либо двигать)."
     )
 
 
@@ -184,6 +186,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     if report.mode is ScanMode.FULL:
         _print_archive_verdicts(report)
         _print_quality_metrics(report, args.db)
+        _print_origin_breakdown(job.scan_id, args.db)
     if report.warnings:
         print(f"Предупреждений: {len(report.warnings)} (см. отчёт)")
     print(f"Отчёт сохранён в {args.report}")
@@ -194,6 +197,67 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             "архивы и недостающие превью."
         )
     return 0
+
+
+def _print_origin_breakdown(scan_id: str, db_path: str) -> None:
+    """The task-15 summary: where this run's photos came from (Р3).
+
+    Confidence is printed beside every count rather than folded away,
+    because the two numbers mean different things to whoever reads them.
+    "Скриншотов 2100" invites a bulk decision; "1300 уверенно, 800 по
+    разрешению" says which part of that is worth a second look. UX-BRIEF
+    asks for the evidence rather than the verdict, and this is the
+    cheapest possible form of that.
+    """
+    from .origin import OriginClass
+
+    try:
+        with ScanIndex(db_path) as index:
+            breakdown = index.origin_breakdown(scan_id)
+    except Exception:  # noqa: BLE001 - a summary line must never fail a scan
+        return
+    if not breakdown:
+        return
+
+    labels = {
+        OriginClass.CAMERA: "камера",
+        OriginClass.SCREENSHOT_PHONE: "скриншот с телефона",
+        OriginClass.SCREENSHOT_DESKTOP: "скриншот с компьютера",
+        OriginClass.MESSENGER: "мессенджер",
+        OriginClass.DOCUMENT_SCAN: "скан документа",
+        OriginClass.WEB_DOWNLOAD: "загрузка из сети",
+        OriginClass.UNKNOWN: "не определено",
+    }
+    total = sum(breakdown.values())
+    print(f"Происхождение снимков ({total}):")
+    for origin_class, label in labels.items():
+        per_confidence = {
+            conf: n for (cls, conf), n in breakdown.items() if cls == origin_class.value
+        }
+        count = sum(per_confidence.values())
+        if not count:
+            continue
+        detail = ", ".join(
+            f"{n} {name}"
+            for name, n in (
+                ("уверенно", per_confidence.get("high", 0)),
+                ("вероятно", per_confidence.get("medium", 0)),
+                ("слабо", per_confidence.get("low", 0)),
+            )
+            if n
+        )
+        share = 100.0 * count / total if total else 0.0
+        print(f"  {label}: {count} ({share:.1f}%) — {detail}")
+
+    screenshots = sum(
+        n for (cls, _), n in breakdown.items()
+        if cls in (OriginClass.SCREENSHOT_PHONE.value, OriginClass.SCREENSHOT_DESKTOP.value)
+    )
+    if screenshots:
+        print(
+            f"  Из будущих альбомов исключаются {screenshots} снимк(ов) экрана (Р3). "
+            "Это метка, не действие: ни один файл от неё не двигается."
+        )
 
 
 def _print_quality_metrics(report: ScanReport, db_path: str) -> None:

@@ -38,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -120,6 +120,33 @@ def _migrate_v3_quality_metrics(conn: sqlite3.Connection) -> None:
             )
 
 
+# v4 adds task 15's origin verdict (Р3) to `files` rather than to
+# `content_previews`, and that placement is the decision, not an
+# implementation detail. Previews and quality metrics are properties of
+# *bytes*, so one row per content hash answers for every copy. An origin
+# verdict is not: half its evidence is the folder and the filename, and
+# the pilot found identical bytes sitting in four different folders at
+# once. A copy in `Screenshots 1` and a copy of the same screenshot filed
+# into `Краснодар` are the same photo and different evidence, so they get
+# a row each — which `files`, keyed by display_path, already is.
+#
+# Stamped with the source size/mtime for the same reason hashes are: the
+# EXIF half of the evidence comes from the bytes, so replacing the file
+# must invalidate the verdict. The path half cannot go stale, because the
+# path is the key.
+def _migrate_v4_origin(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+    for column, declaration in (
+        ("origin_class", "TEXT"),
+        ("origin_confidence", "TEXT"),
+        ("origin_evidence", "TEXT"),
+        ("origin_stamp_size", "INTEGER"),
+        ("origin_stamp_mtime", "REAL"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {column} {declaration}")
+
+
 _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     2: """
     CREATE TABLE IF NOT EXISTS content_previews (
@@ -140,6 +167,7 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         ON content_previews(accessed_at);
     """,
     3: _migrate_v3_quality_metrics,
+    4: _migrate_v4_origin,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -149,6 +177,14 @@ DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
 # query, so the definition of "stale" lives in exactly one place.
 _HASH_IS_FRESH = (
     "(hashed_source_size = source_size AND hashed_source_mtime = source_mtime)"
+)
+
+# The same idea for the origin verdict (task 15), stamped separately
+# because the two are computed in different phases and either can be
+# present without the other: a quick scan hashes and classifies nothing,
+# an index built before v4 has hashes and no verdicts.
+_ORIGIN_IS_FRESH = (
+    "(origin_stamp_size = source_size AND origin_stamp_mtime = source_mtime)"
 )
 
 
@@ -390,6 +426,102 @@ class ScanIndex:
             "bytes_indexed": int(row["bytes"]),
             "files_with_valid_hash": int(row["hashed"] or 0),
         }
+
+    # --- origin verdicts (see origin.py) -----------------------------------
+
+    def needs_origin(self, scan_id: str) -> list[FileRecord]:
+        """Photos in this scan with no usable origin verdict.
+
+        Plain files only. An archive member is excluded here rather than
+        filtered out by the caller, because reading EXIF from inside an
+        archive costs a sequential pass per member — finding A2, which
+        task 3 removed and which must not come back through a side door.
+
+        Unlike `needs_full_hash` this has no same-size prefilter in front
+        of it: every photo needs a verdict, not only the duplicated ones.
+        Task 16 builds events from the whole library, so a screenshot with
+        no copies is exactly as important to exclude as one with three.
+        """
+        cursor = self._conn.execute(
+            f"""
+            SELECT * FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0 AND media_kind = 'photo'
+               AND (origin_class IS NULL OR NOT {_ORIGIN_IS_FRESH})
+             ORDER BY display_path
+            """,
+            (scan_id,),
+        )
+        return [_row_to_record(row) for row in cursor]
+
+    def set_origin(
+        self,
+        display_path: str,
+        origin: str,
+        confidence: str,
+        evidence: Iterable[str] = (),
+    ) -> None:
+        """Store one file's verdict, stamped with the bytes it was read from.
+
+        `evidence` is joined into one string rather than normalised into a
+        table: it is read by people and shown verbatim, never queried, and
+        a join table would be three times the rows of `files` to support a
+        query nobody makes.
+        """
+        self._conn.execute(
+            """
+            UPDATE files
+               SET origin_class       = ?,
+                   origin_confidence  = ?,
+                   origin_evidence    = ?,
+                   origin_stamp_size  = source_size,
+                   origin_stamp_mtime = source_mtime
+             WHERE display_path = ?
+            """,
+            (origin, confidence, " · ".join(evidence), display_path),
+        )
+
+    def get_origin(self, display_path: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT origin_class, origin_confidence, origin_evidence FROM files"
+            " WHERE display_path = ?",
+            (display_path,),
+        ).fetchone()
+
+    def origin_breakdown(self, scan_id: str) -> dict[tuple[str, str], int]:
+        """Counts per (origin, confidence) for one scan.
+
+        Returned as raw counts rather than percentages so the caller can
+        decide what the denominator is — "of all photos" and "of photos we
+        actually classified" are different questions, and UX-BRIEF asks
+        for the evidence rather than a rounded verdict.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT origin_class AS c, origin_confidence AS conf, COUNT(*) AS n
+              FROM files
+             WHERE last_scan_id = ? AND origin_class IS NOT NULL
+             GROUP BY origin_class, origin_confidence
+            """,
+            (scan_id,),
+        )
+        return {(row["c"], row["conf"]): int(row["n"]) for row in cursor}
+
+    def screenshot_paths(self, scan_id: str) -> list[str]:
+        """Every photo in this scan classified as a screenshot.
+
+        The one query task 16 needs from task 15: Р3 excludes screenshots
+        from album generation, and an event clusterer wants the exclusion
+        list, not a per-file lookup it has to run 30 000 times.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT display_path FROM files
+             WHERE last_scan_id = ? AND origin_class IN (?, ?)
+             ORDER BY display_path
+            """,
+            (scan_id, "screenshot_desktop", "screenshot_phone"),
+        )
+        return [row["display_path"] for row in cursor]
 
     # --- thumbnail cache (see thumbnails.py) -------------------------------
     #

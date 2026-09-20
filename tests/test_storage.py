@@ -358,3 +358,126 @@ def test_resolve_content_hash_matches_either_path_form(tmp_path: Path):
 
         assert index.resolve_content_hash("a.jpg") == "hash-a"
         assert index.resolve_content_hash("does-not-exist.jpg") is None
+
+
+# --- origin verdicts (task 15) ---------------------------------------------
+
+
+def _origin_record(path: str, size: int = 10, mtime: float = 1.0) -> FileRecord:
+    return FileRecord(
+        display_path=path,
+        real_path=path,
+        size=size,
+        mtime=mtime,
+        media_kind=MediaKind.PHOTO,
+    )
+
+
+def test_v4_migration_adds_origin_columns_to_a_v3_index(tmp_path):
+    """An index Aziz already has must gain the columns rather than be
+    rebuilt — the hashes in it are the expensive part."""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    with ScanIndex(db) as index:
+        index.upsert_files([_origin_record("a.jpg")], "s1")
+        index.commit()
+
+    conn = sqlite3.connect(str(db))
+    for column in (
+        "origin_class", "origin_confidence", "origin_evidence",
+        "origin_stamp_size", "origin_stamp_mtime",
+    ):
+        conn.execute(f"ALTER TABLE files DROP COLUMN {column}")
+    conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    with ScanIndex(db) as index:
+        columns = {
+            row["name"] for row in index._conn.execute("PRAGMA table_info(files)")
+        }
+        assert {"origin_class", "origin_confidence", "origin_evidence"} <= columns
+        # The row that was already there still needs a verdict, and asking
+        # for one does not crash on a column that only just appeared.
+        assert [r.display_path for r in index.needs_origin("s1")] == ["a.jpg"]
+
+
+def test_v4_migration_is_idempotent(tmp_path):
+    db = tmp_path / "i.db"
+    with ScanIndex(db) as index:
+        index.upsert_files([_origin_record("a.jpg")], "s1")
+        index.set_origin("a.jpg", "camera", "high", ["EXIF"])
+    with ScanIndex(db) as index:  # reopening re-runs nothing and loses nothing
+        assert index.get_origin("a.jpg")["origin_class"] == "camera"
+
+
+def test_origin_round_trip_and_needs_origin_stops_asking(tmp_path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.upsert_files([_origin_record("a.jpg"), _origin_record("b.jpg")], "s1")
+        assert {r.display_path for r in index.needs_origin("s1")} == {"a.jpg", "b.jpg"}
+
+        index.set_origin("a.jpg", "screenshot_phone", "high", ["имя снимка экрана"])
+        assert [r.display_path for r in index.needs_origin("s1")] == ["b.jpg"]
+
+        row = index.get_origin("a.jpg")
+        assert row["origin_class"] == "screenshot_phone"
+        assert row["origin_confidence"] == "high"
+        assert "имя снимка экрана" in row["origin_evidence"]
+
+
+def test_changed_bytes_invalidate_the_origin_verdict(tmp_path):
+    """Half the evidence is EXIF, so replacing the file must re-open the
+    question — the same rule the hash cache lives by."""
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.upsert_files([_origin_record("a.jpg", mtime=1.0)], "s1")
+        index.set_origin("a.jpg", "camera", "high", [])
+        assert index.needs_origin("s1") == []
+
+        index.upsert_files([_origin_record("a.jpg", mtime=2.0)], "s2")
+        assert [r.display_path for r in index.needs_origin("s2")] == ["a.jpg"]
+
+
+def test_archive_members_are_never_asked_for_an_origin(tmp_path):
+    """Reading EXIF from inside an archive is finding A2 again."""
+    member = FileRecord(
+        display_path="a.zip::x.jpg",
+        real_path="a.zip",
+        size=10,
+        mtime=1.0,
+        media_kind=MediaKind.PHOTO,
+        is_archive_member=True,
+        archive_path="a.zip",
+        member_name="x.jpg",
+    )
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.upsert_files([member, _origin_record("loose.jpg")], "s1")
+        assert [r.display_path for r in index.needs_origin("s1")] == ["loose.jpg"]
+
+
+def test_origin_breakdown_and_screenshot_list(tmp_path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.upsert_files(
+            [_origin_record(n) for n in ("a.jpg", "b.jpg", "c.jpg", "d.jpg")], "s1"
+        )
+        index.set_origin("a.jpg", "screenshot_phone", "high", [])
+        index.set_origin("b.jpg", "screenshot_desktop", "medium", [])
+        index.set_origin("c.jpg", "camera", "high", [])
+        # d.jpg deliberately left unclassified.
+
+        assert index.origin_breakdown("s1") == {
+            ("screenshot_phone", "high"): 1,
+            ("screenshot_desktop", "medium"): 1,
+            ("camera", "high"): 1,
+        }
+        assert index.screenshot_paths("s1") == ["a.jpg", "b.jpg"]
+
+
+def test_origin_verdicts_do_not_leak_between_scans(tmp_path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.upsert_files([_origin_record("a.jpg")], "s1")
+        index.set_origin("a.jpg", "camera", "high", [])
+        index.upsert_files([_origin_record("b.jpg")], "s2")
+        index.set_origin("b.jpg", "messenger", "high", [])
+        assert index.screenshot_paths("s1") == []
+        assert index.origin_breakdown("s2") == {("messenger", "high"): 1}

@@ -31,6 +31,7 @@ PHASE_LABELS = {
     "full_hashing": "Этап 3/3: полное хэширование",
     "grouping": "Формирование групп",
     "previewing": "Миниатюры для просмотра",
+    "classifying_origin": "Происхождение снимков",
     "done": "Готово",
     "cancelled": "Остановлено",
     "failed": "Ошибка",
