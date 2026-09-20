@@ -195,6 +195,28 @@ def _print_archive_verdicts(report: ScanReport) -> None:
         print("  Переместить их целиком: dupecleaner quarantine --archives "
               "(двойники будут перечитаны и сверены заново перед перемещением)")
 
+    # Partially redundant archives get their numbers printed too. The
+    # verdict alone ("1 archive, partially redundant") is the least useful
+    # true statement available: on the real Takeout it hides that 59% of
+    # the archive is already on disk. Nothing will be done about it either
+    # way — Р1 defers dissolving — but how much is duplicated is the fact
+    # that decides whether dissolving is worth building.
+    partial = by_class.get(ArchiveClass.PARTIALLY_REDUNDANT, [])
+    for verdict in partial[:5]:
+        share = (
+            f", {100 * verdict.members_redundant / verdict.members_total:.0f}%"
+            if verdict.members_total
+            else ""
+        )
+        print(
+            f"  Частично избыточен: {verdict.path} — уже есть на диске "
+            f"{verdict.members_redundant} из {verdict.members_total} "
+            f"участников{share}, {_fmt_bytes(verdict.redundant_bytes)}. "
+            "Архив не трогаем: вынуть часть нельзя, не пересобрав его."
+        )
+    if len(partial) > 5:
+        print(f"    ... и ещё {len(partial) - 5} (см. отчёт)")
+
     unread = by_class.get(ArchiveClass.UNREAD, [])
     for verdict in unread[:5]:
         print(f"  Не прочитан: {verdict.path} — {verdict.reason}")

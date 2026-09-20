@@ -253,3 +253,21 @@ def test_classify_is_pure_on_a_hand_built_stat():
     stat = ArchiveStat(path="X", size=10, members_total=5, members_unreadable=1)
     verdict = classify_archive(stat, [])
     assert verdict.verdict is ArchiveClass.UNREAD
+
+
+def test_cli_prints_how_redundant_a_partial_archive_is(
+    archive_tree: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    """"One archive, partially redundant" is true and nearly useless. On the
+    real Google Takeout that line stood for "3727 of 6286 members, 9.4 GB,
+    are already on disk" — the number that decides whether dissolving such
+    an archive is worth building at all.
+    """
+    from dupecleaner.cli import _print_archive_verdicts
+
+    _print_archive_verdicts(_scan(archive_tree, tmp_path))
+    out = capsys.readouterr().out
+
+    assert "Частично избыточен" in out
+    assert "1 из 2" in out
+    assert "Не прочитан" in out
