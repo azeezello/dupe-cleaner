@@ -8,9 +8,10 @@ import sys
 import time
 from pathlib import Path
 
+from .archive_classify import classify_archives
 from .jobs import ScanJob
-from .models import ScanReport
-from .quarantine import restore_from_journal, run_quarantine
+from .models import ArchiveClass, ScanReport
+from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
 
@@ -121,17 +122,82 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     print(f"Групп дублей: {len(report.groups)}")
     print(f"Потенциально освободится: {_fmt_bytes(report.total_wasted_bytes)}")
     print(f"Время: {_fmt_duration(time.time() - progress.started_at)}")
-    if report.skipped_archives:
-        skipped_bytes = sum(a.size for a in report.skipped_archives)
+    # `skipped_archives` now holds two different kinds of "not checked":
+    # archives the mode never opened, and archives that refused to be read.
+    # Printing one count for both would have made the second kind sound
+    # like a setting the user chose.
+    by_mode = [a for a in report.skipped_archives if a.reason == "excluded_by_mode"]
+    unread = [a for a in report.skipped_archives if a.reason != "excluded_by_mode"]
+    if by_mode:
         print(
-            f"Не проверено в этом режиме: {len(report.skipped_archives)} "
-            f"архив(ов), {_fmt_bytes(skipped_bytes)} (см. отчёт, "
+            f"Не проверено в этом режиме: {len(by_mode)} архив(ов), "
+            f"{_fmt_bytes(sum(a.size for a in by_mode))} (см. отчёт, "
             "skipped_archives) — внутрь не заглядывали, дубли внутри не найдены бы"
         )
+    if unread:
+        print(
+            f"Не прочитано: {len(unread)} архив(ов), "
+            f"{_fmt_bytes(sum(a.size for a in unread))} — содержимое неизвестно, "
+            "к таким архивам инструмент не притрагивается"
+        )
+    _print_archive_verdicts(report)
     if report.warnings:
         print(f"Предупреждений: {len(report.warnings)} (см. отчёт)")
     print(f"Отчёт сохранён в {args.report}")
     return 0
+
+
+_VERDICT_LABEL = {
+    ArchiveClass.FULLY_REDUNDANT: "полностью избыточны",
+    ArchiveClass.PARTIALLY_REDUNDANT: "частично избыточны",
+    ArchiveClass.UNIQUE: "уникальны",
+    ArchiveClass.UNREAD: "не прочитаны",
+}
+
+
+def _print_archive_verdicts(report: ScanReport) -> None:
+    """Р1 gives every archive one verdict; this prints them grouped by
+    verdict, with the fully redundant ones listed individually because
+    those are the only ones any command will offer to act on.
+    """
+    verdicts = classify_archives(report)
+    if not verdicts:
+        return
+
+    by_class: dict[ArchiveClass, list] = {}
+    for verdict in verdicts:
+        by_class.setdefault(verdict.verdict, []).append(verdict)
+
+    parts = [
+        f"{_VERDICT_LABEL[kind]} — {len(by_class[kind])}"
+        for kind in (
+            ArchiveClass.FULLY_REDUNDANT,
+            ArchiveClass.PARTIALLY_REDUNDANT,
+            ArchiveClass.UNIQUE,
+            ArchiveClass.UNREAD,
+        )
+        if kind in by_class
+    ]
+    print(f"Архивов просмотрено: {len(verdicts)} ({', '.join(parts)})")
+
+    full = by_class.get(ArchiveClass.FULLY_REDUNDANT, [])
+    if full:
+        freed = sum(v.size for v in full)
+        print(
+            f"  Полностью избыточны ({_fmt_bytes(freed)}) — всё их содержимое "
+            "уже лежит на диске отдельными файлами:"
+        )
+        for verdict in full[:10]:
+            print(f"    - {verdict.path} ({_fmt_bytes(verdict.size)}, "
+                  f"участников: {verdict.members_total})")
+        if len(full) > 10:
+            print(f"    ... и ещё {len(full) - 10} (см. отчёт)")
+        print("  Переместить их целиком: dupecleaner quarantine --archives "
+              "(двойники будут перечитаны и сверены заново перед перемещением)")
+
+    unread = by_class.get(ArchiveClass.UNREAD, [])
+    for verdict in unread[:5]:
+        print(f"  Не прочитан: {verdict.path} — {verdict.reason}")
 
 
 def _cmd_quarantine(args: argparse.Namespace) -> int:
@@ -156,9 +222,44 @@ def _cmd_quarantine(args: argparse.Namespace) -> int:
         )
     if result.archive_only_notes:
         print(f"Групп внутри архивов (не тронуты): {len(result.archive_only_notes)}")
+
+    if args.archives:
+        _quarantine_archives_step(report, Path(args.quarantine_dir), args.confirm_media)
+
     print(f"Журнал (источник истины для restore): {Path(args.quarantine_dir) / 'journal.jsonl'}")
     print(f"Манифест (сводка): {Path(args.quarantine_dir) / 'manifest.json'}")
     return 0
+
+
+def _quarantine_archives_step(
+    report: ScanReport, quarantine_dir: Path, confirm_media: bool
+) -> None:
+    """The Р1 pass, run after the file pass on purpose: by now every copy a
+    file-level quarantine intended to move has moved, so re-verifying the
+    twins checks the disk as it will actually look once this command is
+    done — not as it looked when the scan ran.
+    """
+    archive_result = quarantine_archives(
+        classify_archives(report),
+        report,
+        quarantine_dir,
+        confirm_media=confirm_media,
+    )
+    print(
+        f"Архивов перемещено целиком: {len(archive_result.moved)} "
+        f"({_fmt_bytes(archive_result.freed_bytes)})"
+    )
+    for item in archive_result.moved:
+        print(f"  - {item['archive']}: сверено двойников {item['twins_verified']}")
+    for item in archive_result.refused:
+        print(f"  ! не перемещён {item['archive']}: {item['reason']}")
+    for item in archive_result.failed:
+        print(f"  ! ошибка перемещения {item['archive']}: {item['error']}")
+    if archive_result.pending_media_review:
+        print(
+            f"  Архивов с медиа, ожидают ручной проверки "
+            f"(затем --confirm-media): {len(archive_result.pending_media_review)}"
+        )
 
 
 def _cmd_restore(args: argparse.Namespace) -> int:
@@ -223,6 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-media",
         action="store_true",
         help="Также переместить медиа-дубликаты — только после ручного просмотра",
+    )
+    quarantine_p.add_argument(
+        "--archives",
+        action="store_true",
+        help="Также переместить целиком архивы, всё содержимое которых уже "
+        "лежит на диске отдельными файлами (Р1). Перед перемещением каждый "
+        "двойник перечитывается и сверяется заново; любое несовпадение "
+        "отменяет перемещение всего архива.",
     )
     quarantine_p.set_defaults(func=_cmd_quarantine)
 

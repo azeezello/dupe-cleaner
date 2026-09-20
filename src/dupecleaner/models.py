@@ -75,6 +75,122 @@ class SkippedArchive:
     reason: str  # e.g. "excluded_by_mode" or "unreadable"
 
 
+class ArchiveClass(str, Enum):
+    """How a whole archive relates to what is already loose on disk (Р1).
+
+    Р1 makes the *archive*, not the file inside it, the unit of action:
+    pulling one member out of an archive would mean rewriting the archive,
+    which is the one thing this project promised never to do. So an archive
+    gets exactly one verdict, and that verdict decides what may happen to it.
+
+    - FULLY_REDUNDANT   every member has a byte-identical twin sitting loose
+                        on disk -> the archive itself may be quarantined as a
+                        single file (after the twins are re-verified, see
+                        `quarantine.quarantine_archives`).
+    - PARTIALLY_REDUNDANT  some members do, some don't -> report only.
+                        "Dissolving" such an archive (unpack the unique part
+                        next to it, quarantine the rest) is explicitly out of
+                        scope in Р1.
+    - UNIQUE            no member has a loose twin -> leave it alone.
+    - UNREAD            at least one member could not be read (password,
+                        corruption, missing unrar), so the archive's content
+                        is not fully known -> it goes in the report's
+                        "not checked" list, never into an action.
+    """
+
+    FULLY_REDUNDANT = "fully_redundant"
+    PARTIALLY_REDUNDANT = "partially_redundant"
+    UNIQUE = "unique"
+    UNREAD = "unread"
+
+
+@dataclass
+class ArchiveStat:
+    """What one scan run learned about one archive, as facts rather than
+    conclusions: how many members it holds and how many of those could not
+    be read. `archive_classify` turns these into an `ArchiveVerdict`.
+
+    This exists because a duplicate report alone cannot answer "is this
+    archive fully redundant?". A report only ever lists files that *have*
+    duplicates, so a member with no twin is invisible in it — and so is a
+    member that failed to decrypt. Without `members_total` an archive whose
+    every listed member is redundant is indistinguishable from one where
+    three members out of a thousand are, and without `members_unreadable` an
+    archive we could not actually read looks exactly like one we read and
+    found nothing in. Both confusions are the same species as pilot finding
+    A1: "not checked" presented as a verdict.
+    """
+
+    path: str
+    size: int
+    # False when the archive itself could not be opened or listed at all
+    # (corrupt file, encrypted headers, no unrar). Distinguishes that from
+    # a genuinely empty archive, which opens fine and has zero members.
+    opened: bool = True
+    members_total: int = 0
+    # Members that were enumerated (so we know their names and sizes) but
+    # whose bytes could not be read — the classic case being a
+    # password-protected zip/7z, whose directory is readable while its
+    # content is not. The pilot never saw one of these: the single archive
+    # it found opened without trouble.
+    members_unreadable: int = 0
+    error: str | None = None  # first failure seen, verbatim
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "size": self.size,
+            "opened": self.opened,
+            "members_total": self.members_total,
+            "members_unreadable": self.members_unreadable,
+            "error": self.error,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "ArchiveStat":
+        return ArchiveStat(
+            path=data["path"],
+            size=data["size"],
+            opened=data.get("opened", True),
+            members_total=data.get("members_total", 0),
+            members_unreadable=data.get("members_unreadable", 0),
+            error=data.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class ArchiveVerdict:
+    """One archive's Р1 class plus the counts it was derived from, so a
+    person (or a UI) can see *why* without re-running anything.
+    """
+
+    path: str
+    size: int
+    verdict: ArchiveClass
+    members_total: int
+    members_redundant: int
+    members_unreadable: int
+    redundant_bytes: int
+    reason: str | None = None
+
+    @property
+    def is_actionable(self) -> bool:
+        """Only a fully redundant archive may ever be moved (Р1)."""
+        return self.verdict is ArchiveClass.FULLY_REDUNDANT
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "size": self.size,
+            "verdict": self.verdict.value,
+            "members_total": self.members_total,
+            "members_redundant": self.members_redundant,
+            "members_unreadable": self.members_unreadable,
+            "redundant_bytes": self.redundant_bytes,
+            "reason": self.reason,
+        }
+
+
 @dataclass
 class DuplicateGroup:
     """A set of >=2 FileRecords that are byte-identical to each other."""
@@ -114,6 +230,10 @@ class ScanReport:
     # Always present (possibly empty), so a reader never has to infer "not
     # checked" from the absence of a field the way finding A1 describes.
     skipped_archives: list[SkippedArchive] = field(default_factory=list)
+    # One entry per archive the scan met, readable or not — the raw counts
+    # `archive_classify.classify_archives` needs to give each archive a Р1
+    # verdict. See ArchiveStat for why the groups alone aren't enough.
+    archives: list[ArchiveStat] = field(default_factory=list)
 
     @property
     def total_wasted_bytes(self) -> int:
@@ -129,6 +249,7 @@ class ScanReport:
                 {"path": a.path, "size": a.size, "reason": a.reason}
                 for a in self.skipped_archives
             ],
+            "archives": [a.to_dict() for a in self.archives],
             "groups": [
                 {
                     "content_hash": g.content_hash,
@@ -183,4 +304,5 @@ class ScanReport:
             groups=groups,
             warnings=data.get("warnings", []),
             skipped_archives=skipped_archives,
+            archives=[ArchiveStat.from_dict(a) for a in data.get("archives", [])],
         )

@@ -213,7 +213,11 @@ def find_duplicate_groups(
                 warnings.append(f"Не удалось прочитать {record.display_path}: {exc}")
 
         for archive_path, members in by_archive.items():
-            for record, exc in hash_archive_members(index, archive_path, members):
+            try:
+                errors = hash_archive_members(index, archive_path, members)
+            except Exception as exc:  # noqa: BLE001 - see jobs._hash_archives_loop
+                errors = [(record, exc) for record in members]
+            for record, exc in errors:
                 warnings.append(f"Не удалось прочитать {record.display_path}: {exc}")
 
         index.commit()

@@ -52,7 +52,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import DuplicateGroup, FileRecord
+from .archive_classify import MemberTwins, member_twins, verify_members
+from .models import ArchiveClass, ArchiveVerdict, DuplicateGroup, FileRecord, ScanReport
 
 JOURNAL_FILENAME = "journal.jsonl"
 MANIFEST_FILENAME = "manifest.json"
@@ -76,6 +77,40 @@ class QuarantineResult:
             "failed": self.failed,
             "pending_media_review": self.pending_media_review,
             "archive_only_notes": self.archive_only_notes,
+        }
+
+
+@dataclass
+class ArchiveQuarantineResult:
+    """Outcome of the Р1 archive pass: whole archives moved, and every
+    archive that was looked at and deliberately left alone, with why.
+
+    The "left alone" half is not padding. A run that moves two archives out
+    of forty needs to say what it decided about the other thirty-eight,
+    otherwise the only readable outcome is "something happened" — the same
+    complaint pilot finding A1 made about a fast scan reporting zero
+    duplicate groups.
+    """
+
+    moved: list[dict] = field(default_factory=list)
+    failed: list[dict] = field(default_factory=list)
+    refused: list[dict] = field(default_factory=list)
+    pending_media_review: list[dict] = field(default_factory=list)
+    not_actionable: list[dict] = field(default_factory=list)
+
+    @property
+    def freed_bytes(self) -> int:
+        return sum(item.get("size", 0) for item in self.moved)
+
+    def to_dict(self) -> dict:
+        return {
+            "generated_at": time.time(),
+            "moved": self.moved,
+            "failed": self.failed,
+            "refused": self.refused,
+            "pending_media_review": self.pending_media_review,
+            "not_actionable": self.not_actionable,
+            "freed_bytes": self.freed_bytes,
         }
 
 
@@ -214,26 +249,39 @@ def _unique_destination(directory: Path, filename: str) -> Path:
 def _move_one(
     source: Path,
     quarantine_root: Path,
-    group: DuplicateGroup,
-    record: FileRecord,
-    result: QuarantineResult,
+    group_hash: str | None,
+    size: int,
     journal: _JournalWriter,
-) -> None:
+    extra: dict | None = None,
+) -> tuple[str, str | None]:
+    """Move one file into quarantine, journalling the intent first.
+
+    Returns `(destination, error_or_None)` and appends nothing to any
+    result — the caller decides where the outcome is recorded, which is
+    what lets a duplicate file and a whole redundant archive (Р1) take the
+    same journalled path and therefore be undone by the same `restore`.
+
+    `extra` is merged into the `move_pending` line, so anything the caller
+    wants on the record *before* the move happens — such as how many twins
+    were re-verified for an archive — is durable even if the process dies
+    during the move itself.
+    """
     mirrored = _mirrored_destination(quarantine_root, source)
     destination = _unique_destination(mirrored.parent, mirrored.name)
 
     op_id = uuid.uuid4().hex
-    journal.write(
-        {
-            "op_id": op_id,
-            "event": "move_pending",
-            "ts": time.time(),
-            "group_hash": group.content_hash,
-            "original": str(source),
-            "quarantined": str(destination),
-            "size": record.size,
-        }
-    )
+    entry = {
+        "op_id": op_id,
+        "event": "move_pending",
+        "ts": time.time(),
+        "group_hash": group_hash,
+        "original": str(source),
+        "quarantined": str(destination),
+        "size": size,
+    }
+    if extra:
+        entry.update(extra)
+    journal.write(entry)
 
     try:
         shutil.move(str(source), str(destination))
@@ -241,24 +289,10 @@ def _move_one(
         journal.write(
             {"op_id": op_id, "event": "move_failed", "ts": time.time(), "error": str(exc)}
         )
-        result.failed.append(
-            {
-                "group_hash": group.content_hash,
-                "original": str(source),
-                "quarantined": str(destination),
-                "error": str(exc),
-            }
-        )
-        return
+        return str(destination), str(exc)
 
     journal.write({"op_id": op_id, "event": "move_done", "ts": time.time()})
-    result.moved.append(
-        {
-            "group_hash": group.content_hash,
-            "original": str(source),
-            "quarantined": str(destination),
-        }
-    )
+    return str(destination), None
 
 
 def quarantine_group(
@@ -314,7 +348,18 @@ def quarantine_group(
             continue
 
         source = Path(record.real_path)
-        _move_one(source, quarantine_root, group, record, result, journal)
+        destination, error = _move_one(
+            source, quarantine_root, group.content_hash, record.size, journal
+        )
+        entry = {
+            "group_hash": group.content_hash,
+            "original": str(source),
+            "quarantined": destination,
+        }
+        if error is None:
+            result.moved.append(entry)
+        else:
+            result.failed.append({**entry, "error": error})
 
 
 def run_quarantine(
@@ -440,5 +485,137 @@ def restore_from_journal(
 
             journal.write({"op_id": op_id, "event": "restored", "ts": time.time()})
             result.restored.append(entry)
+
+    return result
+
+
+def _archive_has_media(report: ScanReport, archive_path: str) -> bool:
+    return any(
+        r.is_media
+        for g in report.groups
+        for r in g.records
+        if r.is_archive_member and r.archive_path == archive_path
+    )
+
+
+def quarantine_archives(
+    verdicts: list[ArchiveVerdict],
+    report: ScanReport,
+    quarantine_root: Path,
+    confirm_media: bool = False,
+    archive_paths: set[str] | None = None,
+) -> ArchiveQuarantineResult:
+    """Move fully redundant archives into quarantine — as whole files, and
+    only after re-verifying their twins (Р1).
+
+    The order of operations is the entire point, so it is spelled out:
+
+    1. Anything that isn't FULLY_REDUNDANT is recorded and skipped. Partial
+       redundancy is reported, never acted on — "dissolving" a partly
+       redundant archive is out of scope by decision, and an UNREAD one is
+       not a verdict at all, it is an admission.
+    2. Every member's twin on disk is re-read and re-hashed *now*
+       (`archive_classify.verify_members`). The scan may have been hours or
+       days ago; the drive holding the twins may have been unplugged since.
+       One failure refuses the whole archive — the unit of action is the
+       archive, so it is also the unit of veto.
+    3. Only then is the intent written to `journal.jsonl`, and only then
+       does the file move. Same journal, same writer, same format as a
+       duplicate file move (task 5), which is why `dupecleaner restore`
+       brings a quarantined archive back with no archive-specific code.
+
+    Archives whose members include photos or video additionally need
+    `confirm_media=True`, matching the rule for loose media files: the
+    content is the user's photos either way, and the fact that it arrived
+    wrapped in a .tgz is not a reason to apply a weaker safeguard.
+    """
+    result = ArchiveQuarantineResult()
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    twins_by_archive: dict[str, list[MemberTwins]] = member_twins(report)
+
+    journal_path = quarantine_root / JOURNAL_FILENAME
+    with _JournalWriter(journal_path) as journal:
+        for verdict in verdicts:
+            if archive_paths is not None and verdict.path not in archive_paths:
+                continue
+
+            if verdict.verdict is not ArchiveClass.FULLY_REDUNDANT:
+                result.not_actionable.append(
+                    {
+                        "archive": verdict.path,
+                        "size": verdict.size,
+                        "verdict": verdict.verdict.value,
+                        "members_total": verdict.members_total,
+                        "members_redundant": verdict.members_redundant,
+                        "members_unreadable": verdict.members_unreadable,
+                        "reason": verdict.reason,
+                    }
+                )
+                continue
+
+            twins = twins_by_archive.get(verdict.path, [])
+            if len(twins) != verdict.members_total:
+                # The verdict and the group data disagree about what is in
+                # this archive. That should be impossible from one scan, so
+                # it means the report was edited or is stale — refuse rather
+                # than trust half of it.
+                result.refused.append(
+                    {
+                        "archive": verdict.path,
+                        "size": verdict.size,
+                        "reason": f"состав архива в отчёте не сходится: "
+                        f"двойников {len(twins)}, участников {verdict.members_total}",
+                    }
+                )
+                continue
+
+            if _archive_has_media(report, verdict.path) and not confirm_media:
+                result.pending_media_review.append(
+                    {
+                        "archive": verdict.path,
+                        "size": verdict.size,
+                        "members_total": verdict.members_total,
+                    }
+                )
+                continue
+
+            verification = verify_members(verdict.path, twins)
+            if not verification.ok:
+                result.refused.append(
+                    {
+                        "archive": verdict.path,
+                        "size": verdict.size,
+                        "reason": "двойники не подтвердились: "
+                        + verification.failure_summary,
+                        "failures": verification.failures,
+                    }
+                )
+                continue
+
+            source = Path(verdict.path)
+            destination, error = _move_one(
+                source,
+                quarantine_root,
+                group_hash=None,
+                size=verdict.size,
+                journal=journal,
+                extra={
+                    "kind": "archive",
+                    "members_total": verdict.members_total,
+                    "twins_verified": len(verification.verified),
+                },
+            )
+            entry = {
+                "archive": verdict.path,
+                "original": verdict.path,
+                "quarantined": destination,
+                "size": verdict.size,
+                "members_total": verdict.members_total,
+                "twins_verified": len(verification.verified),
+            }
+            if error is None:
+                result.moved.append(entry)
+            else:
+                result.failed.append({**entry, "error": error})
 
     return result

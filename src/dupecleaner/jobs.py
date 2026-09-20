@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path
 
 from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
+from .archive_classify import classify_archives, unread_skipped_entries
 from .models import FileRecord, ScanReport
 from .progress import ScanProgress
 from .scanner import Scanner
@@ -39,6 +40,34 @@ COMMIT_EVERY_SECONDS = 5.0
 
 class ScanCancelled(Exception):
     pass
+
+
+_PASSWORD_HINTS = (
+    "password is required",
+    "password required",
+    "bad password",
+    "wrong password",
+    "incorrect password",
+    "encrypted",
+)
+
+
+def _short_error(exc: BaseException) -> str:
+    """A one-line version of a library exception, fit for a report field.
+
+    Two problems with the raw text. py7zr reports a missing password by
+    repr'ing the entire codec chain into the message — several hundred
+    characters of binary properties wrapped around the one sentence that
+    matters — and even trimmed, "Password is required for extracting given
+    archive" is the kind of line a person has to translate before they can
+    act on it. The one thing they need to know is that the archive is
+    locked, so say that. The library's full text is still in `warnings`.
+    """
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    lowered = text.lower()
+    if any(hint in lowered for hint in _PASSWORD_HINTS):
+        return "требуется пароль"
+    return text if len(text) <= 160 else text[:157] + "..."
 
 
 class ScanJob:
@@ -99,7 +128,7 @@ class ScanJob:
             # start over?" — on a resumed scan it is large.
             self.progress.files_from_cache = index.count_cached_hashes(self.scan_id)
 
-            self._quick_hash_phase(index)
+            self._quick_hash_phase(index, scanner)
             self._full_hash_phase(index)
 
             self.progress.enter_phase("grouping")
@@ -107,13 +136,23 @@ class ScanJob:
             self.progress.groups_found = len(groups)
 
             files_total, _ = index.scan_totals(self.scan_id)
-            self.report = ScanReport(
+            report = ScanReport(
                 scanned_roots=self.roots,
                 total_files_seen=files_total,
                 groups=groups,
                 warnings=scanner.warnings,
                 skipped_archives=scanner.skipped_archives,
+                archives=list(scanner.archive_stats.values()),
             )
+            # An archive whose members refused to decrypt opened fine, so
+            # nothing above listed it as unchecked — only a pile of
+            # per-member warnings did. Give it its Р1 verdict now and put
+            # the UNREAD ones in `skipped_archives`, the one list that
+            # means "we did not look inside" (task 3 / finding A1).
+            report.skipped_archives.extend(
+                unread_skipped_entries(classify_archives(report), report.skipped_archives)
+            )
+            self.report = report
             self.progress.warnings = scanner.warnings
             self.progress.finish("done")
             return self.report
@@ -157,7 +196,7 @@ class ScanJob:
         index.commit()
         self.progress.warnings = list(scanner.warnings)
 
-    def _quick_hash_phase(self, index: ScanIndex) -> None:
+    def _quick_hash_phase(self, index: ScanIndex, scanner: Scanner) -> None:
         """Phase 2: cheap head+tail fingerprint, but only for files that share
         a size with something else. Files with a unique size are never read.
 
@@ -180,7 +219,7 @@ class ScanJob:
         cost = lambda record: min(record.size, 2 * QUICK_HASH_SAMPLE_BYTES)  # noqa: E731
 
         self._hash_loop(index, plain, work=run_quick_stage, cost=cost)
-        self._hash_archives_loop(index, by_archive, cost=cost)
+        self._hash_archives_loop(index, by_archive, cost=cost, scanner=scanner)
 
     def _full_hash_phase(self, index: ScanIndex) -> None:
         """Phase 3: read in full, but only files that matched another file on
@@ -225,10 +264,19 @@ class ScanJob:
 
         index.commit()
 
-    def _hash_archives_loop(self, index: ScanIndex, by_archive: dict, cost) -> None:
+    def _hash_archives_loop(
+        self, index: ScanIndex, by_archive: dict, cost, scanner: Scanner
+    ) -> None:
         """Same progress/commit/warning bookkeeping as `_hash_loop`, but one
         `hash_archive_members` call per archive — a single sequential pass —
         instead of one record-at-a-time call per member.
+
+        Read failures are additionally tallied per archive into
+        `scanner.archive_stats`. A warning line per member was enough while
+        the only question was "did this scan miss something", but Р1 asks a
+        question about the archive as a whole — and an archive with even one
+        member it could not read must never be called fully redundant
+        (see archive_classify).
         """
         last_commit = time.time()
         processed_since_commit = 0
@@ -241,8 +289,27 @@ class ScanJob:
                 self._check_cancelled()
                 self.progress.advance(current_path=record.display_path)
 
-            errors = hash_archive_members(index, archive_path, members, on_start=_on_start)
+            try:
+                errors = hash_archive_members(index, archive_path, members, on_start=_on_start)
+            except ScanCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - assorted archive lib errors
+                # `hash_archive_members` reports per-member failures in its
+                # return value, but the archive can also fail *as a whole*
+                # part-way through the pass — a password-protected member
+                # that makes the library give up, a stream that turns out to
+                # be truncated. Before this, that exception escaped the loop
+                # and killed the entire scan, losing every other root. Now
+                # the archive is counted as unread (which is its Р1 class)
+                # and the scan goes on.
+                errors = [(record, exc) for record in members]
             error_by_member = {record.member_name: exc for record, exc in errors}
+
+            stat = scanner.archive_stats.get(archive_path)
+            if stat is not None and errors:
+                stat.members_unreadable += len(errors)
+                if stat.error is None:
+                    stat.error = _short_error(errors[0][1])
 
             for record in members:
                 exc = error_by_member.get(record.member_name)

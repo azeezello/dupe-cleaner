@@ -12,7 +12,7 @@ from typing import Iterator
 
 from . import archives
 from .config import DEFAULT_EXCLUDE_DIR_NAMES, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-from .models import FileRecord, MediaKind, SkippedArchive
+from .models import ArchiveStat, FileRecord, MediaKind, SkippedArchive
 
 
 def classify_media(name: str) -> MediaKind:
@@ -45,6 +45,11 @@ class Scanner:
         # own list (finding A1) so a fast scan can't be misread as "no
         # duplicates" when really it never looked: see models.SkippedArchive.
         self.skipped_archives: list[SkippedArchive] = []
+        # Every archive this scan met, keyed by path — readable or not, and
+        # regardless of include_archives. These are the raw per-archive
+        # counts `archive_classify` needs to hand out Р1 verdicts (task 4);
+        # the scanner only records facts here and draws no conclusion.
+        self.archive_stats: dict[str, ArchiveStat] = {}
 
     def iter_records(self, roots: list[str | Path]) -> Iterator[FileRecord]:
         for root in roots:
@@ -80,6 +85,14 @@ class Scanner:
                 self.skipped_archives.append(
                     SkippedArchive(path=str(path), size=stat.st_size, reason="excluded_by_mode")
                 )
+                # Recorded with opened=False so a quick-mode run can't be
+                # mistaken for one that looked inside and found nothing.
+                self.archive_stats[str(path)] = ArchiveStat(
+                    path=str(path),
+                    size=stat.st_size,
+                    opened=False,
+                    error="архив пропущен режимом скана",
+                )
             yield FileRecord(
                 display_path=str(path),
                 real_path=str(path),
@@ -99,6 +112,12 @@ class Scanner:
             self.skipped_archives.append(
                 SkippedArchive(path=str(path), size=stat.st_size, reason="unreadable")
             )
+            self.archive_stats[str(path)] = ArchiveStat(
+                path=str(path),
+                size=stat.st_size,
+                opened=False,
+                error="не найден unrar/unar в PATH",
+            )
             return
 
         try:
@@ -109,7 +128,14 @@ class Scanner:
             self.skipped_archives.append(
                 SkippedArchive(path=str(path), size=stat.st_size, reason="unreadable")
             )
+            self.archive_stats[str(path)] = ArchiveStat(
+                path=str(path), size=stat.st_size, opened=False, error=str(exc)
+            )
             return
+
+        self.archive_stats[str(path)] = ArchiveStat(
+            path=str(path), size=stat.st_size, opened=True, members_total=len(members)
+        )
 
         for member in members:
             self.total_files_seen += 1
