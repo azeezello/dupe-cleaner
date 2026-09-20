@@ -221,3 +221,48 @@ def test_a_photo_that_will_not_decode_gets_no_metrics_rather_than_zeroes(tmp_pat
 
         assert index.quality_for_hashes(["hash-broken"]) == {}
         assert index.count_quality_metrics() == 0
+
+
+def test_a_known_file_size_is_used_instead_of_stating_the_file(tmp_path: Path):
+    """The scan already knows every file's size from the walk that found
+    it. Statting again is not free — through the session's mount to
+    D:\\Photos it measured 2.3 ms, against 0.4 ms for all three metrics
+    together — so the caller passes it in and `generate` must actually use
+    what it is given.
+    """
+    src = tmp_path / "shot.heic.png"  # lossless: bpp is not consulted
+    _detailed_photo((400, 300)).save(src, format="PNG")
+
+    # A deliberately wrong size, on a format whose score *does* read it.
+    lying, basis, _ = quality.measure_recompression(
+        image_format="HEIF", quantization=None, pixels=400 * 300, file_bytes=1_000_000
+    )
+    honest, _, _ = quality.measure_recompression(
+        image_format="HEIF", quantization=None, pixels=400 * 300, file_bytes=5_000
+    )
+    assert basis == quality.BASIS_BITS_PER_PIXEL
+    assert lying != honest  # the parameter is load-bearing, not decoration
+
+    # And the real path: the file is not stat'ed at all when its size was
+    # supplied. Patching pathlib.Path.stat rather than os.stat on purpose —
+    # Path.stat resolves os.stat at import time, so patching the latter
+    # catches nothing and the test would pass against the very code it is
+    # supposed to forbid.
+    seen: list[str] = []
+    real_stat = Path.stat
+
+    def counting_stat(self, *args, **kwargs):
+        seen.append(str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(Path, "stat", counting_stat)
+        thumbnails.generate(src, file_bytes=12345)
+        assert str(src) not in seen
+
+        seen.clear()
+        thumbnails.generate(src)  # ...and it still stats when nobody said
+        assert str(src) in seen
+    finally:
+        monkey.undo()

@@ -108,7 +108,11 @@ def run_full_stage(
         and record.media_kind is MediaKind.PHOTO
         and not record.is_archive_member
     ):
-        thumbnails.maybe_generate(index, content_hash, Path(record.real_path))
+        # record.size is this file's size from the enumeration walk, so
+        # the metrics never have to stat it again (thumbnails.generate).
+        thumbnails.maybe_generate(
+            index, content_hash, Path(record.real_path), file_bytes=record.size
+        )
 
 
 def group_by_archive(

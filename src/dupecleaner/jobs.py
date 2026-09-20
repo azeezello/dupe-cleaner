@@ -322,7 +322,9 @@ class ScanJob:
             self.progress.advance(current_path=record.display_path)
             # maybe_generate is already best-effort: a photo that will not
             # decode is logged and skipped, never raised (thumbnails.py).
-            thumbnails.maybe_generate(index, content_hash, Path(record.real_path))
+            thumbnails.maybe_generate(
+                index, content_hash, Path(record.real_path), file_bytes=record.size
+            )
             # Not hashing work: an upgraded scan that re-hashes nothing must
             # still report files_hashed == 0 (see ScanProgress.advance).
             self.progress.advance(files=1, count_as_hashed=False)
