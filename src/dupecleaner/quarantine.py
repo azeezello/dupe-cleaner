@@ -1,4 +1,4 @@
-"""Turns a list of confirmed DuplicateGroups into safe filesystem actions.
+r"""Turns a list of confirmed DuplicateGroups into safe filesystem actions.
 
 Nothing here ever calls os.remove(). The only destructive-looking action is
 `shutil.move` into the quarantine folder, which is reversible (see
