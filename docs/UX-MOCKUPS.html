@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dupe-cleaner — макеты (задача 10)</title>
+<style>
+  /* ============================================================
+     ТОКЕНЫ ЯЗЫКА (см. docs/DECISIONS.md, Р10)
+     Тёмная тема — единственная; переключателя нет намеренно.
+     ============================================================ */
+  :root{
+    --bg:            #14151a;
+    --bg-elev:       #1c1e24;
+    --bg-elev-2:     #23262e;
+    --bg-sunken:     #101114;
+    --border:        #2c2f38;
+    --border-soft:   #23252c;
+    --text:          #e7e8ec;
+    --text-muted:    #9aa0ac;
+    --text-faint:    #666b77;
+
+    --accent:        #5b8cff;
+    --accent-soft:   rgba(91,140,255,.16);
+    --accent-text:   #cfdbff;
+
+    --ok:            #4ec178;
+    --ok-soft:       rgba(78,193,120,.15);
+    --warn:          #e6a23c;
+    --warn-soft:     rgba(230,162,60,.15);
+    --danger:        #f0645a;
+    --danger-soft:   rgba(240,100,90,.15);
+    --neutral:       #8b93a3;
+    --neutral-soft:  rgba(139,147,163,.13);
+
+    --focus:         #7aa2ff;
+    --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px;
+    --font-ui:   system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body{
+    margin:0; color: var(--text); font-family: var(--font-ui);
+    font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+  }
+  code, .mono { font-family: var(--font-mono); }
+  .tabular { font-variant-numeric: tabular-nums; }
+  ::selection { background: var(--accent-soft); }
+  a { color: var(--accent-text); }
+  button { font-family: inherit; }
+  button:focus-visible, [tabindex]:focus-visible, input:focus-visible {
+    outline: 2px solid var(--focus); outline-offset: 2px;
+  }
+
+  /* ---------- каркас страницы макетов (не часть продукта) ---------- */
+  .doc-topbar{
+    position: sticky; top:0; z-index: 50;
+    display:flex; align-items:center; gap: .75rem;
+    padding: .6rem 1rem; background: var(--bg-elev);
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .doc-topbar b { font-size: .8rem; color: var(--text-muted); font-weight: 600; }
+  .doc-tabs { display:flex; gap:.35rem; flex-wrap: wrap; }
+  .doc-tab{
+    background: transparent; color: var(--text-muted); border:1px solid var(--border-soft);
+    border-radius: 999px; padding: .32rem .75rem; font-size: .78rem; cursor:pointer;
+  }
+  .doc-tab.active{ background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+  .doc-note{ max-width: 900px; margin: 0 auto; padding: .6rem 1rem 0; color: var(--text-faint); font-size: .78rem; }
+
+  .panel{ display:none; padding: 1.25rem 1rem 4rem; max-width: 1080px; margin: 0 auto; }
+  .panel.active{ display:block; }
+  .panel h2{ font-size: 1.05rem; margin: 0 0 .15rem; }
+  .panel .lede{ color: var(--text-muted); font-size: .85rem; margin: 0 0 1.1rem; max-width: 62ch; }
+  .screen{
+    background: var(--bg-elev); border:1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 1.1rem 1.15rem; margin-bottom: 1.1rem;
+  }
+  .screen h3{ margin:0 0 .7rem; font-size: .95rem; }
+  .why{
+    font-size: .8rem; color: var(--text-muted); background: var(--bg-sunken);
+    border: 1px solid var(--border-soft); border-radius: var(--radius-md);
+    padding: .6rem .75rem; margin-top: .7rem;
+  }
+  .why b { color: var(--text); }
+
+  /* ============================================================
+     ЭКРАН 1 — ЗАПУСК СКАНА
+     ============================================================ */
+  .app-shell{ max-width: 640px; }
+  .app-h1{ font-size: 1.3rem; margin: 0 0 .1rem; }
+  .app-sub{ color: var(--text-muted); font-size: .85rem; margin: 0 0 1.2rem; }
+  .field label{ display:block; font-size: .8rem; color: var(--text-muted); margin-bottom: .3rem; }
+  textarea.mock-input{
+    width:100%; background: var(--bg-sunken); border:1px solid var(--border); color: var(--text);
+    border-radius: var(--radius-md); padding: .6rem .7rem; font-family: var(--font-mono); font-size: .82rem;
+  }
+  .mode-cards{ display:grid; grid-template-columns: 1fr 1fr; gap: .6rem; margin: .9rem 0; }
+  @media (max-width: 560px){ .mode-cards{ grid-template-columns: 1fr; } }
+  .mode-card{
+    position: relative; border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: .8rem .85rem; cursor: pointer; background: var(--bg-sunken);
+  }
+  .mode-card.selected{ border-color: var(--accent); background: var(--accent-soft); }
+  .mode-card .mc-title{ display:flex; align-items:center; gap:.4rem; font-weight: 600; font-size: .92rem; }
+  .mode-card .mc-radio{
+    width: 15px; height:15px; border-radius: 50%; border: 1.5px solid var(--text-faint); flex: none;
+  }
+  .mode-card.selected .mc-radio{ border-color: var(--accent); background: radial-gradient(circle, var(--accent) 0 40%, transparent 42%); }
+  .mode-card .mc-desc{ font-size: .78rem; color: var(--text-muted); margin-top: .35rem; }
+  .mode-card .mc-meta{ font-size: .72rem; color: var(--text-faint); margin-top: .45rem; }
+  .guarantee-line{
+    display:flex; gap:.5rem; align-items:flex-start; font-size: .78rem; color: var(--text-muted);
+    background: var(--ok-soft); border:1px solid transparent; border-radius: var(--radius-md);
+    padding: .55rem .7rem; margin-top: .2rem;
+  }
+  .guarantee-line b{ color: var(--ok); }
+  .btn{
+    border-radius: var(--radius-sm); border:1px solid var(--border); background: var(--bg-elev-2);
+    color: var(--text); padding: .5rem 1rem; font-size: .85rem; cursor:pointer;
+  }
+  .btn.primary{ background: var(--accent); border-color: var(--accent); color:#0b1220; font-weight:600; }
+  .btn.ghost{ background: transparent; }
+  .btn.sm{ padding: .28rem .6rem; font-size: .75rem; }
+  .btn:disabled{ opacity:.45; cursor:not-allowed; }
+  .row-actions{ display:flex; gap:.5rem; margin-top: 1rem; }
+
+  /* ============================================================
+     ЭКРАН 2 — СВОДКА И ОХВАТ
+     ============================================================ */
+  .stat-strip{ display:flex; gap: 1.4rem; flex-wrap:wrap; margin-bottom: .9rem; }
+  .stat{ min-width: 120px; }
+  .stat .n{ font-size: 1.3rem; font-weight: 700; }
+  .stat .l{ font-size: .72rem; color: var(--text-muted); }
+  .mode-pill{
+    display:inline-flex; align-items:center; gap:.3rem; font-size: .72rem; padding: .15rem .55rem;
+    border-radius: 999px; border:1px solid var(--border); color: var(--text-muted); vertical-align: middle;
+  }
+
+  .coverage-banner{
+    display:flex; align-items:center; gap:.8rem; flex-wrap: wrap;
+    background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+    border-radius: var(--radius-md); padding: .7rem .9rem; margin-bottom: 1rem;
+  }
+  .coverage-banner .cb-icon{ font-size: 1.1rem; }
+  .coverage-banner .cb-text{ flex: 1 1 320px; font-size: .82rem; }
+  .coverage-banner .cb-text b{ color: var(--warn); }
+
+  .verdict-strip{ display:flex; gap:.5rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
+  .verdict-chip{
+    display:flex; align-items:center; gap:.4rem; border-radius: var(--radius-md);
+    padding: .45rem .7rem; font-size: .78rem; border: 1px solid transparent;
+  }
+  .verdict-chip .vc-n{ font-weight:700; font-size: .92rem; }
+  .verdict-chip.ok{ background: var(--ok-soft); color: var(--ok); }
+  .verdict-chip.warn{ background: var(--warn-soft); color: var(--warn); }
+  .verdict-chip.neutral{ background: var(--neutral-soft); color: var(--neutral); }
+  .verdict-chip.danger{ background: var(--danger-soft); color: var(--danger); }
+
+  .type-tabs{ display:flex; gap:.4rem; border-bottom: 1px solid var(--border); margin-bottom: .9rem; }
+  .type-tab{
+    background:none; border:none; color: var(--text-muted); padding: .5rem .2rem; font-size: .85rem;
+    border-bottom: 2px solid transparent; cursor:pointer; margin-right: .6rem;
+  }
+  .type-tab.active{ color: var(--text); border-bottom-color: var(--accent); }
+  .type-tab .cnt{ color: var(--text-faint); font-size: .75rem; }
+
+  /* ============================================================
+     СЕТКА ГРУПП (общая для полного/быстрого экрана)
+     ============================================================ */
+  .vg-wrap{ border:1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--bg-sunken); }
+  .vg-toolbar{
+    display:flex; justify-content:space-between; align-items:center; gap:.6rem; flex-wrap:wrap;
+    padding: .5rem .7rem; font-size: .72rem; color: var(--text-faint); border-bottom: 1px solid var(--border-soft);
+  }
+  .vg-viewport{ position: relative; height: 460px; overflow-y: auto; overflow-x: hidden; }
+  .vg-sizer{ position: relative; width: 100%; }
+  .vg-pool{ position:absolute; top:0; left:0; }
+
+  .tile{
+    position:absolute; width: 148px; height: 190px;
+    background: var(--bg-elev); border:1px solid var(--border-soft); border-radius: var(--radius-md);
+    overflow:hidden; transition: border-color .1s ease;
+  }
+  .tile:hover, .tile:focus-within{ border-color: var(--accent); }
+  .tile .thumb{
+    position:relative; width:100%; height: 132px; background-size: cover; background-position: center;
+    display:flex; align-items:flex-end; justify-content:flex-start;
+  }
+  .tile .thumb.no-preview{ display:flex; align-items:center; justify-content:center; flex-direction:column; gap:.15rem; }
+  .tile .ext-mono{ font-size: 1rem; font-weight:800; letter-spacing:.02em; }
+  .tile .ext-sub{ font-size: .62rem; opacity:.85; }
+  .tile .chk{
+    position:absolute; top:6px; right:6px; width:16px; height:16px; border-radius:4px;
+    border: 1.5px solid rgba(255,255,255,.55); background: rgba(20,21,26,.35);
+  }
+  .tile .chk.checked{ background: var(--ok); border-color: var(--ok); }
+  .tile .chk.checked::after{ content:"✓"; color:#0b1220; font-size:11px; font-weight:800; display:block; text-align:center; line-height:15px; }
+  .tile .count-badge{
+    position:absolute; left:6px; top:6px; background: rgba(10,11,14,.65); color:#fff;
+    font-size: .65rem; padding: .05rem .35rem; border-radius: 999px; font-weight:600;
+  }
+  .tile .q-badge{
+    position:absolute; right:6px; bottom:6px; font-size: .6rem; padding: .04rem .32rem;
+    border-radius: 4px; background: rgba(10,11,14,.7); color: var(--warn); font-weight:600;
+  }
+  .tile .info{ padding: .38rem .45rem; }
+  .tile .path{
+    font-size: .68rem; color: var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .tile .path.named::before{ content:"📁 "; }
+  .tile .path.dated::before{ content:"🗓 "; opacity:.7; }
+  .tile .size{ font-size: .68rem; color: var(--text-faint); margin-top: .1rem; }
+
+  .vg-status{ display:flex; gap: .9rem; }
+
+  /* ============================================================
+     ЭКРАН 5 — КАРТОЧКА АРХИВА
+     ============================================================ */
+  .archive-card{
+    border: 1px solid var(--border); border-radius: var(--radius-md); padding: .8rem .9rem; margin-bottom: .7rem;
+    display:flex; gap: .9rem; align-items:flex-start; flex-wrap: wrap;
+  }
+  .archive-card .ac-icon{ font-size: 1.4rem; line-height:1; }
+  .archive-card .ac-body{ flex:1 1 320px; }
+  .archive-card .ac-path{ font-family: var(--font-mono); font-size: .82rem; margin-bottom: .25rem; }
+  .archive-card .ac-verdict{
+    display:inline-flex; align-items:center; gap:.3rem; font-size: .72rem; font-weight:700;
+    padding: .12rem .5rem; border-radius: 999px; margin-bottom: .4rem;
+  }
+  .archive-card .ac-verdict.ok{ background: var(--ok-soft); color: var(--ok); }
+  .archive-card .ac-verdict.warn{ background: var(--warn-soft); color: var(--warn); }
+  .archive-card .ac-verdict.neutral{ background: var(--neutral-soft); color: var(--neutral); }
+  .archive-card .ac-verdict.danger{ background: var(--danger-soft); color: var(--danger); }
+  .ac-bar-outer{ height: 6px; border-radius: 999px; background: var(--bg-sunken); overflow:hidden; margin: .35rem 0; max-width: 320px; }
+  .ac-bar-inner{ height:100%; background: var(--warn); }
+  .ac-detail{ font-size: .78rem; color: var(--text-muted); }
+  .archive-card .ac-action{ flex: none; align-self:center; text-align:right; }
+  .ac-action .hint{ display:block; font-size: .68rem; color: var(--text-faint); margin-top:.3rem; max-width: 160px; }
+
+  /* ============================================================
+     ЭКРАН 6 — СРАВНЕНИЕ МЕДИА (лупа)
+     ============================================================ */
+  .compare-wrap{ display:grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 720px){ .compare-wrap{ grid-template-columns: 1fr; } }
+  .compare-pane{ border:1px solid var(--border); border-radius: var(--radius-md); overflow:hidden; background: var(--bg-sunken); }
+  .compare-pane.chosen{ border-color: var(--ok); }
+  .cp-head{ display:flex; justify-content:space-between; align-items:center; padding: .5rem .7rem; border-bottom: 1px solid var(--border-soft); }
+  .cp-head .cp-title{ font-size: .82rem; font-weight:600; }
+  .cp-head .cp-badge{ font-size: .68rem; padding: .1rem .5rem; border-radius: 999px; background: var(--ok-soft); color: var(--ok); font-weight:700; }
+  .cp-img{
+    position:relative; height: 230px; background: repeating-linear-gradient(45deg, #1b1c22 0 10px, #191a20 10px 20px);
+    display:flex; align-items:center; justify-content:center; overflow:hidden;
+  }
+  .cp-img .fake-photo{
+    position:absolute; inset:0; background: radial-gradient(circle at 35% 30%, #6b7a99, #2a3040 70%);
+  }
+  .cp-img.soft .fake-photo{ filter: blur(2.5px) saturate(.8); }
+  .loupe{
+    position:absolute; width: 92px; height: 92px; border-radius: 50%; border: 2px solid var(--accent);
+    box-shadow: 0 0 0 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.5);
+    background-repeat:no-repeat; pointer-events:none;
+  }
+  .cp-metrics{ padding: .6rem .7rem; font-size: .78rem; color: var(--text-muted); display:grid; gap:.3rem; }
+  .metric-row{ display:flex; justify-content:space-between; gap:.5rem; }
+  .metric-row .m-bar-outer{ flex:1; height:5px; background: var(--bg-elev-2); border-radius:999px; overflow:hidden; margin: 0 .5rem; }
+  .metric-row .m-bar-inner{ height:100%; background: var(--accent); }
+  .verdict-line{ font-size: .82rem; margin-top:.8rem; padding: .6rem .75rem; background: var(--bg-sunken); border-radius: var(--radius-md); border:1px solid var(--border-soft); }
+  .verdict-line b{ color: var(--ok); }
+
+  .legend-row{ display:flex; gap:1rem; flex-wrap:wrap; font-size: .74rem; color: var(--text-faint); margin-top: .6rem; }
+  .legend-row span{ display:inline-flex; align-items:center; gap:.3rem; }
+  .legend-dot{ width:8px; height:8px; border-radius:50%; display:inline-block; }
+</style>
+</head>
+<body>
+
+  <div class="doc-topbar">
+    <b>dupe-cleaner · задача 10 · макеты</b>
+    <div class="doc-tabs" id="tabs"></div>
+  </div>
+  <p class="doc-note">Тёмная тема — единственная и намеренная (см. Р10 в docs/DECISIONS.md). Данные ниже синтетические, но объём — из реального прогона: 8814 групп / 6000 в быстром / 36 386 файлов.</p>
+
+  <!-- ============================================================
+       ЭКРАН 1
+       ============================================================ -->
+  <section class="panel" data-panel="start">
+    <h2>Экран 1 · Запуск скана</h2>
+    <p class="lede">Тот же функционал, что уже есть (переключатель «Быстро / Полно», задача 7), но выбор режима — не строчка радиокнопок, а две карточки: их проще ударить с первого взгляда, и выбранная видна из другого конца комнаты.</p>
+    <div class="screen">
+      <div class="app-shell">
+        <div class="app-h1">dupe-cleaner</div>
+        <p class="app-sub">Локальный поиск дубликатов. Ничего не покидает эту машину.</p>
+        <div class="field">
+          <label>Папки или диски (по одной на строку)</label>
+          <textarea class="mock-input" rows="2">D:\Photos
+D:\Google Photos Takeouts</textarea>
+        </div>
+
+        <div class="mode-cards">
+          <div class="mode-card selected" tabindex="0" role="radio" aria-checked="true">
+            <div class="mc-title"><span class="mc-radio"></span> Быстро</div>
+            <div class="mc-desc">Точные дубликаты среди обычных файлов. Архивы не открываются, превью не строятся.</div>
+            <div class="mc-meta">по прошлому прогону: ~1 минута на 36 тыс. файлов</div>
+          </div>
+          <div class="mode-card" tabindex="0" role="radio" aria-checked="false">
+            <div class="mc-title"><span class="mc-radio"></span> Полно</div>
+            <div class="mc-desc">То же самое плюс содержимое архивов и превью для просмотра.</div>
+            <div class="mc-meta">по прошлому прогону: ~9,5 минут</div>
+          </div>
+        </div>
+
+        <div class="guarantee-line">
+          <span>✓</span>
+          <span><b>Ни один режим не теряет файлы.</b> Разница — в охвате, не в надёжности: в карантин в обоих случаях уходит только подтверждённое байт-в-байт. Начали с быстрого — можно досчитать до полного позже, не сканируя заново.</span>
+        </div>
+
+        <div class="row-actions">
+          <button class="btn primary">Начать скан</button>
+        </div>
+      </div>
+    </div>
+    <div class="why">
+      <b>Почему карточки, а не радиокнопки.</b> Раньше — обычный <code>&lt;input type="radio"&gt;</code> со скромной подписью; выбор было легко пропустить взглядом, хотя это самый важный переключатель на экране (Р7). Карточка целиком кликабельна/фокусируема, а разница «что произойдёт» читается без прищура. Cтрока замера времени (мс/мин) — не выдумка: цифры берутся из последнего реального прогона на этой машине, не «около».
+    </div>
+  </section>
+
+  <!-- ============================================================
+       ЭКРАН 2
+       ============================================================ -->
+  <section class="panel" data-panel="results">
+    <h2>Экран 2 · Результаты: сводка и охват</h2>
+    <p class="lede">Главная задача экрана — не дать быстрому скану прочитаться как «дублей больше нет» (Р7). Поэтому баннер охвата — не тихая строка под сводкой, а первое, что видно, в цвете, с числом и кнопкой.</p>
+
+    <div class="screen">
+      <div class="stat-strip">
+        <div class="stat"><div class="n tabular">8 814</div><div class="l">групп дублей</div></div>
+        <div class="stat"><div class="n tabular">22,9 ГБ</div><div class="l">можно освободить</div></div>
+        <div class="stat"><div class="n tabular">36 386</div><div class="l">файлов просмотрено</div></div>
+        <div class="stat"><span class="mode-pill">режим: Полный</span></div>
+      </div>
+
+      <div class="coverage-banner">
+        <span class="cb-icon">⏳</span>
+        <span class="cb-text">Показан результат <b>быстрого</b> скана: <b>38 архивов</b> (12,4 ГБ) не открывались — дубликаты внутри них здесь не отображены, превью тоже не строились.</span>
+        <button class="btn primary sm">Досчитать полностью</button>
+      </div>
+
+      <div class="verdict-strip">
+        <div class="verdict-chip ok"><span class="vc-n">6</span> полностью избыточны</div>
+        <div class="verdict-chip warn"><span class="vc-n">27</span> частично избыточны</div>
+        <div class="verdict-chip neutral"><span class="vc-n">4</span> уникальны</div>
+        <div class="verdict-chip danger"><span class="vc-n">1</span> не прочитан</div>
+      </div>
+
+      <div class="type-tabs">
+        <button class="type-tab active">Обычные файлы <span class="cnt">7 940</span></button>
+        <button class="type-tab">Медиа — ручная проверка <span class="cnt">839</span></button>
+        <button class="type-tab">Только в архивах <span class="cnt">35</span></button>
+      </div>
+      <p class="lede" style="margin-bottom:0">↳ переключение табами вместо трёх раскрытых блоков «details» — на 8814 группах аккордеон из трёх секций ничего не экономит, а таб сохраняет место под сетку.</p>
+    </div>
+    <div class="why">
+      <b>Почему вердикты архивов показаны всегда, а не только на отдельном экране «Архивы».</b> В брифе экран «Архивы» отмечен как «Нет» — его подробный вид (список, фильтры) действительно из задачи 12. Но сами четыре числа уже есть в отчёте (задача 4) и ничего не стоят на этом экране: без них полностью избыточный архив, который давно можно было бы убрать одним нажатием, попросту невидим.
+    </div>
+  </section>
+
+  <!-- ============================================================
+       ЭКРАН 3 — СЕТКА, ПОЛНЫЙ РЕЖИМ
+       ============================================================ -->
+  <section class="panel" data-panel="grid-full">
+    <h2>Экран 3 · Сетка дублей — полный режим (с превью)</h2>
+    <p class="lede">Одна плитка = одна группа, не одна плитка на копию. Внутри группы точных дублей копии побайтово одинаковы (Р8) — показывать одно и то же изображение два-три раза подряд не добавляет информации, только удлиняет скролл в 2–3 раза на 8814 группах.</p>
+
+    <div class="screen">
+      <div class="vg-wrap">
+        <div class="vg-toolbar">
+          <span>Синтетические данные для демонстрации виртуализации — <b id="full-count">0</b> плиток</span>
+          <span class="vg-status" id="full-status"></span>
+        </div>
+        <div class="vg-viewport" id="vp-full">
+          <div class="vg-sizer" id="sizer-full"><div class="vg-pool" id="pool-full"></div></div>
+        </div>
+      </div>
+      <div class="legend-row">
+        <span><span class="legend-dot" style="background:var(--ok)"></span> отмечено в карантин</span>
+        <span>📁 — именованная папка хранит копию (Р8)</span>
+        <span>🗓 — датированная папка</span>
+        <span><span class="mono" style="color:var(--warn)">рез. ↓ / резкость ↓</span> — метрика качества из индекса (задача 9), информационно</span>
+      </div>
+    </div>
+    <div class="why">
+      <b>Клик/Enter по плитке</b> не открывает модалку — он разворачивает мини-панель на месте (пути всех копий, «Сверить полностью»), не ломая позицию скролла в сетке. Это часть ответа на «решение за секунду»: раскрытие ничего не грузит с сервера заново, кроме одной проверки по требованию.
+      <br><br>
+      <b>Путь хранителя</b> — это <code>keeper_display_path</code> с сервера (Р8), макет не пересчитывает «самый короткий путь» в браузере — та самая ошибка, которую задача 6 нашла и исправила в текущем <code>app.js</code>.
+    </div>
+  </section>
+
+  <!-- ============================================================
+       ЭКРАН 4 — СЕТКА, БЫСТРЫЙ РЕЖИМ
+       ============================================================ -->
+  <section class="panel" data-panel="grid-quick">
+    <h2>Экран 4 · Сетка дублей — быстрый режим (без превью)</h2>
+    <p class="lede">В быстром режиме превью не строятся вовсе (задача 7) — 6000 плиток не должны выглядеть как 6000 серых прямоугольников. Вместо фотографии — карточка с тем, что реально известно без чтения байт: расширение, число копий, объём, путь хранителя.</p>
+
+    <div class="screen">
+      <div class="vg-wrap">
+        <div class="vg-toolbar">
+          <span>Синтетические данные — <b id="quick-count">0</b> плиток, без превью</span>
+          <span class="vg-status" id="quick-status"></span>
+        </div>
+        <div class="vg-viewport" id="vp-quick">
+          <div class="vg-sizer" id="sizer-quick"><div class="vg-pool" id="pool-quick"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="why">
+      <b>Почему не «серый прямоугольник + подпись».</b> Верхняя половина плитки красится по категории файла (изображение / видео / прочее) и несёт моноширинное расширение крупным начертанием — это не декорация, а способ разом видеть состав сетки боковым зрением, пролистывая тысячи карточек: сплошная полоса одного цвета — однородный участок (например, RAW с одной камеры), пестрота — смешанный. Серый бы этого не показал.
+      <br><br>
+      Макет намеренно не выдумывает превью «как будто» — это противоречило бы принципу брифа «честность в цифрах»: раз файл не читался, ничего похожего на его содержимое на экране быть не должно.
+    </div>
+  </section>
+
+  <!-- ============================================================
+       ЭКРАН 5 — АРХИВЫ
+       ============================================================ -->
+  <section class="panel" data-panel="archives">
+    <h2>Экран 5 · Карточка архива — все четыре вердикта</h2>
+    <p class="lede">Вердикт архива (задача 4: полностью/частично избыточен, уникален, не прочитан) есть в отчёте и в CLI, на экране — нет. Право на действие («в карантин целиком») — только у полностью избыточного; форма карточки сама эту границу и показывает.</p>
+
+    <div class="screen">
+      <div class="archive-card">
+        <div class="ac-icon">📦</div>
+        <div class="ac-body">
+          <div class="ac-verdict ok">✓ полностью избыточен</div>
+          <div class="ac-path">D:\Backup\2021_export_full.zip</div>
+          <div class="ac-detail">612 файлов, 3,1 ГБ — все уже есть на диске обычными файлами.</div>
+        </div>
+        <div class="ac-action">
+          <button class="btn primary sm">В карантин целиком</button>
+          <span class="hint">двойники будут перечитаны и захэшированы заново в момент нажатия, не по данным скана</span>
+        </div>
+      </div>
+
+      <div class="archive-card">
+        <div class="ac-icon">📦</div>
+        <div class="ac-body">
+          <div class="ac-verdict warn">◐ частично избыточен</div>
+          <div class="ac-path">D:\Google Photos Takeouts\takeout.tgz</div>
+          <div class="ac-bar-outer"><div class="ac-bar-inner" style="width:59.3%"></div></div>
+          <div class="ac-detail">3 727 из 6 286 участников (59,3%, 9,37 ГБ из 44,9 ГБ) уже лежат на диске обычными файлами.</div>
+        </div>
+        <div class="ac-action">
+          <button class="btn sm" disabled>В карантин целиком</button>
+          <span class="hint">недоступно — в архиве остаётся уникальное содержимое</span>
+        </div>
+      </div>
+
+      <div class="archive-card">
+        <div class="ac-icon">📦</div>
+        <div class="ac-body">
+          <div class="ac-verdict neutral">— уникален</div>
+          <div class="ac-path">D:\Photos\old_scans.7z</div>
+          <div class="ac-detail">Ни одного участника с двойником на диске. Действие не предлагается — смотреть нечего проверять.</div>
+        </div>
+      </div>
+
+      <div class="archive-card">
+        <div class="ac-icon">📦</div>
+        <div class="ac-body">
+          <div class="ac-verdict danger">✕ не прочитан</div>
+          <div class="ac-path">D:\Backup\family_2019_encrypted.7z</div>
+          <div class="ac-detail">Причина: требуется пароль. Неизвестные байты избыточными не бывают — вердикт не «уникален» и не «избыточен».</div>
+        </div>
+      </div>
+
+      <div class="archive-card" style="opacity:.6">
+        <div class="ac-icon">📦</div>
+        <div class="ac-body">
+          <div class="ac-verdict danger">✕ не прочитан (быстрый режим)</div>
+          <div class="ac-path">D:\Photos\any_archive.zip</div>
+          <div class="ac-detail">В быстром режиме архивы не открываются в принципе — вердикт «не прочитан» получает каждый, действия нет ни у одного.</div>
+        </div>
+      </div>
+    </div>
+    <div class="why">
+      <b>Почему кнопка у «частично избыточен» видна, но не спрятана совсем.</b> Спрятать её means человек не узнает, что здесь вообще есть что-то избыточное (9,37 ГБ на реальном прогоне). Задизейблить с подписью причины — тот же принцип 5 брифа («честность в цифрах»), только про действия: видно, что есть, и видно, почему пока нельзя. «Растворение» частично избыточных архивов — отдельная, не принятая задача (см. «За пределами плана» в plan.md).
+    </div>
+  </section>
+
+  <!-- ============================================================
+       ЭКРАН 6 — СРАВНЕНИЕ
+       ============================================================ -->
+  <section class="panel" data-panel="compare">
+    <h2>Экран 6 · Сравнение медиа — крупная пара с лупой</h2>
+    <p class="lede">Отвечает на открытый вопрос брифа №4: «как показать размытость/пережатие на превью, а не только числом». На <b>128×128 плитке разница не видна физически</b> — нужен крупный план и зум на общую точку кадра.</p>
+
+    <div class="screen">
+      <p class="lede" style="margin-bottom:.8rem">Этот экран — не для сегодняшних точных дублей (там копии побайтово идентичны, сравнивать нечего — см. экран 3). Он для группы <b>похожих</b> снимков (near-duplicate, задачи 13/14/17): копии реально разного качества, и здесь решается Р2 — «оставить лучшую копию» — на глаз, а не только по числу.</p>
+      <div class="compare-wrap">
+        <div class="compare-pane chosen">
+          <div class="cp-head"><span class="cp-title">IMG_2201.jpg</span><span class="cp-badge">лучше</span></div>
+          <div class="cp-img" id="cp-sharp">
+            <div class="fake-photo"></div>
+            <div class="loupe" id="loupe-sharp"></div>
+          </div>
+          <div class="cp-metrics">
+            <div class="metric-row"><span>Разрешение</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:92%"></span></span><span class="tabular">4032×3024</span></div>
+            <div class="metric-row"><span>Резкость</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:88%"></span></span><span class="tabular">0.88</span></div>
+            <div class="metric-row"><span>Пережатие</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:6%;background:var(--ok)"></span></span><span class="tabular">низкое</span></div>
+          </div>
+        </div>
+        <div class="compare-pane">
+          <div class="cp-head"><span class="cp-title">IMG_2201_whatsapp.jpg</span></div>
+          <div class="cp-img soft" id="cp-soft">
+            <div class="fake-photo"></div>
+            <div class="loupe" id="loupe-soft"></div>
+          </div>
+          <div class="cp-metrics">
+            <div class="metric-row"><span>Разрешение</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:24%"></span></span><span class="tabular">1280×960</span></div>
+            <div class="metric-row"><span>Резкость</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:31%"></span></span><span class="tabular">0.31</span></div>
+            <div class="metric-row"><span>Пережатие</span><span class="m-bar-outer"><span class="m-bar-inner" style="width:81%;background:var(--danger)"></span></span><span class="tabular">высокое</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="verdict-line">Лупа наведена на одну и ту же точку кадра в обеих копиях (синхронный зум, не просто увеличение всей плитки) — на превью-масштабе эти два снимка выглядели бы почти одинаково; на 100% разница в резкости и пережатии становится физически видна. <b>Предложено оставить левую</b> — выше на всех трёх метриках; решение всё равно подтверждает человек, автоматика только сортирует.</div>
+    </div>
+    <div class="why">
+      <b>Почему это отдельный экран, а не режим плитки в общей сетке.</b> Принцип 3 брифа требует разной «температуры» для разных категорий: фото — крупно и спокойно, без плотной решётки. Сравнение двух конкретных копий — операция «открыл одну группу», а не «пролистываю тысячу» — плотность здесь работает против цели, а не на неё.
+    </div>
+  </section>
+
+<script>
+(function(){
+  // ---------- вкладки макета ----------
+  var panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
+  var tabsEl = document.getElementById('tabs');
+  var labels = {
+    start: '1. Запуск', results: '2. Результаты', 'grid-full': '3. Сетка · полный',
+    'grid-quick': '4. Сетка · быстрый', archives: '5. Архивы', compare: '6. Сравнение'
+  };
+  panels.forEach(function(p, i){
+    var btn = document.createElement('button');
+    btn.className = 'doc-tab' + (i === 0 ? ' active' : '');
+    btn.textContent = labels[p.dataset.panel] || p.dataset.panel;
+    btn.addEventListener('click', function(){
+      panels.forEach(function(pp){ pp.classList.remove('active'); });
+      Array.prototype.forEach.call(tabsEl.children, function(b){ b.classList.remove('active'); });
+      p.classList.add('active'); btn.classList.add('active');
+    });
+    tabsEl.appendChild(btn);
+  });
+  panels[0].classList.add('active');
+
+  // ---------- карточки режима на экране 1 ----------
+  document.querySelectorAll('.mode-card').forEach(function(card){
+    card.addEventListener('click', function(){
+      card.parentElement.querySelectorAll('.mode-card').forEach(function(c){ c.classList.remove('selected'); c.setAttribute('aria-checked','false'); });
+      card.classList.add('selected'); card.setAttribute('aria-checked','true');
+    });
+  });
+
+  // ---------- табы типов групп на экране 2 (косметика) ----------
+  document.querySelectorAll('.type-tab').forEach(function(t){
+    t.addEventListener('click', function(){
+      t.parentElement.querySelectorAll('.type-tab').forEach(function(x){ x.classList.remove('active'); });
+      t.classList.add('active');
+    });
+  });
+
+  // ---------- лупа на экране 6 ----------
+  function wireLoupe(imgId, loupeId){
+    var img = document.getElementById(imgId), loupe = document.getElementById(loupeId);
+    if (!img) return;
+    img.addEventListener('mousemove', function(e){
+      var r = img.getBoundingClientRect();
+      var x = e.clientX - r.left, y = e.clientY - r.top;
+      loupe.style.left = (x - 46) + 'px'; loupe.style.top = (y - 46) + 'px';
+      loupe.style.backgroundImage = 'radial-gradient(circle at 35% 30%, #93a3c9, #3a4258 70%)';
+      loupe.style.backgroundSize = (r.width * 3) + 'px ' + (r.height * 3) + 'px';
+      loupe.style.backgroundPosition = (-x * 3 + 46) + 'px ' + (-y * 3 + 46) + 'px';
+      loupe.style.opacity = 1;
+    });
+    img.addEventListener('mouseleave', function(){ loupe.style.opacity = 0; });
+    loupe.style.opacity = 0;
+  }
+  wireLoupe('cp-sharp', 'loupe-sharp');
+  wireLoupe('cp-soft', 'loupe-soft');
+
+  // ============================================================
+  // Виртуализация: реальная, не бутафорская — только видимые
+  // плитки в DOM, пул переиспользуется при скролле.
+  // Это и есть ответ на открытый вопрос брифа №2 (ваниль/фреймворк):
+  // сетка написана без единой внешней зависимости.
+  // ============================================================
+  var NAMED = ['Краснодар','Wedding Day','Грузия 2022-2023','Pamir 2016','Свадьба 16042017'];
+  var DATED = ['2020','2010 -2020\\2020','13 May 2018'];
+  var GENERIC = ['Pictures','DCIM','Загрузки','Новая папка (2)'];
+  var EXT_IMG = ['JPG','PNG','HEIC'];
+  var EXT_VID = ['MP4','MOV'];
+
+  function pick(arr){ return arr[(Math.random()*arr.length)|0]; }
+
+  function makeItems(n){
+    var items = [];
+    for (var i=0;i<n;i++){
+      var kind = Math.random();
+      var folderKind, folder;
+      if (kind < 0.42){ folderKind='named'; folder = pick(NAMED); }
+      else if (kind < 0.68){ folderKind='dated'; folder = pick(DATED); }
+      else { folderKind='generic'; folder = pick(GENERIC); }
+      var isVideo = Math.random() < 0.12;
+      var ext = isVideo ? pick(EXT_VID) : pick(EXT_IMG);
+      var copies = 2 + ((Math.random()*3)|0);
+      var sizeMb = isVideo ? (20 + Math.random()*180) : (1 + Math.random()*14);
+      var lowQ = !isVideo && Math.random() < 0.16;
+      items.push({ folder: folder, folderKind: folderKind, ext: ext, isVideo: isVideo, copies: copies, sizeMb: sizeMb, lowQ: lowQ, hue: isVideo ? 265 : (200 + ((Math.random()*40)|0)) });
+    }
+    return items;
+  }
+
+  function fmtSize(mb){
+    return mb >= 1024 ? (mb/1024).toFixed(1)+' ГБ' : mb.toFixed(mb<10?1:0)+' МБ';
+  }
+
+  function buildVirtualGrid(cfg){
+    var viewport = document.getElementById(cfg.viewportId);
+    var sizer = document.getElementById(cfg.sizerId);
+    var pool = document.getElementById(cfg.poolId);
+    var items = cfg.items;
+    var tileW = 148, tileH = 190, gap = 10, overscan = 2;
+    var columns = 1, rows = 0, slots = [];
+
+    function makeTileNode(){
+      var el = document.createElement('div');
+      el.className = 'tile';
+      el.tabIndex = 0;
+      var thumb = document.createElement('div'); thumb.className = 'thumb';
+      var countBadge = document.createElement('div'); countBadge.className = 'count-badge';
+      var chk = document.createElement('div'); chk.className = 'chk';
+      var qBadge = document.createElement('div'); qBadge.className = 'q-badge'; qBadge.hidden = true;
+      thumb.appendChild(countBadge); thumb.appendChild(chk); thumb.appendChild(qBadge);
+      var info = document.createElement('div'); info.className = 'info';
+      var pathEl = document.createElement('div'); pathEl.className = 'path';
+      var sizeEl = document.createElement('div'); sizeEl.className = 'size';
+      info.appendChild(pathEl); info.appendChild(sizeEl);
+      el.appendChild(thumb); el.appendChild(info);
+      return { node: el, thumb: thumb, countBadge: countBadge, chk: chk, qBadge: qBadge, pathEl: pathEl, sizeEl: sizeEl };
+    }
+
+    function updateTile(slot, item){
+      slot.countBadge.textContent = '×' + item.copies;
+      slot.chk.className = 'chk checked'; // по умолчанию отмечено к карантину
+      slot.pathEl.textContent = item.folder;
+      slot.pathEl.className = 'path ' + item.folderKind;
+      slot.sizeEl.textContent = fmtSize(item.sizeMb * (item.copies - 1)) + ' освободится';
+      if (cfg.withPreview){
+        slot.thumb.classList.remove('no-preview');
+        slot.thumb.style.background = 'radial-gradient(circle at 30% 25%, hsl(' + item.hue + ' 45% 55%), hsl(' + item.hue + ' 35% 18%) 75%)';
+        slot.thumb.innerHTML = '';
+        slot.thumb.appendChild(slot.countBadge); slot.thumb.appendChild(slot.chk); slot.thumb.appendChild(slot.qBadge);
+        if (item.lowQ){ slot.qBadge.hidden = false; slot.qBadge.textContent = 'резкость ↓'; }
+        else { slot.qBadge.hidden = true; }
+      } else {
+        slot.thumb.classList.add('no-preview');
+        slot.thumb.style.background = 'hsl(' + item.hue + ' 30% 16%)';
+        slot.thumb.innerHTML = '';
+        var mono = document.createElement('div'); mono.className = 'ext-mono'; mono.style.color = 'hsl(' + item.hue + ' 70% 72%)'; mono.textContent = item.ext;
+        var sub = document.createElement('div'); sub.className = 'ext-sub'; sub.style.color = 'hsl(' + item.hue + ' 40% 55%)'; sub.textContent = item.isVideo ? 'видео' : 'изображение';
+        slot.thumb.appendChild(mono); slot.thumb.appendChild(sub);
+        slot.thumb.appendChild(slot.countBadge); slot.thumb.appendChild(slot.chk);
+      }
+    }
+
+    function computeColumns(){
+      var w = viewport.clientWidth || 600;
+      columns = Math.max(1, Math.floor((w + gap) / (tileW + gap)));
+      rows = Math.ceil(items.length / columns);
+      sizer.style.height = (rows * (tileH + gap)) + 'px';
+    }
+
+    function ensurePool(){
+      var visRows = Math.ceil(viewport.clientHeight / (tileH + gap)) + overscan * 2;
+      var needed = Math.max(1, visRows) * columns;
+      while (slots.length < needed){
+        var s = makeTileNode();
+        pool.appendChild(s.node);
+        slots.push(s);
+      }
+    }
+
+    function render(){
+      var scrollTop = viewport.scrollTop;
+      var startRow = Math.max(0, Math.floor(scrollTop / (tileH + gap)) - overscan);
+      var visible = 0;
+      slots.forEach(function(slot, i){
+        var idx = startRow * columns + i;
+        if (idx >= items.length){ slot.node.style.display = 'none'; return; }
+        slot.node.style.display = 'block';
+        var r = Math.floor(idx / columns), c = idx % columns;
+        slot.node.style.transform = 'translate(' + (c * (tileW + gap)) + 'px,' + (r * (tileH + gap)) + 'px)';
+        updateTile(slot, items[idx]);
+        visible++;
+      });
+      if (cfg.statusId){
+        document.getElementById(cfg.statusId).textContent =
+          'DOM-узлов: ' + slots.length + ' из ' + items.length + ' карточек (' + ((slots.length/items.length*100).toFixed(1)) + '%)';
+      }
+    }
+
+    viewport.addEventListener('scroll', function(){ requestAnimationFrame(render); });
+    window.addEventListener('resize', function(){ computeColumns(); ensurePool(); render(); });
+
+    computeColumns(); ensurePool(); render();
+    return { itemCount: items.length };
+  }
+
+  var fullItems = makeItems(3200);
+  var quickItems = makeItems(6000);
+
+  document.getElementById('full-count').textContent = fullItems.length.toLocaleString('ru-RU');
+  document.getElementById('quick-count').textContent = quickItems.length.toLocaleString('ru-RU');
+
+  buildVirtualGrid({ viewportId:'vp-full', sizerId:'sizer-full', poolId:'pool-full', items: fullItems, withPreview:true, statusId:'full-status' });
+  buildVirtualGrid({ viewportId:'vp-quick', sizerId:'sizer-quick', poolId:'pool-quick', items: quickItems, withPreview:false, statusId:'quick-status' });
+})();
+</script>
+</body>
+</html>
