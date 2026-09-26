@@ -247,6 +247,10 @@ class ArchiveVerdict:
             "members_unreadable": self.members_unreadable,
             "redundant_bytes": self.redundant_bytes,
             "reason": self.reason,
+            # Task 12, screen 5: the client renders the "в карантин целиком"
+            # button from this rather than re-deriving "only FULLY_REDUNDANT
+            # is actionable" from the verdict string — one rule, one place.
+            "is_actionable": self.is_actionable,
         }
 
 
@@ -299,6 +303,30 @@ class DuplicateGroup:
 
         return choose_keeper(self.records).display_path
 
+    @property
+    def keeper_reason(self) -> str | None:
+        """Why `keeper_display_path` is the one Р8 kept — задача 12's
+        "не только выбор, но и причину". Same local-import reasoning as
+        `keeper_display_path` above; see `keeper.keeper_reason`.
+        """
+        if not self.records:
+            return None
+        from .keeper import keeper_reason as _keeper_reason
+
+        return _keeper_reason(self.records)[0]
+
+    @property
+    def keeper_reason_kind(self) -> str:
+        """`"named"` / `"dated"` / `"generic"` / `""` — cheap tile-face icon
+        hint, see `keeper.keeper_reason`'s docstring for why this is served
+        rather than reclassified in the browser.
+        """
+        if not self.records:
+            return ""
+        from .keeper import keeper_reason as _keeper_reason
+
+        return _keeper_reason(self.records)[1]
+
 
 @dataclass
 class ScanReport:
@@ -347,6 +375,8 @@ class ScanReport:
                     "has_archive_members": g.has_archive_members,
                     "only_archive_members": g.only_archive_members,
                     "keeper_display_path": g.keeper_display_path,
+                    "keeper_reason": g.keeper_reason,
+                    "keeper_reason_kind": g.keeper_reason_kind,
                     "records": [
                         {
                             "display_path": r.display_path,

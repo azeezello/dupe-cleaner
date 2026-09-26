@@ -61,6 +61,7 @@ from .models import (
     ArchiveClass,
     ArchiveVerdict,
     DuplicateGroup,
+    FileRecord,
     ScanMode,
     ScanReport,
 )
@@ -300,6 +301,7 @@ def quarantine_group(
     result: QuarantineResult,
     journal: _JournalWriter,
     confirm_media: bool = False,
+    keeper_override: FileRecord | None = None,
 ) -> None:
     if group.only_archive_members:
         # Nothing is safe to move automatically. Report it and let the user
@@ -326,7 +328,11 @@ def quarantine_group(
         )
         return
 
-    keeper = choose_keeper(group.records)
+    # Task 12: a human reviewing this specific group may override Р8's
+    # default keeper (they can see the actual files, Р8 cannot). Falls
+    # back to Р8 exactly as before when nothing overrides it, so every
+    # existing caller of this function is unaffected.
+    keeper = keeper_override if keeper_override is not None else choose_keeper(group.records)
     result.kept[group.content_hash] = keeper.display_path
 
     for record in group.records:
@@ -361,6 +367,26 @@ def quarantine_group(
             result.failed.append({**entry, "error": error})
 
 
+def _append_manifest(quarantine_root: Path, result: QuarantineResult) -> None:
+    """Append one run's summary to `manifest.json` (human-readable, not the
+    source of truth — see module docstring). Shared by `run_quarantine` and
+    `quarantine_reviewed_groups` so the two paths a file can take into
+    quarantine (bulk confirm_media pass, or a batch of individually
+    reviewed decisions) produce manifests that look the same.
+    """
+    manifest_path = quarantine_root / MANIFEST_FILENAME
+    existing = []
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = [existing]
+        except (json.JSONDecodeError, OSError):
+            existing = []
+    existing.append(result.to_dict())
+    manifest_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def run_quarantine(
     groups: list[DuplicateGroup],
     quarantine_root: Path,
@@ -384,18 +410,70 @@ def run_quarantine(
                 continue
             quarantine_group(group, quarantine_root, result, journal, confirm_media=confirm_media)
 
-    manifest_path = quarantine_root / MANIFEST_FILENAME
-    existing = []
-    if manifest_path.exists():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(existing, list):
-                existing = [existing]
-        except (json.JSONDecodeError, OSError):
-            existing = []
-    existing.append(result.to_dict())
-    manifest_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_manifest(quarantine_root, result)
+    return result
 
+
+def quarantine_reviewed_groups(
+    groups: list[DuplicateGroup],
+    quarantine_root: Path,
+    decisions: dict[str, str | None],
+    confirm_media: bool = False,
+) -> QuarantineResult:
+    """Задача 12's batch path: apply exactly the groups a human has
+    reviewed and queued, and touch nothing else.
+
+    Pilot finding P1.1 named the gap this closes: `run_quarantine` without
+    `confirm_media` moves zero media groups, with it moves every one of
+    them, and there was nothing in between. `decisions` is the accumulated
+    pile — `{content_hash: keeper_override_display_path_or_None}` — built
+    up one keyboard decision at a time and stored in the index (see
+    `storage.ScanIndex.record_decision`) rather than kept only in the
+    browser or the in-memory report, precisely so a crash or a server
+    restart mid-review does not erase an evening of looking at 8814 groups.
+
+    A group not in `decisions` is not visited at all — "непросмотренное не
+    двигается" is enforced by iterating `decisions`, not `groups`. A media
+    group inside `decisions` still needs `confirm_media=True` to actually
+    move (same rule as everywhere else the guarantee is `only byte-
+    confirmed content, explicitly confirmed, may be quarantined`): the
+    fact that a human reviewed it is not by itself permission to move
+    family photos, so it lands in `result.pending_media_review` exactly as
+    `quarantine_group` already does, and the caller (see
+    `web/app.py::apply_decisions`) knows to leave its decision queued
+    rather than mark it applied.
+
+    An archive-only group can never legitimately be a key here — the web
+    layer refuses to record a decision for one (archives have their own
+    card and their own action, task 4/Р1) — but a stale or hand-crafted
+    request naming one is silently skipped rather than trusted, the same
+    posture `quarantine_group` already takes toward archive members.
+    """
+    result = QuarantineResult()
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    by_hash = {g.content_hash: g for g in groups}
+
+    journal_path = quarantine_root / JOURNAL_FILENAME
+    with _JournalWriter(journal_path) as journal:
+        for content_hash, keeper_path in decisions.items():
+            group = by_hash.get(content_hash)
+            if group is None or group.only_archive_members:
+                continue
+            keeper_override = None
+            if keeper_path:
+                keeper_override = next(
+                    (r for r in group.records if r.display_path == keeper_path), None
+                )
+            quarantine_group(
+                group,
+                quarantine_root,
+                result,
+                journal,
+                confirm_media=confirm_media,
+                keeper_override=keeper_override,
+            )
+
+    _append_manifest(quarantine_root, result)
     return result
 
 
@@ -486,6 +564,54 @@ def restore_from_journal(
             result.restored.append(entry)
 
     return result
+
+
+def journal_summary(quarantine_root: Path) -> list[dict]:
+    """One row per operation in `journal.jsonl`, newest first — the data
+    behind the journal/restore screen (задача 12: "веб-обвязка поверх
+    готового restore_from_journal", so this reads the same journal that
+    function does and adds nothing new to the on-disk format).
+
+    Status per op_id:
+    - "moved"    — completed and still in quarantine, a candidate to
+                   restore;
+    - "restored" — already brought back, `dupecleaner restore`/this
+                   screen already ran this one;
+    - "failed"   — the move itself raised (see `_move_one`);
+    - "pending"  — the intent line was written but neither a `move_done`
+                   nor a `move_failed` followed — the process died mid-move,
+                   the same crash scenario Р5 exists to make legible instead
+                   of silent.
+    """
+    ops = _operations_from_journal(_read_journal(quarantine_root / JOURNAL_FILENAME))
+    rows: list[dict] = []
+    for op_id, op in ops.items():
+        if "move_pending" not in op.get("events", []):
+            continue
+        events = op["events"]
+        if "restored" in events:
+            status = "restored"
+        elif "move_failed" in events:
+            status = "failed"
+        elif "move_done" in events:
+            status = "moved"
+        else:
+            status = "pending"
+        rows.append(
+            {
+                "op_id": op_id,
+                "status": status,
+                "original": op.get("original"),
+                "quarantined": op.get("quarantined"),
+                "group_hash": op.get("group_hash"),
+                "size": op.get("size"),
+                "kind": op.get("kind", "file"),
+                "ts": op.get("ts"),
+                "error": op.get("move_error"),
+            }
+        )
+    rows.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    return rows
 
 
 def _archive_has_media(report: ScanReport, archive_path: str) -> bool:

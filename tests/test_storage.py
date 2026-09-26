@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dupecleaner.models import FileRecord, MediaKind
 from dupecleaner.storage import ScanIndex
 
@@ -481,3 +483,154 @@ def test_origin_verdicts_do_not_leak_between_scans(tmp_path):
         index.set_origin("b.jpg", "messenger", "high", [])
         assert index.screenshot_paths("s1") == []
         assert index.origin_breakdown("s2") == {("messenger", "high"): 1}
+
+
+# --------------------------------------------------------------------------
+# `review_decisions` (задача 12, "the main question of the session"):
+# decisions are keyed by content_hash, not scan_id, precisely so they
+# survive a server restart and a re-scan of the same roots. These tests
+# exercise that guarantee directly rather than trusting the migration
+# comment.
+# --------------------------------------------------------------------------
+
+def test_record_decision_round_trips_through_decisions_for_hashes(tmp_path: Path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.record_decision("h1", "quarantine", keeper_path="D:\\Краснодар\\a.jpg")
+        index.record_decision("h2", "keep")
+        got = index.decisions_for_hashes(["h1", "h2", "h3-never-decided"])
+
+    assert got["h1"]["action"] == "quarantine"
+    assert got["h1"]["keeper_path"] == "D:\\Краснодар\\a.jpg"
+    assert got["h1"]["applied_at"] is None
+    assert got["h2"]["action"] == "keep"
+    assert got["h2"]["keeper_path"] is None
+    assert "h3-never-decided" not in got
+
+
+def test_record_decision_rejects_an_unknown_action(tmp_path: Path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        with pytest.raises(ValueError):
+            index.record_decision("h1", "delete-it-please")
+
+
+def test_redeciding_a_group_resets_its_applied_state(tmp_path: Path):
+    """A human who changes their mind about an already-applied group must
+    have the new decision actually re-considered by the next apply, not
+    silently ignored because `applied_at` was still set from the old one."""
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.record_decision("h1", "quarantine")
+        index.mark_decisions_applied(["h1"])
+        assert index.decisions_for_hashes(["h1"])["h1"]["applied_at"] is not None
+
+        index.record_decision("h1", "keep")
+        got = index.decisions_for_hashes(["h1"])["h1"]
+        assert got["action"] == "keep"
+        assert got["applied_at"] is None
+
+
+def test_clear_decision_removes_it(tmp_path: Path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.record_decision("h1", "quarantine")
+        index.clear_decision("h1")
+        assert index.decisions_for_hashes(["h1"]) == {}
+        # Clearing something that was never decided is not an error.
+        index.clear_decision("never-existed")
+
+
+def test_mark_decisions_applied_is_batched_and_leaves_others_untouched(tmp_path: Path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.record_decision("h1", "quarantine")
+        index.record_decision("h2", "quarantine")
+        index.record_decision("h3", "keep")
+        index.mark_decisions_applied(["h1", "h3"])
+        got = index.decisions_for_hashes(["h1", "h2", "h3"])
+        assert got["h1"]["applied_at"] is not None
+        assert got["h2"]["applied_at"] is None
+        assert got["h3"]["applied_at"] is not None
+
+
+def test_pending_decision_count_counts_only_unapplied_quarantine_decisions(tmp_path: Path):
+    with ScanIndex(tmp_path / "i.db") as index:
+        index.record_decision("h1", "quarantine")
+        index.record_decision("h2", "quarantine")
+        index.record_decision("h3", "keep")
+        assert index.pending_decision_count() == 2
+        index.mark_decisions_applied(["h1"])
+        assert index.pending_decision_count() == 1
+
+
+def test_decisions_for_hashes_is_batched_past_the_sqlite_variable_limit(tmp_path: Path):
+    """`decisions_for_hashes` chunks its query -- a real report has up to
+    8814 groups, and SQLite refuses a single query with that many bound
+    parameters."""
+    hashes = [f"h{i}" for i in range(1200)]
+    with ScanIndex(tmp_path / "i.db") as index:
+        for h in hashes[:5]:
+            index.record_decision(h, "quarantine")
+        got = index.decisions_for_hashes(hashes)
+    assert len(got) == 5
+
+
+# --------------------------------------------------------------------------
+# The actual guarantee this table exists for: surviving a restart, and
+# surviving a re-scan (same content_hash, new scan_id / new report object).
+# --------------------------------------------------------------------------
+
+def test_decisions_survive_reopening_the_same_database_file(tmp_path: Path):
+    """This is P3 from the pilot report made concrete: after a server
+    restart, `registry.get(scan_id)` returns nothing -- but the decisions
+    must still be there, because they were never stored in that registry
+    to begin with."""
+    db = tmp_path / "index.db"
+    with ScanIndex(db) as index:
+        index.record_decision("stable-hash-1", "quarantine", keeper_path="D:\\a.jpg")
+
+    # A brand new ScanIndex instance against the same file -- the closest
+    # thing to "the process restarted" this test can simulate.
+    with ScanIndex(db) as index:
+        got = index.decisions_for_hashes(["stable-hash-1"])
+    assert got["stable-hash-1"]["action"] == "quarantine"
+    assert got["stable-hash-1"]["keeper_path"] == "D:\\a.jpg"
+
+
+def test_opening_a_v4_database_adds_review_decisions_in_place(tmp_path: Path):
+    """An index Aziz already has (with its expensive hashes already in it)
+    must gain the table rather than be rebuilt, exactly like the v3->v4
+    origin migration above."""
+    import sqlite3
+
+    from dupecleaner.storage import SCHEMA_VERSION
+
+    db = tmp_path / "old.db"
+    with ScanIndex(db):
+        pass  # created fresh, at the current (>=5) schema version
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP TABLE review_decisions")
+    conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    with ScanIndex(db) as index:
+        tables = {
+            row["name"]
+            for row in index._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "review_decisions" in tables
+        version = index._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+        # And it's actually usable, not just present.
+        index.record_decision("h1", "quarantine")
+        assert index.decisions_for_hashes(["h1"])["h1"]["action"] == "quarantine"
+
+
+def test_the_v5_migration_is_safe_to_run_again(tmp_path: Path):
+    db = tmp_path / "i.db"
+    with ScanIndex(db) as index:
+        index.record_decision("h1", "keep")
+    with ScanIndex(db) as index:  # reopening at the current version is a no-op
+        assert index.decisions_for_hashes(["h1"])["h1"]["action"] == "keep"

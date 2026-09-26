@@ -9,7 +9,12 @@ import pytest
 
 from dupecleaner import quarantine as quarantine_module
 from dupecleaner.dedupe import find_duplicate_groups
-from dupecleaner.quarantine import restore_from_journal, run_quarantine
+from dupecleaner.quarantine import (
+    journal_summary,
+    quarantine_reviewed_groups,
+    restore_from_journal,
+    run_quarantine,
+)
 from dupecleaner.scanner import Scanner
 
 
@@ -393,3 +398,130 @@ def test_file_quarantine_then_archive_quarantine_still_verifies(
     restored = restore_from_journal(quarantine_dir)
     assert (archive_tree / "fully.zip").exists()
     assert not restored.skipped, [s["reason"] for s in restored.skipped]
+
+
+# --------------------------------------------------------------------------
+# `quarantine_reviewed_groups` (задача 12, half two): the batch path pilot
+# finding P1.1 asked for, between "nothing moves" (no --confirm-media) and
+# "everything moves" (--confirm-media on the whole report). Only groups a
+# human actually queued in `decisions` may move; everything else -- decided
+# or not -- must be left exactly where it was.
+# --------------------------------------------------------------------------
+
+def _leaf(record) -> str:
+    # For an archive member (`archive.zip::inner/name.ext`) the meaningful
+    # leaf is the member name, not the archive's own filename.
+    if record.is_archive_member:
+        return Path(record.member_name).name
+    return Path(record.display_path).name
+
+
+def _find_group(groups, *leaf_names: str):
+    wanted = set(leaf_names)
+    for g in groups:
+        if {_leaf(r) for r in g.records} == wanted:
+            return g
+    raise AssertionError(f"no group with leaves {wanted} in {[{_leaf(r) for r in g.records} for g in groups]}")
+
+
+def test_only_decided_groups_move_undecided_ones_are_untouched(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    groups = find_duplicate_groups(list(scanner.iter_records([str(tmp_tree)])))
+
+    plain_group = _find_group(groups, "a1.txt", "a2.txt", "a_copy.txt")
+    media_group = _find_group(groups, "photo1.jpg", "photo2.jpg")
+
+    quarantine_dir = tmp_tree.parent / "q1"
+    result = quarantine_reviewed_groups(
+        groups, quarantine_dir, {plain_group.content_hash: None}, confirm_media=False
+    )
+
+    assert len(result.moved) == 1
+    # The media group was never in `decisions` at all -- not even deferred
+    # to pending_media_review, because nobody asked about it.
+    assert result.pending_media_review == []
+    assert (tmp_tree / "photo1.jpg").exists()
+    assert (tmp_tree / "photo2.jpg").exists()
+
+
+def test_a_decided_media_group_without_confirm_media_is_deferred_not_dropped(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    groups = find_duplicate_groups(list(scanner.iter_records([str(tmp_tree)])))
+    media_group = _find_group(groups, "photo1.jpg", "photo2.jpg")
+
+    quarantine_dir = tmp_tree.parent / "q2"
+    result = quarantine_reviewed_groups(
+        groups, quarantine_dir, {media_group.content_hash: None}, confirm_media=False
+    )
+    assert result.moved == []
+    assert len(result.pending_media_review) == 1
+    assert (tmp_tree / "photo1.jpg").exists()
+    assert (tmp_tree / "photo2.jpg").exists()
+
+    # The same call again, this time confirmed, actually moves it -- the
+    # exact "second explicit step" apply_decisions's docstring promises.
+    result2 = quarantine_reviewed_groups(
+        groups, quarantine_dir, {media_group.content_hash: None}, confirm_media=True
+    )
+    assert len(result2.moved) == 1
+
+
+def test_keeper_override_is_honoured_in_the_batch_path(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    groups = find_duplicate_groups(list(scanner.iter_records([str(tmp_tree)])))
+    plain_group = _find_group(groups, "a1.txt", "a2.txt", "a_copy.txt")
+
+    # Р8's default keeper would be whichever plain-file copy sorts first;
+    # override it to the *other* plain copy so the archive member (which
+    # can never be the keeper anyway) isn't the only thing left standing.
+    non_archive = [r for r in plain_group.records if not r.is_archive_member]
+    override_path = non_archive[1].display_path if len(non_archive) > 1 else non_archive[0].display_path
+
+    quarantine_dir = tmp_tree.parent / "q3"
+    result = quarantine_reviewed_groups(
+        groups, quarantine_dir, {plain_group.content_hash: override_path}, confirm_media=True
+    )
+    assert override_path in result.kept.values() or override_path == list(result.kept.values())[0]
+    assert Path(override_path).exists()
+
+
+def test_unknown_or_archive_only_hashes_in_decisions_are_skipped_not_errors(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    groups = find_duplicate_groups(list(scanner.iter_records([str(tmp_tree)])))
+    archive_only = next(g for g in groups if g.only_archive_members)
+
+    quarantine_dir = tmp_tree.parent / "q4"
+    # A hash that isn't in this report's groups at all, plus a real
+    # archive-only group's hash -- neither has a `quarantine_group` call
+    # that could possibly succeed, and both must be silently skipped.
+    result = quarantine_reviewed_groups(
+        groups,
+        quarantine_dir,
+        {"not-a-real-hash": None, archive_only.content_hash: None},
+        confirm_media=True,
+    )
+    assert result.moved == []
+    assert result.failed == []
+
+
+# --------------------------------------------------------------------------
+# `journal_summary` -- the read side of the journal/restore screen.
+# --------------------------------------------------------------------------
+
+def test_journal_summary_reports_moved_then_restored(tmp_tree: Path):
+    scanner = Scanner(include_archives=True)
+    groups = find_duplicate_groups(list(scanner.iter_records([str(tmp_tree)])))
+    plain_group = _find_group(groups, "a1.txt", "a2.txt", "a_copy.txt")
+
+    quarantine_dir = tmp_tree.parent / "q5"
+    quarantine_reviewed_groups(
+        groups, quarantine_dir, {plain_group.content_hash: None}, confirm_media=True
+    )
+
+    entries = journal_summary(quarantine_dir)
+    assert len(entries) == 1
+    assert entries[0]["status"] == "moved"
+
+    restore_from_journal(quarantine_dir)
+    entries_after = journal_summary(quarantine_dir)
+    assert entries_after[0]["status"] == "restored"

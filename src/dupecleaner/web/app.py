@@ -22,10 +22,17 @@ from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
 
 from .. import thumbnails
+from ..archive_classify import classify_archives
 from ..dedupe import verify_group
 from ..jobs import ScanRegistry
 from ..models import ScanMode
-from ..quarantine import run_quarantine
+from ..quarantine import (
+    journal_summary,
+    quarantine_archives,
+    quarantine_reviewed_groups,
+    restore_from_journal,
+    run_quarantine,
+)
 from ..storage import DEFAULT_DB_PATH, ScanIndex
 
 BASE_DIR = Path(__file__).parent
@@ -65,6 +72,31 @@ class QuarantineRequest(BaseModel):
     quarantine_dir: str
     group_hashes: Optional[list[str]] = None
     confirm_media: bool = False
+
+
+class DecisionRequest(BaseModel):
+    """One human decision on one group (задача 12). `keeper_path` overrides
+    Р8's default keeper — must be one of the group's own record paths, or
+    left unset to accept Р8's choice."""
+
+    action: str  # "quarantine" | "keep"
+    keeper_path: Optional[str] = None
+
+
+class ApplyDecisionsRequest(BaseModel):
+    quarantine_dir: str
+    confirm_media: bool = False
+
+
+class ArchiveActionRequest(BaseModel):
+    quarantine_dir: str
+    archive_path: str
+    confirm_media: bool = False
+
+
+class RestoreRequest(BaseModel):
+    quarantine_dir: str
+    op_ids: Optional[list[str]] = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -133,7 +165,34 @@ def scan_result(scan_id: str):
         **job.report.to_dict(),
     }
     _attach_quality(payload["groups"])
+    _attach_decisions(payload["groups"])
+    # Screen 5 (docs/UX-MOCKUPS.html): one verdict card per archive the
+    # scan met (task 4/Р1), computed here rather than carried on the report
+    # object — `classify_archives` needs `member_twins`, which recomputes
+    # Р8's ranking over every group, and doing that on every poll of a
+    # running scan would be wasted work `report.to_dict()` never used to
+    # do. Once, on the one endpoint that actually renders the archive tab.
+    payload["archive_verdicts"] = [v.to_dict() for v in classify_archives(job.report)]
     return payload
+
+
+def _attach_decisions(groups: list[dict]) -> None:
+    """Hang each group's review decision (задача 12), if any, off its
+    entry — same shape and same reasoning as `_attach_quality`: decisions
+    live in the index, keyed by content hash, because that is what
+    survives a lost `report` (see storage.py's schema-v5 comment), so the
+    grid can show "already queued for quarantine" the moment a report
+    loads, including a report rebuilt from scratch after a restart.
+
+    A group with no decision gets `decision: null` — "not yet reviewed" is
+    the default, not a zero-ish decision of its own.
+    """
+    if not groups:
+        return
+    with ScanIndex(DB_PATH) as index:
+        decisions = index.decisions_for_hashes(g["content_hash"] for g in groups)
+    for group in groups:
+        group["decision"] = decisions.get(group["content_hash"])
 
 
 def _attach_quality(groups: list[dict]) -> None:
@@ -235,6 +294,159 @@ def quarantine_scan(scan_id: str, req: QuarantineRequest):
         confirm_media=req.confirm_media,
         group_hashes=group_hashes,
     )
+    return result.to_dict()
+
+
+def _find_group(job, content_hash: str):
+    group = next((g for g in job.report.groups if g.content_hash == content_hash), None)
+    if group is None:
+        raise HTTPException(404, "Группа не найдена в этом скане.")
+    return group
+
+
+@app.post("/api/scan/{scan_id}/group/{content_hash}/decision")
+def set_group_decision(scan_id: str, content_hash: str, req: DecisionRequest):
+    """Задача 12, half one: record a per-group decision — this is the
+    "решение... за секунду" step, and it is deliberately *not* the step
+    that touches the filesystem. Recording is instant and reversible
+    (`DELETE` below); moving files only happens in `apply_decisions`,
+    batched, and only for groups a human actually queued — the gap pilot
+    finding P1.1 asked for between "nothing" and "everything".
+    """
+    job = registry.get(scan_id)
+    if job is None or job.report is None:
+        raise HTTPException(404, "Завершённый скан не найден.")
+    group = _find_group(job, content_hash)
+
+    if group.only_archive_members:
+        raise HTTPException(
+            400,
+            "У групп целиком внутри архивов нет отдельного решения — "
+            "архив управляется целиком через /api/scan/{id}/archive-quarantine.",
+        )
+    if req.action not in ("quarantine", "keep"):
+        raise HTTPException(400, "action должен быть 'quarantine' или 'keep'.")
+    if req.keeper_path is not None:
+        chosen = next((r for r in group.records if r.display_path == req.keeper_path), None)
+        if chosen is None:
+            raise HTTPException(400, "keeper_path не входит в состав этой группы.")
+        if chosen.is_archive_member:
+            # Р8 already ranks an archive member last precisely because it
+            # can never be the thing that moves (Р1: an archive is the unit
+            # of action). Letting a human override *to* one would strand
+            # every plain copy in quarantine behind the one copy nobody can
+            # act on.
+            raise HTTPException(
+                400, "Нельзя оставить копию внутри архива — её нельзя вынуть, не переписав архив."
+            )
+
+    with ScanIndex(DB_PATH) as index:
+        index.record_decision(content_hash, req.action, req.keeper_path)
+    return {"content_hash": content_hash, "action": req.action, "keeper_path": req.keeper_path}
+
+
+@app.delete("/api/scan/{scan_id}/group/{content_hash}/decision")
+def clear_group_decision(scan_id: str, content_hash: str):
+    """Undo — the keyboard `U` action. No group lookup against the report
+    is needed to delete a row that may or may not exist, and refusing to
+    clear a decision just because the scan object is gone would defeat the
+    entire point of decisions outliving it."""
+    with ScanIndex(DB_PATH) as index:
+        index.clear_decision(content_hash)
+    return {"content_hash": content_hash, "cleared": True}
+
+
+@app.post("/api/scan/{scan_id}/apply-decisions")
+def apply_decisions(scan_id: str, req: ApplyDecisionsRequest):
+    """Задача 12, half two: the batch path. Moves every group that is
+    (a) queued for quarantine, (b) not already applied, and (c) still
+    present in this scan's report — nothing else. Groups nobody decided on
+    are never visited (see `quarantine.quarantine_reviewed_groups`).
+
+    A media group without `confirm_media=True` stays queued rather than
+    silently dropped: its decision's `applied_at` is left NULL, so calling
+    this again with `confirm_media=True` (a second explicit step, matching
+    the rule everywhere else in this project) picks it up.
+    """
+    job = registry.get(scan_id)
+    if job is None or job.report is None:
+        raise HTTPException(404, "Завершённый скан не найден.")
+
+    hashes = [g.content_hash for g in job.report.groups]
+    with ScanIndex(DB_PATH) as index:
+        decisions = index.decisions_for_hashes(hashes)
+    to_apply = {
+        h: d["keeper_path"]
+        for h, d in decisions.items()
+        if d["action"] == "quarantine" and d["applied_at"] is None
+    }
+
+    if not to_apply:
+        return {
+            "applied": 0, "kept": {}, "moved": [], "failed": [],
+            "pending_media_review": [], "archive_only_notes": [],
+        }
+
+    result = quarantine_reviewed_groups(
+        job.report.groups, Path(req.quarantine_dir), to_apply, confirm_media=req.confirm_media,
+    )
+
+    failed_hashes = {f["group_hash"] for f in result.failed}
+    media_pending_hashes = {m["group_hash"] for m in result.pending_media_review}
+    applied_hashes = [
+        h for h in to_apply if h not in failed_hashes and h not in media_pending_hashes
+    ]
+    with ScanIndex(DB_PATH) as index:
+        index.mark_decisions_applied(applied_hashes)
+
+    payload = result.to_dict()
+    payload["applied"] = len(applied_hashes)
+    return payload
+
+
+@app.post("/api/scan/{scan_id}/archive-quarantine")
+def quarantine_one_archive(scan_id: str, req: ArchiveActionRequest):
+    """Screen 5's "в карантин целиком" button. `quarantine_archives`
+    itself is what refuses the request outright when the report was taken
+    in quick mode (Р7: every archive there is UNREAD, never actionable)
+    and refuses any archive whose verdict is not FULLY_REDUNDANT — this
+    endpoint adds nothing to that logic, it just aims it at one path.
+    """
+    job = registry.get(scan_id)
+    if job is None or job.report is None:
+        raise HTTPException(404, "Завершённый скан не найден.")
+
+    verdicts = classify_archives(job.report)
+    result = quarantine_archives(
+        verdicts,
+        job.report,
+        Path(req.quarantine_dir),
+        confirm_media=req.confirm_media,
+        archive_paths={req.archive_path},
+    )
+    return result.to_dict()
+
+
+@app.get("/api/quarantine/journal")
+def get_journal(quarantine_dir: str):
+    """The journal/restore screen's read side — a thin wrapper over
+    `quarantine.journal_summary`, itself a thin reader of `journal.jsonl`
+    (Р5: that file, not `manifest.json`, is the source of truth). Not
+    scoped to a scan_id: the journal outlives any one scan or server
+    restart, which is the entire reason it exists.
+    """
+    return {"entries": journal_summary(Path(quarantine_dir))}
+
+
+@app.post("/api/quarantine/restore")
+def restore_quarantine(req: RestoreRequest):
+    """One-action restore from the journal/restore screen — a web wrapper
+    over the already-complete `quarantine.restore_from_journal`, exactly as
+    задача 12 asks for. `op_ids=None` restores everything restorable in one
+    call; a specific set restores only the checked rows.
+    """
+    op_ids = set(req.op_ids) if req.op_ids else None
+    result = restore_from_journal(Path(req.quarantine_dir), op_ids)
     return result.to_dict()
 
 

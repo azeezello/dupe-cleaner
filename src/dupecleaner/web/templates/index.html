@@ -95,13 +95,18 @@
       <span id="upgrade-status" class="hint"></span>
     </div>
 
-    <p class="hint">Только просмотр — клавиатурная навигация и решения по группе (что оставить,
-      что отправить в карантин) появятся отдельным экраном.</p>
+    <p class="hint kbd-hint">
+      <kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&larr;</kbd><kbd>&rarr;</kbd> по группам ·
+      <kbd>Q</kbd> в карантин (копия из подсказки) · <kbd>1</kbd>&ndash;<kbd>9</kbd> в карантин
+      с другой оставляемой копией · <kbd>K</kbd> оставить обе · <kbd>U</kbd> отменить решение ·
+      <kbd>Enter</kbd> открыть панель. Решение пишется сразу; файлы не двигаются, пока
+      не нажата «Применить отмеченное» ниже.
+    </p>
 
     <div class="type-tabs" role="tablist">
       <button class="type-tab active" data-tab="plain" role="tab">Обычные файлы <span class="cnt">0</span></button>
       <button class="type-tab" data-tab="media" role="tab">⚠️ Медиа — ручная проверка <span class="cnt">0</span></button>
-      <button class="type-tab" data-tab="archive" role="tab">📦 Только внутри архивов <span class="cnt">0</span></button>
+      <button class="type-tab" data-tab="archive" role="tab">📦 Архивы <span class="cnt">0</span></button>
     </div>
 
     <div class="grid-card">
@@ -109,6 +114,14 @@
         <div class="grid-sizer" id="grid-sizer"><div class="grid-pool" id="grid-pool"></div></div>
       </div>
       <p class="hint grid-empty" id="grid-empty" hidden>В этой вкладке групп нет.</p>
+
+      <div id="archive-panel" class="archive-panel" hidden>
+        <p class="hint">Вердикт из задачи 4 (Р1) — единица действия здесь целый архив, не файл
+          внутри него. Только «полностью избыточен» даёт право на «в карантин целиком»; двойники
+          перечитываются и сверяются заново в момент нажатия, а не по данным скана.</p>
+        <div id="archive-cards"></div>
+        <p class="hint" id="archive-empty" hidden>Архивов в этом скане не было.</p>
+      </div>
     </div>
 
     <div class="card group-detail" id="group-detail" hidden>
@@ -118,11 +131,50 @@
       </div>
       <ul id="detail-records" class="detail-records"></ul>
       <p class="hint" id="detail-quality" hidden></p>
+      <p class="detail-reason" id="detail-reason" hidden></p>
+
+      <div class="decision-row" id="decision-row">
+        <button id="decide-quarantine-btn" class="btn-decide ok" title="Клавиша Q">В карантин (Q)</button>
+        <button id="decide-keep-btn" class="btn-decide" title="Клавиша K">Оставить обе (K)</button>
+        <button id="decide-undo-btn" class="btn-decide" title="Клавиша U" hidden>Отменить (U)</button>
+        <span id="decision-status" class="decision-status"></span>
+      </div>
+
       <div class="group-actions">
         <button id="detail-verify-btn" class="verify-btn">Сверить полностью</button>
         <div id="detail-verify-result" class="verify-result"></div>
       </div>
     </div>
+  </section>
+
+  <section class="card" id="quarantine-card" hidden>
+    <h2>Карантин</h2>
+    <label for="quarantine-dir">Папка карантина</label>
+    <input type="text" id="quarantine-dir" placeholder="D:\DupeQuarantine">
+
+    <p class="hint" id="queue-summary">В очереди: 0 групп.</p>
+    <label class="inline">
+      <input type="checkbox" id="confirm-media-apply">
+      Включить в это применение отмеченные медиа-группы (иначе они останутся в очереди)
+    </label>
+
+    <div class="row">
+      <button id="apply-btn" class="primary">Применить отмеченное</button>
+    </div>
+    <p class="hint" id="apply-status"></p>
+    <div id="apply-result" class="verify-result"></div>
+  </section>
+
+  <section class="card" id="journal-card" hidden>
+    <h2>Журнал и восстановление</h2>
+    <p class="hint">Читает и пишет тот же <code>journal.jsonl</code>, что и
+      <code>dupecleaner restore</code> — это веб-обвязка, не второй путь в карантин.</p>
+    <div class="row">
+      <button id="journal-refresh-btn">Показать журнал</button>
+      <button id="journal-restore-selected-btn" disabled>Вернуть отмеченное</button>
+    </div>
+    <ul id="journal-list" class="journal-list"></ul>
+    <p class="hint" id="journal-status"></p>
   </section>
 
   <section class="card" id="warnings-card" hidden>

@@ -20,6 +20,7 @@ from dupecleaner.keeper import (
     SegmentKind,
     choose_keeper,
     classify_segment,
+    keeper_reason,
     rank_keepers,
 )
 from dupecleaner.models import DuplicateGroup, FileRecord, MediaKind, ScanReport
@@ -268,3 +269,84 @@ def test_the_serialized_report_carries_the_keeper_so_the_ui_cannot_guess():
     assert ScanReport.from_dict(payload).groups[0].keeper_display_path == (
         named.display_path
     )
+
+
+# --------------------------------------------------------------------------
+# `keeper_reason` (задача 12): the UI must show not just the choice but why.
+# --------------------------------------------------------------------------
+
+def test_keeper_reason_names_the_folder_for_a_named_win():
+    dump = rec(r"Pictures\20180926_120940.jpg")
+    named = rec(r"Краснодар\20180926_120940.jpg")
+    text, kind = keeper_reason([dump, named])
+    assert kind == "named"
+    assert "Краснодар" in text
+
+
+def test_keeper_reason_names_the_folder_for_a_dated_win():
+    dump = rec(r"Pictures\IMG_1.jpg")
+    dated = rec(r"2010 -2020\2020\IMG_1.jpg")
+    text, kind = keeper_reason([dump, dated])
+    assert kind == "dated"
+    assert "2020" in text
+
+
+def test_keeper_reason_falls_back_to_generic_count_when_specificity_ties():
+    """Both copies sit under an equally-named ancestor (a real path always
+    has one — the scan root itself), so the tiebreak that actually fires
+    is 'fewer junk folders above it', and the reason must say that, not
+    fabricate a folder-name explanation that doesn't apply."""
+    shallow = rec(r"Pamir 2016\IMG_2.jpg")
+    buried = rec(r"Pamir 2016\Pictures\IMG_2.jpg")
+    text, kind = keeper_reason([buried, shallow])
+    assert kind == "named"
+    assert "папок-свалок" in text
+
+
+def test_keeper_reason_for_a_single_copy_has_nothing_to_compare_to():
+    only = rec(r"Краснодар\solo.jpg")
+    text, kind = keeper_reason([only])
+    assert "сравнивать не с чем" in text
+    assert kind == "named"
+
+
+def test_keeper_reason_for_a_plain_file_beating_an_archive_member():
+    inside = member(r"D:\Takeouts\takeout.tgz", "Takeout/Краснодар/IMG_7.jpg")
+    dump = rec(r"Pictures\IMG_7.jpg")
+    text, kind = keeper_reason([inside, dump])
+    assert "архив" in text
+    assert kind == "generic"
+
+
+def test_keeper_reason_kind_matches_keeper_key_specificity_ordering():
+    """The kind label is read off the *keeper's own* segments, independent
+    of which tiebreak level actually decided the group -- so it must never
+    disagree with the plain rule (named > dated > generic)."""
+    dump = rec(r"Pictures\IMG_9.jpg")
+    dated = rec(r"2010 -2020\2016\IMG_9.jpg")
+    named = rec(r"Pictures\Pamir 2016\IMG_9.jpg")
+    _, dated_alone_kind = keeper_reason([dump, dated])
+    assert dated_alone_kind == "dated"
+    _, named_wins_kind = keeper_reason([dated, named])
+    assert named_wins_kind == "named"
+
+
+def test_keeper_reason_is_exposed_through_the_serialized_group():
+    """Задача 12's whole point: the reason travels with the group, exactly
+    like `keeper_display_path` already does (see the round-trip test
+    above for that one)."""
+    dump = rec(r"Pictures\IMG_10.jpg")
+    named = rec(r"Краснодар\IMG_10.jpg")
+    report = ScanReport(
+        scanned_roots=[ROOT],
+        total_files_seen=2,
+        groups=[DuplicateGroup(content_hash="h10", records=[dump, named])],
+    )
+    payload = report.to_dict()
+    group_payload = payload["groups"][0]
+    assert "Краснодар" in group_payload["keeper_reason"]
+    assert group_payload["keeper_reason_kind"] == "named"
+    # And a round trip through from_dict must not lose it either.
+    restored = ScanReport.from_dict(payload).groups[0]
+    assert restored.keeper_reason == group_payload["keeper_reason"]
+    assert restored.keeper_reason_kind == "named"

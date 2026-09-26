@@ -38,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -168,6 +168,35 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     """,
     3: _migrate_v3_quality_metrics,
     4: _migrate_v4_origin,
+    # v5 (task 12, задача 12): "просмотренное накапливается и применяется
+    # пачкой" needs somewhere for the pile to live that survives a server
+    # restart — the same requirement Р6 already solved for hashes and
+    # thumbnails/quality (task 8/9) solved for previews. `report` itself is
+    # a plain in-memory object (see jobs.ScanRegistry) and does not survive
+    # one; the index does, so decisions go here rather than into the report
+    # or the browser, both of which one restart or one closed tab erases.
+    #
+    # Keyed by content_hash, not (scan_id, content_hash): a decision is a
+    # fact about *content* ("this photo's extra copies go to quarantine"),
+    # not about one particular scan run of it — exactly the reasoning
+    # `content_previews` already uses for thumbnails and quality metrics.
+    # That is what makes recovery from a lost `report` automatic: re-running
+    # a scan over the same roots rebuilds groups from the same index data
+    # (Р6), gets a new scan_id, but the *content hashes are unchanged*, so
+    # every decision reattaches to its group without the reviewer having to
+    # redo a single group. `applied_at` distinguishes "queued" from
+    # "already moved" so a second apply pass or a page reload after a batch
+    # quarantine run doesn't try to move the same files twice.
+    5: """
+    CREATE TABLE IF NOT EXISTS review_decisions (
+        content_hash TEXT PRIMARY KEY,
+        action       TEXT NOT NULL,   -- 'quarantine' | 'keep'
+        keeper_path  TEXT,            -- display_path override of Р8's
+                                       -- default keeper; NULL = accept it
+        decided_at   REAL NOT NULL,
+        applied_at   REAL             -- NULL until actually moved
+    );
+    """,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -725,6 +754,116 @@ class ScanIndex:
             self._conn.executemany("DELETE FROM files WHERE display_path = ?", gone)
             self._conn.commit()
         return len(gone)
+
+    # --- review decisions (task 12) -----------------------------------------
+    #
+    # See the schema-v5 comment above for why these are keyed by content
+    # hash and live in the index rather than in the in-memory report or the
+    # browser. A decision is one human choice per group: quarantine the
+    # non-keeper copies (optionally overriding which copy Р8 would have
+    # kept), or keep everything and move on. Recording one is deliberately
+    # cheap and separate from acting on it — задача 12's whole point is a
+    # gap between "reviewed" and "moved" that today does not exist.
+
+    def record_decision(
+        self, content_hash: str, action: str, keeper_path: str | None = None
+    ) -> None:
+        """Queue (or replace) a human decision for one group.
+
+        A fresh decision always resets `applied_at` to NULL, including one
+        that overwrites an earlier decision on the same group — the human
+        changed their mind, so whatever the previous decision's apply state
+        was no longer describes this one. Not reachable in practice for an
+        already-applied group: the non-keeper copies are gone from disk by
+        then, so the group stops appearing in the next scan's report and
+        nothing in the UI offers to re-decide it.
+        """
+        if action not in ("quarantine", "keep"):
+            raise ValueError(f"record_decision: неизвестное действие {action!r}")
+        self._conn.execute(
+            """
+            INSERT INTO review_decisions (content_hash, action, keeper_path, decided_at, applied_at)
+            VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                action      = excluded.action,
+                keeper_path = excluded.keeper_path,
+                decided_at  = excluded.decided_at,
+                applied_at  = NULL
+            """,
+            (content_hash, action, keeper_path, time.time()),
+        )
+        self._conn.commit()
+
+    def clear_decision(self, content_hash: str) -> None:
+        """Undo — back to "not reviewed". Used by the keyboard `U` action
+        and by nothing else; there is no other way for a decision to stop
+        existing short of the group itself disappearing.
+        """
+        self._conn.execute(
+            "DELETE FROM review_decisions WHERE content_hash = ?", (content_hash,)
+        )
+        self._conn.commit()
+
+    def decisions_for_hashes(self, content_hashes: Iterable[str]) -> dict[str, dict]:
+        """Decisions for many groups at once, keyed by hash — same batching
+        reasoning as `quality_for_hashes`: the review screen asks about
+        every group in the report it just loaded, and on the real
+        8814-group report that is one query instead of 8814.
+
+        A hash with no row simply isn't a key in the result — "not yet
+        reviewed" is the absence of a decision, not a decision of its own.
+        """
+        wanted = list(dict.fromkeys(content_hashes))
+        if not wanted:
+            return {}
+        out: dict[str, dict] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self._conn.execute(
+                f"""
+                SELECT content_hash, action, keeper_path, decided_at, applied_at
+                  FROM review_decisions
+                 WHERE content_hash IN ({placeholders})
+                """,
+                chunk,
+            )
+            for row in cursor:
+                out[row["content_hash"]] = {
+                    "action": row["action"],
+                    "keeper_path": row["keeper_path"],
+                    "decided_at": row["decided_at"],
+                    "applied_at": row["applied_at"],
+                }
+        return out
+
+    def mark_decisions_applied(
+        self, content_hashes: Iterable[str], when: float | None = None
+    ) -> None:
+        """Stamp `applied_at` once `quarantine.quarantine_reviewed_groups`
+        has actually moved a group's files, so a second apply pass (or the
+        same report reloaded after a restart) treats it as done rather than
+        queued — the file is gone from disk either way, but only this call
+        is what tells the index so.
+        """
+        hashes = [(when or time.time(), h) for h in content_hashes]
+        if not hashes:
+            return
+        self._conn.executemany(
+            "UPDATE review_decisions SET applied_at = ? WHERE content_hash = ?",
+            hashes,
+        )
+        self._conn.commit()
+
+    def pending_decision_count(self) -> int:
+        """How many groups are queued for quarantine but not yet applied —
+        the number that answers "did an evening of review survive?" after a
+        restart, independent of any one scan_id."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM review_decisions "
+            "WHERE action = 'quarantine' AND applied_at IS NULL"
+        ).fetchone()
+        return int(row["n"])
 
 
 def _row_to_quality_dict(row: sqlite3.Row) -> dict:

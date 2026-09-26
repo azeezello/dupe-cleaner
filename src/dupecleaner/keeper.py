@@ -252,3 +252,135 @@ def choose_keeper(records: list[FileRecord]) -> FileRecord:
     if not records:
         raise ValueError("choose_keeper: нечего выбирать, список копий пуст")
     return min(records, key=keeper_key)
+
+
+#: `keeper_reason`'s second return value, so a tile face can pick an icon
+#: (📁/🗓, see docs/UX-MOCKUPS.html's screen-3 legend) without re-running
+#: `classify_segment` in the browser — the exact duplication of Р8 that
+#: `DuplicateGroup.keeper_display_path`'s docstring already tells the story
+#: of once.
+_KIND_LABEL = {
+    SegmentKind.NAMED: "named",
+    SegmentKind.DATED: "dated",
+    SegmentKind.GENERIC: "generic",
+}
+
+
+def _dominant_kind_label(kinds: list[SegmentKind]) -> str:
+    return _KIND_LABEL[max(kinds)] if kinds else ""
+
+
+def _most_specific_segment(segments: list[str], kinds: list[SegmentKind]) -> str | None:
+    """The deepest segment (closest to the file) that carries the path's
+    top classification. Deepest rather than shallowest so a path like
+    `Wedding Day/Wedding 16042017` names the folder that actually filed the
+    photo, matching point 4 of the rule (more NAMED segments wins).
+    """
+    if not kinds:
+        return None
+    best = max(kinds)
+    for segment, kind in zip(reversed(segments), reversed(kinds)):
+        if kind == best:
+            return segment
+    return None
+
+
+def keeper_reason(records: list["FileRecord"]) -> tuple[str, str]:
+    r"""One sentence explaining *why* `choose_keeper` picked the copy it
+    did — задача 12's requirement that the interface show not just the
+    choice but the reason ("остаётся, потому что лежит в папке, которую
+    назвал человек").
+
+    Р8 is a five-level tiebreak (`keeper_key`), and the honest reason is
+    not "here is what the winner looks like" — every copy on a byte-
+    identical group looks however it looks — it is *the first level at
+    which the winner actually beat the runner-up*. Found by comparing the
+    keeper's key against the next-best copy's key position by position,
+    which is exactly what `min()`/`sorted()` does internally to rank them;
+    this just reports where that comparison first came out non-equal,
+    instead of re-deriving a different explanation that could disagree
+    with the rule it is describing.
+
+    Returns `(text, segment_kind)` — `segment_kind` is `"named"`,
+    `"dated"`, `"generic"` or `""` (no folder segments above the file at
+    all, e.g. a file directly under a drive root), taken from the keeper's
+    *own* most specific segment regardless of which tiebreak level
+    actually decided the group, so a tile can always show a consistent
+    📁/🗓 icon for where the keeper lives.
+    """
+    if not records:
+        raise ValueError("keeper_reason: список копий пуст")
+
+    ranked = rank_keepers(records)
+    keeper = ranked[0]
+    keeper_segments = meaningful_segments(keeper)
+    keeper_kinds = [classify_segment(s) for s in keeper_segments]
+    label = _dominant_kind_label(keeper_kinds)
+
+    if len(ranked) == 1:
+        return "единственная копия в группе — сравнивать не с чем", label
+
+    runner_up = ranked[1]
+    keeper_k = keeper_key(keeper)
+    runner_k = keeper_key(runner_up)
+
+    if keeper_k[0] != runner_k[0]:
+        return (
+            "остаётся, потому что это обычный файл на диске, а не участник "
+            "архива — копию нельзя забрать из архива, не переписав его",
+            label,
+        )
+
+    if keeper_k[1] != runner_k[1]:
+        segment = _most_specific_segment(keeper_segments, keeper_kinds)
+        if label == "named":
+            return (
+                f"остаётся, потому что лежит в папке «{segment}», которую "
+                "вы назвали сами — у остальных копий такой папки в пути нет",
+                label,
+            )
+        if label == "dated":
+            return (
+                f"остаётся, потому что лежит в папке с датой «{segment}» — "
+                "точнее, чем безымянная папка у остальных копий",
+                label,
+            )
+        return (
+            "остаётся по остаточному признаку — ни одна копия не лежит в "
+            "осмысленно названной папке",
+            label,
+        )
+
+    if keeper_k[2] != runner_k[2]:
+        return (
+            f"остаётся, потому что над ней меньше папок-свалок по пути "
+            f"({keeper_k[2]} против {runner_k[2]} у следующей по порядку копии)",
+            label,
+        )
+
+    if keeper_k[3] != runner_k[3]:
+        return (
+            "остаётся, потому что путь содержит больше именованных папок — "
+            "подшита точнее остальных копий",
+            label,
+        )
+
+    if keeper_k[4] != runner_k[4]:
+        return (
+            "копии одинаково осмысленно разложены по папкам — выбрана как "
+            "более короткий путь (старое правило, последний довод)",
+            label,
+        )
+
+    if keeper_k[5] != runner_k[5]:
+        return (
+            "копии и пути неотличимы по Р8 — выбрана как более ранняя по "
+            "дате изменения",
+            label,
+        )
+
+    return (
+        "копии полностью равнозначны по всем признакам правила — выбор "
+        "детерминирован (по пути), но по существу не важен",
+        label,
+    )

@@ -238,3 +238,103 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   body { padding: 1rem; }
   .row { flex-direction: column; }
 }
+
+/* ============================================================
+   Task 12: keyboard decisions, batch apply, archive verdict cards,
+   journal/restore. See docs/DECISIONS.md Р11 for why decisions live
+   in a content_hash-keyed table rather than in the report/browser.
+   ============================================================ */
+
+.kbd-hint { line-height: 1.9; }
+kbd {
+  display: inline-block;
+  min-width: 1.3em;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--surface-elev);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.78rem;
+  text-align: center;
+}
+
+/* --- archive verdict cards (task 4 / Р1, mockup screen 5) --- */
+.archive-panel { padding: 0.2rem 0.1rem; }
+.archive-card {
+  display: flex; gap: 0.7rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-sunken);
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.6rem;
+}
+.archive-card-quick { opacity: 0.6; }
+.ac-icon { font-size: 1.4rem; line-height: 1; flex: none; }
+.ac-body { flex: 1 1 auto; min-width: 0; }
+.ac-path {
+  font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem;
+  overflow-wrap: anywhere; margin: 0.15rem 0 0.35rem;
+}
+.ac-verdict { font-size: 0.85rem; font-weight: 600; }
+.ac-verdict.ok { color: var(--ok); }
+.ac-verdict.warn { color: var(--warn); }
+.ac-verdict.neutral { color: var(--muted); }
+.ac-verdict.danger { color: var(--danger); }
+.ac-bar-outer {
+  height: 8px; border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  overflow: hidden; margin: 0.3rem 0;
+}
+.ac-bar-inner { height: 100%; background: var(--warn); border-radius: 999px; }
+.ac-detail { font-size: 0.8rem; color: var(--muted); margin-top: 0.2rem; }
+.ac-action { margin-top: 0.5rem; display: flex; align-items: center; gap: 0.6rem; }
+.ac-status { font-size: 0.8rem; }
+.ac-status.ok { color: var(--ok); }
+.ac-status.bad { color: var(--danger); }
+.ac-status.pending { color: var(--muted); }
+
+/* --- per-group decision controls (task 6 / Р8 reason + keyboard flow) --- */
+.detail-reason {
+  font-size: 0.85rem;
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.decision-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0; }
+.btn-decide { font-size: 0.85rem; }
+.btn-decide.ok { border-color: var(--ok); color: var(--ok); }
+.btn-decide.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.decision-status { font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+
+.tile.active { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.tile-decision-badge {
+  position: absolute; right: 6px; top: 6px;
+  font-size: 0.68rem; font-weight: 600;
+  padding: 0.05rem 0.4rem; border-radius: 999px;
+  display: none;
+}
+.tile-decision-badge.queued { display: inline-block; background: var(--warn-soft); color: var(--warn); }
+.tile-decision-badge.applied { display: inline-block; background: var(--ok); color: #fff; }
+.tile-decision-badge.kept { display: inline-block; background: color-mix(in srgb, currentColor 14%, transparent); color: var(--muted); }
+
+.detail-record.selectable { cursor: pointer; }
+.detail-record.selectable:hover { color: var(--accent); }
+
+/* --- journal / restore (task 5 / Р5 web wrapper) --- */
+.journal-list { list-style: none; margin: 0.5rem 0; padding: 0; max-height: 260px; overflow-y: auto; }
+.journal-entry {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.3rem 0.1rem;
+  border-top: 1px solid var(--border-soft);
+  font-size: 0.8rem;
+}
+.journal-entry:first-child { border-top: none; }
+.journal-path { font-family: ui-monospace, Consolas, monospace; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.journal-status-badge { font-size: 0.7rem; padding: 0.05rem 0.4rem; border-radius: 999px; flex: none; }
+.journal-entry.status-moved .journal-status-badge { background: var(--ok); color: #fff; }
+.journal-entry.status-restored .journal-status-badge { background: color-mix(in srgb, currentColor 14%, transparent); color: var(--muted); }
+.journal-entry.status-failed .journal-status-badge { background: var(--danger); color: #fff; }
+.journal-entry.status-pending .journal-status-badge { background: var(--warn-soft); color: var(--warn); }
