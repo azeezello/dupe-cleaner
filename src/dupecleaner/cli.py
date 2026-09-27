@@ -1,4 +1,4 @@
-"""Command-line entry point: `dupecleaner scan|quarantine|restore|serve|index`."""
+"""Command-line entry point: `dupecleaner scan|events|quarantine|restore|serve|index`."""
 
 from __future__ import annotations
 
@@ -10,6 +10,15 @@ from pathlib import Path
 
 from .archive_classify import classify_archives
 from .dedupe import verify_group
+from .events import (
+    DEFAULT_THRESHOLDS,
+    EventThresholds,
+    MomentPolicy,
+    cluster_events,
+    gap_sensitivity,
+    merge_into_trips,
+    moments_from_rows,
+)
 from .jobs import ScanJob
 from .models import ArchiveClass, MediaKind, ScanMode, ScanReport
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
@@ -103,6 +112,13 @@ def _mode_banner(job: ScanJob) -> str:
 def _cmd_scan(args: argparse.Namespace) -> int:
     mode = ScanMode(args.mode)
     job = ScanJob(
+        moment_policy=MomentPolicy(
+            utc_offset_seconds=(
+                args.utc_offset_hours * 3600
+                if args.utc_offset_hours is not None
+                else None
+            )
+        ),
         roots=args.paths,
         db_path=args.db,
         # None means "whatever the mode says"; --no-archives may only
@@ -503,6 +519,153 @@ def _cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_events(args: argparse.Namespace) -> int:
+    """Cluster a finished scan into events (Р4, task 16). Read-only.
+
+    Reads the index and prints; it cannot move, rename or delete anything,
+    and it does not want to — an event is axis C in Р0. Building the
+    library out of these clusters is task 21, and that one shows its whole
+    plan before touching a file.
+    """
+    thresholds = EventThresholds(
+        session_gap_seconds=args.session_gap_hours * 3600,
+        geo_gap_seconds=args.geo_gap_minutes * 60,
+        place_radius_m=args.place_radius_km * 1000,
+        keep_same_day_same_place=not args.no_same_day_merge,
+        same_place_radius_m=args.same_place_radius_km * 1000,
+        max_speed_kmh=args.max_speed_kmh,
+    )
+    policy = MomentPolicy(
+        utc_offset_seconds=(
+            args.utc_offset_hours * 3600 if args.utc_offset_hours is not None else None
+        ),
+        use_mtime=args.use_mtime,
+    )
+
+    with ScanIndex(args.db) as index:
+        scan_id = args.scan_id or index.latest_scan_id()
+        if scan_id is None:
+            print(
+                "В индексе нет ни одного скана. Сначала: dupecleaner scan --mode full <папки>",
+                file=sys.stderr,
+            )
+            return 1
+
+        coverage = index.moment_coverage(scan_id)
+        rows = index.moments(scan_id)
+        excluded = [] if args.include_screenshots else index.excluded_from_albums_paths(scan_id)
+        moments = moments_from_rows(rows, policy=policy)
+
+    if not rows:
+        print("В этом скане нет ни фото, ни видео.", file=sys.stderr)
+        return 1
+    if not any(m.has_time for m in moments):
+        print(
+            "Ни у одного файла нет времени съёмки. Фаза метаданных выполняется "
+            "только в полном режиме: dupecleaner scan --mode full с тем же --db.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Скан: {scan_id}")
+    print("Пороги:")
+    for line in thresholds.describe():
+        print(f"  · {line}")
+    if not policy.use_mtime:
+        print(
+            "  · Время файла (mtime) не используется: на реальной папке он "
+            "расходится с EXIF на годы. --use-mtime включает."
+        )
+    print("Источники времени:", ", ".join(f"{k}={v}" for k, v in sorted(coverage.items())))
+
+    clustering = cluster_events(moments, thresholds=thresholds, excluded_paths=excluded)
+    summary = clustering.summary()
+    print(
+        f"\nСобытий: {summary['events']} на {summary['photos_in_events']} снимков "
+        f"(медиана {summary['median_event_size']}, крупнейшее {summary['largest_event']}, "
+        f"одиночек {summary['singletons']})"
+    )
+    print(
+        "Уверенность: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(summary["by_confidence"].items()))
+    )
+    print(f"Без даты (в _unsorted по Р5): {summary['undated']}")
+    print(f"Исключено из альбомов (Р3, скриншоты и сканы): {summary['excluded']}")
+    if clustering.warnings:
+        print(f"Странных координат: {len(clustering.warnings)} (первые три)")
+        for warning in clustering.warnings[:3]:
+            print(f"  ! {warning}")
+
+    if args.sensitivity:
+        print("\nЧувствительность к порогу времени:")
+        hours = (2, 4, 6, 8, 9, 10, 12, 16, 24)
+        table = gap_sensitivity(
+            [m for m in moments if m.display_path not in set(excluded)],
+            [h * 3600 for h in hours],
+            base=thresholds,
+        )
+        for hour in hours:
+            mark = " ←" if abs(hour * 3600 - thresholds.session_gap_seconds) < 1 else ""
+            print(f"  {hour:>2} ч: {table[hour * 3600]:6d} событий{mark}")
+
+    limit = args.limit
+    print(f"\nПервые {min(limit, len(clustering.events))} событий:")
+    for event in clustering.events[:limit]:
+        start, end = event.date_range
+        span = f"{start}" if start == end else f"{start} → {end}"
+        centre = event.centroid
+        where = f", {centre[0]:.3f},{centre[1]:.3f}" if centre else ""
+        print(
+            f"  [{event.size:5d}] {span}  {_fmt_duration(event.duration_seconds)}"
+            f", {event.confidence.value}, гео {event.geo_known}{where}"
+        )
+        print(f"          начало: {event.boundary.reason if event.boundary else 'первый снимок'}")
+        folders = ", ".join(
+            f"{name or '<корень>'}×{n}" for name, n in event.folders.most_common(3)
+        )
+        print(f"          папки: {folders}")
+
+    if args.trips:
+        trips = merge_into_trips(clustering, thresholds=thresholds)
+        merged = [t for t in trips if len(t.events) > 1]
+        print(
+            f"\nВторой уровень (поездки): {len(trips)} вместо {len(clustering.events)}; "
+            f"склеено из нескольких событий: {len(merged)}"
+        )
+        print(
+            "  Какой уровень становится папкой — открытый продуктовый вопрос, "
+            "см. claude/task-16-events-report.md"
+        )
+        for trip in sorted(merged, key=lambda t: -t.size)[:10]:
+            first, last = trip.date_range
+            print(f"  [{trip.size:5d}] {first} → {last}, событий {len(trip.events)}")
+
+    if args.json:
+        payload = {
+            "scan_id": scan_id,
+            "thresholds": {
+                "session_gap_seconds": thresholds.session_gap_seconds,
+                "geo_gap_seconds": thresholds.geo_gap_seconds,
+                "place_radius_m": thresholds.place_radius_m,
+                "same_place_radius_m": thresholds.same_place_radius_m,
+                "keep_same_day_same_place": thresholds.keep_same_day_same_place,
+                "max_speed_kmh": thresholds.max_speed_kmh,
+                "use_mtime": policy.use_mtime,
+            },
+            "summary": summary,
+            "coverage": coverage,
+            "events": [event.to_dict() for event in clustering.events],
+            "undated": [m.display_path for m in clustering.undated],
+            "excluded": clustering.excluded,
+            "warnings": clustering.warnings,
+        }
+        Path(args.json).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"\nСобытия сохранены в {args.json}")
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -538,6 +701,14 @@ def build_parser() -> argparse.ArgumentParser:
         "содержимое архивов (Р1), превью и метрики. Разница только в "
         "охвате: в карантин в обоих режимах уходит "
         "только подтверждённое байт-в-байт.",
+    )
+    scan_p.add_argument(
+        "--utc-offset-hours",
+        type=float,
+        default=None,
+        help="Часовой пояс библиотеки, если он не совпадает с зоной этой машины. "
+        "EXIF пишет местное время без зоны, а Google-сайдкар — настоящий UTC; "
+        "смешивать их нельзя (см. events.py).",
     )
     scan_p.add_argument(
         "--no-archives",
@@ -587,6 +758,88 @@ def build_parser() -> argparse.ArgumentParser:
     )
     restore_p.add_argument("--quarantine-dir", required=True, help="Папка карантина")
     restore_p.set_defaults(func=_cmd_restore)
+
+    events_p = subparsers.add_parser(
+        "events",
+        help="Разбить снимки на события: разрыв во времени плюс смена места (Р4)",
+    )
+    events_p.add_argument(
+        "--scan-id",
+        default=None,
+        help="Какой скан кластеризовать. По умолчанию последний в индексе.",
+    )
+    events_p.add_argument(
+        "--session-gap-hours",
+        type=float,
+        default=DEFAULT_THRESHOLDS.session_gap_seconds / 3600,
+        help="Разрыв, после которого начинается новое событие (по умолчанию "
+        f"{DEFAULT_THRESHOLDS.session_gap_seconds / 3600:.0f} ч — выбрано по "
+        "гистограмме разрывов и по сверке с вашими же папками, см. "
+        "claude/task-16-events-report.md).",
+    )
+    events_p.add_argument(
+        "--place-radius-km",
+        type=float,
+        default=DEFAULT_THRESHOLDS.place_radius_m / 1000,
+        help="Насколько далеко нужно переместиться, чтобы это считалось сменой "
+        f"места (по умолчанию {DEFAULT_THRESHOLDS.place_radius_m / 1000:.0f} км).",
+    )
+    events_p.add_argument(
+        "--geo-gap-minutes",
+        type=float,
+        default=DEFAULT_THRESHOLDS.geo_gap_seconds / 60,
+        help="Минимальный разрыв, при котором смена места вообще учитывается "
+        f"(по умолчанию {DEFAULT_THRESHOLDS.geo_gap_seconds / 60:.0f} мин).",
+    )
+    events_p.add_argument(
+        "--same-place-radius-km",
+        type=float,
+        default=DEFAULT_THRESHOLDS.same_place_radius_m / 1000,
+        help="Радиус, внутри которого длинный разрыв в пределах одного дня не "
+        "разрезает событие.",
+    )
+    events_p.add_argument(
+        "--no-same-day-merge",
+        action="store_true",
+        help="Отключить правило «тот же день, то же место»: тогда длинный разрыв "
+        "разрезает событие всегда.",
+    )
+    events_p.add_argument(
+        "--max-speed-kmh",
+        type=float,
+        default=DEFAULT_THRESHOLDS.max_speed_kmh,
+        help="Выше этой скорости пара снимков считается ошибкой координат, а не "
+        "перемещением.",
+    )
+    events_p.add_argument(
+        "--use-mtime",
+        action="store_true",
+        help="Использовать время файла там, где нет ни EXIF, ни даты в имени. "
+        "На D:\\Photos это даёт фальшивое событие из 889 снимков «за 36 минут» "
+        "в день копирования папки — поэтому по умолчанию выключено.",
+    )
+    events_p.add_argument(
+        "--utc-offset-hours",
+        type=float,
+        default=None,
+        help="Часовой пояс библиотеки. EXIF пишет местное время без зоны, а "
+        "sidecar и mtime — настоящий UTC; смешивать их нельзя. По умолчанию "
+        "берётся зона этой машины.",
+    )
+    events_p.add_argument(
+        "--include-screenshots",
+        action="store_true",
+        help="Не исключать скриншоты и сканы (Р3 исключает их из альбомов).",
+    )
+    events_p.add_argument("--trips", action="store_true", help="Показать второй уровень: поездки")
+    events_p.add_argument(
+        "--sensitivity",
+        action="store_true",
+        help="Показать, как число событий зависит от порога времени",
+    )
+    events_p.add_argument("--limit", type=int, default=20, help="Сколько событий распечатать")
+    events_p.add_argument("--json", default=None, help="Сохранить события в JSON")
+    events_p.set_defaults(func=_cmd_events)
 
     index_p = subparsers.add_parser("index", help="Показать состояние индекса хэшей")
     index_p.add_argument(

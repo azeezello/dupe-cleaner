@@ -31,6 +31,10 @@ PHASE_LABELS = {
     "full_hashing": "Этап 3/3: полное хэширование",
     "grouping": "Формирование групп",
     "previewing": "Миниатюры для просмотра",
+    # One phase, two answers: the origin verdict (Р3) and the capture
+    # moment (task 16) both come out of the same header read.
+    "reading_headers": "Метаданные: происхождение, время, место",
+    # Kept so a progress payload saved by an older run still renders.
     "classifying_origin": "Происхождение снимков",
     "done": "Готово",
     "cancelled": "Остановлено",

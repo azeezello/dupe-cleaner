@@ -131,6 +131,13 @@ class GoogleSidecar:
     origin_key: str | None = None      # mobileUpload | webUpload | composition | ...
     has_geo: bool = False
     taken_at: float | None = None
+    # The coordinates themselves, for task 16: an event boundary needs to
+    # know *where*, not only whether a position exists. Google writes
+    # `{"latitude": 0, "longitude": 0}` for "no location", so an exact zero
+    # pair is read as absent rather than as a point in the Gulf of Guinea —
+    # which is also why `has_geo` above was already a truthiness test.
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,25 @@ class OriginSignals:
     has_exif_datetime: bool = False
     has_gps: bool = False
     sidecar: GoogleSidecar | None = None
+    # The values behind the two booleans above, added by task 16. Origin
+    # classification only ever needed "is there a timestamp / a position";
+    # event clustering needs the numbers. They ride along here because they
+    # come out of the *same* header read — `read_signals` opens the file
+    # once and both `classify` (this module) and `events.moment_from_signals`
+    # are pure functions over the result. Paying for a second pass over
+    # 30 000 headers to learn a number already in hand would have been the
+    # only expensive thing in task 16.
+    #
+    # `exif_taken_at` is wall-clock seconds, not an epoch: EXIF
+    # DateTimeOriginal is the camera's local time with no zone, and
+    # events.py keeps every source on one wall-clock scale on purpose (see
+    # its module docstring). `exif_offset_minutes` is OffsetTimeOriginal
+    # when the camera bothered to write it, which is how a wall clock can
+    # be turned back into an instant if that is ever needed.
+    exif_taken_at: float | None = None
+    exif_offset_minutes: int | None = None
+    gps_latitude: float | None = None
+    gps_longitude: float | None = None
 
     @property
     def name(self) -> str:
@@ -633,8 +659,82 @@ def classify(signals: OriginSignals) -> OriginVerdict:
 _EXIF_MAKE = 0x010F
 _EXIF_MODEL = 0x0110
 _EXIF_SOFTWARE = 0x0131
-_EXIF_DATETIME_ORIGINAL = 0x9003
+_EXIF_DATETIME = 0x0132              # IFD0: last modification, the weak one
+_EXIF_DATETIME_ORIGINAL = 0x9003     # Exif IFD: when the shutter fired
+_EXIF_DATETIME_DIGITIZED = 0x9004    # Exif IFD
+_EXIF_OFFSET_ORIGINAL = 0x9011       # Exif IFD: "+07:00", rarely present
+_EXIF_IFD = 0x8769
 _EXIF_GPS_IFD = 0x8825
+
+# GPS sub-IFD tags. Numbers rather than names because `get_ifd` returns a
+# raw tag->value mapping and Pillow's name table is not guaranteed to have
+# resolved every one of them.
+_GPS_LAT_REF, _GPS_LAT = 0x0001, 0x0002
+_GPS_LON_REF, _GPS_LON = 0x0003, 0x0004
+
+
+def _rational_to_degrees(value: object) -> float | None:
+    """EXIF stores a position as three rationals: degrees, minutes, seconds.
+
+    Returns None rather than raising on anything unexpected. Malformed GPS
+    blocks are common in files that have been through a dozen apps, and a
+    missing position costs one photo its geo evidence — never the scan.
+    """
+    try:
+        degrees, minutes, seconds = (float(part) for part in value)  # type: ignore[misc]
+    except (TypeError, ValueError):
+        return None
+    return degrees + minutes / 60.0 + seconds / 3600.0
+
+
+def _parse_exif_datetime(text: object) -> float | None:
+    """`"2019:06:15 14:51:06"` -> wall-clock seconds.
+
+    Wall-clock, not an epoch: the string carries no zone, so turning it
+    into an instant would mean inventing one. events.py explains why the
+    whole pipeline stays on one scale instead.
+
+    Rejects the zero date (`"0000:00:00 00:00:00"`, written by more than
+    one phone) and anything outside a plausible range, because a date a
+    file does not really have is worse than no date: it would place the
+    photo in an event that never happened.
+    """
+    if not text:
+        return None
+    cleaned = str(text).strip().replace("/", ":").replace("-", ":")
+    match = re.match(
+        r"^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?", cleaned
+    )
+    if not match:
+        return None
+    year, month, day, hour, minute = (int(g) for g in match.groups()[:5])
+    second = int(match.group(6) or 0)
+    if not (_PLAUSIBLE_YEARS[0] <= year <= _PLAUSIBLE_YEARS[1]):
+        return None
+    try:
+        import calendar
+        import datetime as _dt
+
+        stamp = _dt.datetime(year, month, day, hour, minute, min(second, 59))
+    except ValueError:
+        return None
+    return float(calendar.timegm(stamp.timetuple()))
+
+
+def _parse_exif_offset(text: object) -> int | None:
+    """`"+07:00"` -> 420. None when absent or malformed."""
+    if not text:
+        return None
+    match = re.match(r"^([+-])(\d{2}):?(\d{2})$", str(text).strip())
+    if not match:
+        return None
+    sign = 1 if match.group(1) == "+" else -1
+    return sign * (int(match.group(2)) * 60 + int(match.group(3)))
+
+
+# A date outside this range is a broken clock, not a photograph: cameras
+# with a dead battery report 1980, and a corrupt tag can produce anything.
+_PLAUSIBLE_YEARS = (1990, 2035)
 
 _SIDECAR_ORIGIN_KEYS = (
     "mobileUpload", "webUpload", "driveDesktopUploader", "composition",
@@ -707,6 +807,17 @@ def read_google_sidecar(path: Path) -> GoogleSidecar | None:
             isinstance(geo, dict)
             and (geo.get("latitude") or geo.get("longitude"))
         )
+        latitude = longitude = None
+        if has_geo:
+            try:
+                latitude = float(geo["latitude"])
+                longitude = float(geo["longitude"])
+            except (KeyError, TypeError, ValueError):
+                latitude = longitude = None
+            if latitude is not None and not (
+                -90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0
+            ):
+                latitude = longitude = None
         taken = data.get("photoTakenTime") or {}
         taken_at = None
         if isinstance(taken, dict) and taken.get("timestamp"):
@@ -714,7 +825,13 @@ def read_google_sidecar(path: Path) -> GoogleSidecar | None:
                 taken_at = float(taken["timestamp"])
             except (TypeError, ValueError):
                 taken_at = None
-        return GoogleSidecar(origin_key=origin_key, has_geo=has_geo, taken_at=taken_at)
+        return GoogleSidecar(
+            origin_key=origin_key,
+            has_geo=has_geo,
+            taken_at=taken_at,
+            latitude=latitude,
+            longitude=longitude,
+        )
     return None
 
 
@@ -737,6 +854,9 @@ def read_signals(path: Path | str, *, display_path: str | None = None) -> Origin
     width = height = None
     image_format = make = model = software = None
     has_datetime = has_gps = False
+    taken_at = None
+    offset_minutes = None
+    latitude = longitude = None
 
     try:
         with Image.open(file_path) as img:
@@ -746,12 +866,46 @@ def read_signals(path: Path | str, *, display_path: str | None = None) -> Origin
             make = _clean(exif.get(_EXIF_MAKE))
             model = _clean(exif.get(_EXIF_MODEL))
             software = _clean(exif.get(_EXIF_SOFTWARE))
-            has_datetime = bool(exif.get(_EXIF_DATETIME_ORIGINAL))
+            # DateTimeOriginal lives in the Exif sub-IFD, not in IFD0, so
+            # the old `exif.get(0x9003)` here answered None for virtually
+            # every real file. It cost task 15 nothing — `classify` never
+            # reads `has_exif_datetime` — but task 16 is built on that
+            # timestamp, so it is read from the right place now, with
+            # IFD0's weaker DateTime kept only as a last resort.
+            try:
+                exif_ifd = exif.get_ifd(_EXIF_IFD)
+            except Exception:  # noqa: BLE001 - malformed EXIF blocks vary wildly
+                exif_ifd = {}
+            for tag in (_EXIF_DATETIME_ORIGINAL, _EXIF_DATETIME_DIGITIZED):
+                taken_at = _parse_exif_datetime((exif_ifd or {}).get(tag))
+                if taken_at is not None:
+                    break
+            if taken_at is None:
+                taken_at = _parse_exif_datetime(exif.get(_EXIF_DATETIME))
+            offset_minutes = _parse_exif_offset((exif_ifd or {}).get(_EXIF_OFFSET_ORIGINAL))
+            has_datetime = taken_at is not None
             try:
                 gps = exif.get_ifd(_EXIF_GPS_IFD)
             except Exception:  # noqa: BLE001 - malformed EXIF blocks vary wildly
                 gps = None
             has_gps = bool(gps)
+            if gps:
+                latitude = _rational_to_degrees(gps.get(_GPS_LAT))
+                longitude = _rational_to_degrees(gps.get(_GPS_LON))
+                if latitude is not None and str(gps.get(_GPS_LAT_REF, "N")).upper().startswith("S"):
+                    latitude = -latitude
+                if longitude is not None and str(gps.get(_GPS_LON_REF, "E")).upper().startswith("W"):
+                    longitude = -longitude
+                # A stripped GPS block often survives as an exact zero pair.
+                # Zero/zero is in the ocean off Ghana; nobody's holiday
+                # snaps are there, and calling it a location would invent an
+                # event boundary out of missing data.
+                if not latitude and not longitude:
+                    latitude = longitude = None
+                if latitude is not None and not -90.0 <= latitude <= 90.0:
+                    latitude = None
+                if longitude is not None and not -180.0 <= longitude <= 180.0:
+                    longitude = None
     except Exception:  # noqa: BLE001 - Pillow raises many unrelated types
         pass
 
@@ -765,6 +919,10 @@ def read_signals(path: Path | str, *, display_path: str | None = None) -> Origin
         exif_software=software,
         has_exif_datetime=has_datetime,
         has_gps=has_gps,
+        exif_taken_at=taken_at,
+        exif_offset_minutes=offset_minutes,
+        gps_latitude=latitude,
+        gps_longitude=longitude,
         sidecar=read_google_sidecar(file_path),
     )
 
