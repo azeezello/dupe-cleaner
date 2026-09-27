@@ -392,6 +392,12 @@ def test_v4_migration_adds_origin_columns_to_a_v3_index(tmp_path):
     ):
         conn.execute(f"ALTER TABLE files DROP COLUMN {column}")
     conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+    # A genuine v3 index predates the `applied_migrations` key entirely
+    # (task 18 added it), so the simulation has to remove it too —
+    # otherwise this fabricates something that never existed: an index
+    # that says migration 4 has run while its columns say otherwise, and
+    # the set is deliberately the authority over the number.
+    conn.execute("DELETE FROM meta WHERE key = 'applied_migrations'")
     conn.commit()
     conn.close()
 

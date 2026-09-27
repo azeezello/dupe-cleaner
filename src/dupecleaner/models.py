@@ -71,6 +71,20 @@ class ScanMode(str, Enum):
         """
         return self is ScanMode.FULL
 
+    @property
+    def detect_faces(self) -> bool:
+        """Whether face detection and embeddings (task 18) run.
+
+        Its own property for the same reason `classify_origin` is one,
+        and with a stronger case: this is by far the most expensive thing
+        Р7 puts inside "Полная обработка" — roughly 120 ms of CPU per
+        photograph against origin's 8 ms header read — and it is the
+        first phase for which "full" might plausibly grow a third answer
+        ("everything except faces") without either of the other two
+        properties becoming a lie.
+        """
+        return self is ScanMode.FULL
+
 
 @dataclass(frozen=True)
 class FileRecord:

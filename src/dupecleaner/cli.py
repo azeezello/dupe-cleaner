@@ -104,8 +104,10 @@ def _mode_banner(job: ScanJob) -> str:
     return (
         "Режим: полный — то же самое плюс содержимое архивов (Р1), превью "
         "для просмотра, метрики качества (Р2: считаются и показываются, "
-        "на выбор копий не влияют) и происхождение снимков (Р3: метка и "
-        "будущий фильтр альбомов, не повод что-либо двигать)."
+        "на выбор копий не влияют), происхождение снимков (Р3: метка и "
+        "будущий фильтр альбомов, не повод что-либо двигать) и лица "
+        "(Р11: детекция и эмбеддинги, всё офлайн; без установленных "
+        "моделей фаза пропускается и говорит об этом)."
     )
 
 
@@ -178,6 +180,19 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     print(f"Групп дублей: {len(report.groups)}")
     print(f"Потенциально освободится: {_fmt_bytes(report.total_wasted_bytes)}")
     print(f"Время: {_fmt_duration(time.time() - progress.started_at)}")
+    if mode is ScanMode.FULL:
+        # Only in full mode, and only when the phase actually ran: printing
+        # "лиц: 0" after a run that had no models would read as "there are
+        # no people in your photographs", which is the same class of lie as
+        # finding A1.
+        with ScanIndex(args.db) as index:
+            face_stats = index.face_stats(job.scan_id)
+        if face_stats["content_scanned"]:
+            print(
+                f"Лица: {face_stats['faces']} на "
+                f"{face_stats['content_with_faces']} снимках "
+                f"из {face_stats['content_scanned']} просмотренных"
+            )
     # `skipped_archives` now holds two different kinds of "not checked":
     # archives the mode never opened, and archives that refused to be read.
     # Printing one count for both would have made the second kind sound
@@ -663,6 +678,65 @@ def _cmd_events(args: argparse.Namespace) -> int:
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(f"\nСобытия сохранены в {args.json}")
+def _cmd_faces(args: argparse.Namespace) -> int:
+    """Install and inspect the offline face models (task 18).
+
+    A command of its own rather than a flag on `scan`, because it is the
+    one place in this project that is allowed to open a network
+    connection. Р4 promises the tool works locally; a scan that quietly
+    downloaded 37 MB of face-recognition weights the first time it met a
+    photograph would keep the letter of that and break its point. So the
+    download is a thing a person does on purpose, once, and a scan
+    without the models simply reports that it did not look for faces.
+    """
+    from . import faces
+
+    directory = Path(args.models_dir) if args.models_dir else faces.models_dir()
+
+    if args.install_models:
+        try:
+            for line in faces.install_models(
+                directory, source_dir=Path(args.source) if args.source else None
+            ):
+                print(line)
+        except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
+            print(f"Не удалось установить модели: {exc}", file=sys.stderr)
+            return 1
+
+    print(f"Папка моделей: {directory}")
+    for spec in faces.MODELS:
+        path = directory / spec.filename
+        state = (
+            f"есть, {_fmt_bytes(path.stat().st_size)}"
+            if path.is_file()
+            else "НЕТ"
+        )
+        print(f"  {spec.role:10s} {spec.filename}  [{state}]  {spec.license}")
+
+    if not faces.models_installed(directory):
+        print(
+            "\nМоделей нет — при полном скане лица считаться не будут "
+            "(всё остальное отработает как обычно)."
+            "\nПоставить: dupecleaner faces --install-models"
+        )
+        return 0
+
+    try:
+        faces.FaceEngine(directory)
+    except faces.FaceEngineUnavailable as exc:
+        print(f"\nДвижок не запускается: {exc}")
+        return 1
+    print(f"\nДвижок: {faces.ENGINE_NAME}, работает офлайн, сеть при скане не нужна.")
+
+    with ScanIndex(args.db) as index:
+        stats = index.face_stats()
+        embedding_bytes = index.total_embedding_bytes()
+    print(
+        f"В индексе: снимков просмотрено {stats['content_scanned']}, "
+        f"с лицами {stats['content_with_faces']}, лиц {stats['faces']} "
+        f"(мелких, без эмбеддинга: {stats['faces_too_small']}), "
+        f"эмбеддинги занимают {_fmt_bytes(embedding_bytes)}"
+    )
     return 0
 
 
@@ -846,6 +920,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune", action="store_true", help="Убрать записи о файлах, которых больше нет"
     )
     index_p.set_defaults(func=_cmd_index)
+
+    faces_p = subparsers.add_parser(
+        "faces", help="Модели распознавания лиц: установка и состояние"
+    )
+    faces_p.add_argument(
+        "--install-models",
+        action="store_true",
+        help="Скачать модели один раз и проверить по SHA-256 "
+        "(единственное место, где инструмент ходит в сеть)",
+    )
+    faces_p.add_argument(
+        "--source",
+        help="Взять файлы моделей из этой папки, а не из сети "
+        "(для машины без интернета)",
+    )
+    faces_p.add_argument(
+        "--models-dir", help="Куда класть модели (по умолчанию рядом с индексом)"
+    )
+    faces_p.set_defaults(func=_cmd_faces)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")

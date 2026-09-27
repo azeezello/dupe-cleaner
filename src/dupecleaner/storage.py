@@ -38,7 +38,14 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-SCHEMA_VERSION = 6
+# Highest migration this build knows about. Note the gap at 5: that
+# number belongs to task 12's `review_decisions`, which landed on `main`
+# in a session running in parallel with this one. Two branches cannot
+# both own "the next number", so this one took 6 and left 5 alone rather
+# than colliding in the middle of a merge — and the bookkeeping in
+# `__init__` below was changed at the same time so that a gap is a fact
+# the index can record instead of a hole it silently skips.
+SCHEMA_VERSION = 7
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -237,6 +244,48 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     );
     """,
     6: _migrate_v6_moment,
+    # (5 is task 12's `review_decisions` — see SCHEMA_VERSION above.)
+    7: """
+    -- Task 18: faces. Keyed by content_hash, next to `content_previews`
+    -- and for the same reason: a face is a property of *pixels*, so four
+    -- copies of one photograph in four folders share one answer and one
+    -- decode. That is the opposite of the choice v4 made for origin
+    -- verdicts, and deliberately so — half of an origin verdict's
+    -- evidence is the folder it sits in, and none of a face's is.
+    --
+    -- Two tables rather than one, because "we looked and found nobody"
+    -- is a real answer that has to survive. Without `content_face_scans`
+    -- a photograph with no faces in it is indistinguishable from one
+    -- nobody has run the detector over, and every rescan would decode
+    -- the whole landscape half of the library again. It is the same
+    -- shape of mistake as pilot finding A1 ("not checked" read as a
+    -- verdict), one layer down.
+    CREATE TABLE IF NOT EXISTS content_face_scans (
+        content_hash        TEXT PRIMARY KEY,
+        engine              TEXT NOT NULL,
+        detect_long_side    INTEGER NOT NULL,
+        faces_found         INTEGER NOT NULL,
+        faces_skipped_small INTEGER NOT NULL DEFAULT 0,
+        created_at          REAL NOT NULL
+    );
+
+    -- One row per embedded face. `embedding` is 512 bytes: 128 raw
+    -- little-endian float32, L2-normalised, packed by
+    -- `faces.encode_embedding`. `score` and `width` are stored so task 19
+    -- can raise the detector's bar or drop small faces without re-reading
+    -- 59 GB of photographs to do it.
+    CREATE TABLE IF NOT EXISTS content_faces (
+        content_hash TEXT NOT NULL,
+        face_index   INTEGER NOT NULL,
+        x            INTEGER NOT NULL,
+        y            INTEGER NOT NULL,
+        width        INTEGER NOT NULL,
+        height       INTEGER NOT NULL,
+        score        REAL NOT NULL,
+        embedding    BLOB NOT NULL,
+        PRIMARY KEY (content_hash, face_index)
+    );
+    """,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -281,21 +330,55 @@ class ScanIndex:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
 
+        # Which migrations have run is tracked as a *set*, not as a high
+        # water mark. A single number was enough while the schema grew in
+        # one line; it stopped being enough the moment two sessions worked
+        # on two branches at once, because whoever merged second would
+        # find their migration number already taken and, worse, an index
+        # stamped past it would skip the other's table without a word.
+        # A set composes in either merge order.
+        #
+        # An index written before this bookkeeping existed carries only
+        # `schema_version`, and for those the old meaning is exactly
+        # right: everything up to that number did run. That is the
+        # `<= current_version` line, and it is what makes this change
+        # invisible to Aziz's existing index.
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
         current_version = int(row["value"]) if row else 0
-        for version in sorted(v for v in _MIGRATIONS if v > current_version):
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'applied_migrations'"
+        ).fetchone()
+        if row is None:
+            # Pre-bookkeeping index: the high water mark is all it has, and
+            # for those it means exactly what it used to.
+            applied = {v for v in _MIGRATIONS if v <= current_version}
+        else:
+            # Once the set exists it is the only authority. Falling back to
+            # the number here would undo the whole point: an index stamped
+            # 9 by another branch would swallow this branch's 6 in silence,
+            # which is the bug the set was introduced to prevent.
+            applied = {int(v) for v in row["value"].split(",") if v}
+
+        for version in sorted(v for v in _MIGRATIONS if v not in applied):
             migration = _MIGRATIONS[version]
             if callable(migration):
                 migration(self._conn)
             else:
                 self._conn.executescript(migration)
-            current_version = version
+            applied.add(version)
 
         self._conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
+            # never downgrade the stamp: a newer build may have opened this
+            # same file already, and saying "4" after it said "7" would
+            # invite an older build to re-run migrations it does not own.
+            (str(max(SCHEMA_VERSION, current_version)),),
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('applied_migrations', ?)",
+            (",".join(str(v) for v in sorted(applied)),),
         )
         self._conn.commit()
 
@@ -599,6 +682,200 @@ class ScanIndex:
             (scan_id, "screenshot_desktop", "screenshot_phone"),
         )
         return [row["display_path"] for row in cursor]
+
+    # --- faces (see faces.py) ----------------------------------------------
+    #
+    # Keyed by content_hash, like the previews below and unlike the origin
+    # verdicts above: a face is a property of the pixels, so one answer
+    # serves every copy of the same photograph. See the v7 migration for
+    # why "no faces here" needs a row of its own.
+
+    def needs_faces(self, scan_id: str) -> list[FileRecord]:
+        """Photos in this scan with no face pass behind them.
+
+        Runs over the whole library rather than over the duplicate groups,
+        the same call `needs_origin` makes and for the same reason: Р4
+        makes a person a filter across all events, so a face index that
+        covered only the duplicated photographs would answer the wrong
+        question. A face in a photo with no copies is exactly as much a
+        face.
+
+        A photo with no usable `full_hash` is included, because the face
+        phase is where it gets one: that phase reads the file in full
+        anyway (the decoder does), so hashing the same bytes on the way
+        past is close to free, and it is what lets the *next* scan skip
+        the photo entirely (Р6). Plain files only — reading pixels out of
+        an archive member would be finding A2 again, and Р1 treats
+        archive contents as cold storage besides.
+        """
+        cursor = self._conn.execute(
+            f"""
+            SELECT f.* FROM files f
+            LEFT JOIN content_face_scans s ON s.content_hash = f.full_hash
+             WHERE f.last_scan_id = ?
+               AND f.is_archive_member = 0
+               AND f.media_kind = 'photo'
+               AND (
+                    f.full_hash IS NULL
+                 OR NOT (f.hashed_source_size = f.source_size
+                         AND f.hashed_source_mtime = f.source_mtime)
+                 OR s.content_hash IS NULL
+               )
+             ORDER BY f.display_path
+            """,
+            (scan_id,),
+        )
+        return [_row_to_record(row) for row in cursor]
+
+    def has_face_scan(self, content_hash: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM content_face_scans WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+            is not None
+        )
+
+    def set_faces(
+        self,
+        content_hash: str,
+        faces: Iterable[tuple[int, int, int, int, int, float, bytes]],
+        *,
+        engine: str,
+        detect_long_side: int,
+        skipped_small: int = 0,
+    ) -> None:
+        """Record one photo's faces, replacing whatever was there.
+
+        `faces` is a sequence of `(face_index, x, y, width, height, score,
+        embedding)` — plain tuples rather than `faces.DetectedFace`, so
+        this module stays importable without the optional face
+        dependencies, exactly as it stays importable without Pillow (see
+        the TYPE_CHECKING import at the top).
+
+        Replace-rather-than-merge because the unit of truth is a whole
+        pass over one photo: re-running with a different
+        `detect_long_side` must not leave yesterday's faces mixed in with
+        today's, half of them measured at another scale.
+        """
+        face_rows = [
+            (content_hash, index, x, y, width, height, float(score), embedding)
+            for index, x, y, width, height, score, embedding in faces
+        ]
+        self._conn.execute(
+            "DELETE FROM content_faces WHERE content_hash = ?", (content_hash,)
+        )
+        if face_rows:
+            self._conn.executemany(
+                """
+                INSERT INTO content_faces (
+                    content_hash, face_index, x, y, width, height, score, embedding
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                face_rows,
+            )
+        self._conn.execute(
+            """
+            INSERT INTO content_face_scans (
+                content_hash, engine, detect_long_side, faces_found,
+                faces_skipped_small, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                engine              = excluded.engine,
+                detect_long_side    = excluded.detect_long_side,
+                faces_found         = excluded.faces_found,
+                faces_skipped_small = excluded.faces_skipped_small,
+                created_at          = excluded.created_at
+            """,
+            (
+                content_hash,
+                engine,
+                detect_long_side,
+                len(face_rows),
+                skipped_small,
+                time.time(),
+            ),
+        )
+
+    def get_faces(self, content_hash: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM content_faces WHERE content_hash = ?"
+                " ORDER BY face_index",
+                (content_hash,),
+            )
+        )
+
+    def iter_scan_faces(self, scan_id: str) -> Iterator[sqlite3.Row]:
+        """Every stored face belonging to a photo this scan saw, with the
+        path it was found in.
+
+        The one query task 19 needs from task 18, shaped the way task 15
+        shaped `screenshot_paths`: clustering wants the whole set in one
+        pass, not thirty thousand lookups. An iterator rather than a list
+        because 66 000 rows of 512-byte vectors is 34 MB, and a clusterer
+        that wants them all in memory should say so itself.
+
+        DISTINCT on the join: several copies of one photograph share a
+        content hash, and a person appearing four times because their
+        photo was filed four times would be a cluster artefact invented by
+        the storage layer.
+        """
+        return self._conn.execute(
+            f"""
+            SELECT DISTINCT cf.content_hash, cf.face_index, cf.x, cf.y,
+                   cf.width, cf.height, cf.score, cf.embedding
+              FROM content_faces cf
+              JOIN files f ON f.full_hash = cf.content_hash
+             WHERE f.last_scan_id = ? AND {_HASH_IS_FRESH}
+             ORDER BY cf.content_hash, cf.face_index
+            """,
+            (scan_id,),
+        )
+
+    def face_stats(self, scan_id: str | None = None) -> dict:
+        """Counts for the CLI and the report. Scoped to one scan when
+        asked, over the whole index otherwise."""
+        if scan_id is None:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS photos,
+                       COALESCE(SUM(faces_found), 0) AS faces,
+                       COALESCE(SUM(faces_skipped_small), 0) AS small,
+                       COALESCE(SUM(CASE WHEN faces_found > 0 THEN 1 ELSE 0 END), 0)
+                           AS photos_with_faces
+                  FROM content_face_scans
+                """
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                f"""
+                SELECT COUNT(*) AS photos,
+                       COALESCE(SUM(s.faces_found), 0) AS faces,
+                       COALESCE(SUM(s.faces_skipped_small), 0) AS small,
+                       COALESCE(SUM(CASE WHEN s.faces_found > 0 THEN 1 ELSE 0 END), 0)
+                           AS photos_with_faces
+                  FROM content_face_scans s
+                 WHERE s.content_hash IN (
+                     SELECT full_hash FROM files
+                      WHERE last_scan_id = ? AND full_hash IS NOT NULL
+                        AND {_HASH_IS_FRESH}
+                 )
+                """,
+                (scan_id,),
+            ).fetchone()
+        return {
+            "content_scanned": int(row["photos"]),
+            "content_with_faces": int(row["photos_with_faces"]),
+            "faces": int(row["faces"]),
+            "faces_too_small": int(row["small"]),
+        }
+
+    def total_embedding_bytes(self) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(embedding)), 0) AS n FROM content_faces"
+        ).fetchone()
+        return int(row["n"])
 
     # --- capture moments (see events.py) -----------------------------------
 

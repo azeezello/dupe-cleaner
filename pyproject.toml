@@ -25,10 +25,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "httpx>=0.27"]
-# Phase 2 (near-duplicate media + face recognition) — intentionally NOT
-# installed by default: heavy native deps (dlib/onnxruntime). See
+# Phase 3 (near-duplicate media) — still a placeholder, see
 # docs/ROADMAP.md and src/dupecleaner/media.py.
-media = ["imagehash>=4.3", "videohash>=3.0.0", "face_recognition>=1.3"]
+media = ["imagehash>=4.3", "videohash>=3.0.0"]
+# Phase 4, task 18: offline face detection + embeddings. Separate from
+# [media] and not installed by default because it is the heaviest thing
+# this project asks for — 43.8 MB of wheel and 117.6 MB on disk for
+# OpenCV on Windows, plus numpy, plus 37.1 MB of ONNX weights that
+# `dupecleaner faces --install-models` fetches once. Everything runs
+# locally afterwards; see src/dupecleaner/faces.py for why this engine
+# and not dlib or InsightFace.
+faces = ["opencv-python-headless>=4.9", "numpy>=1.24"]
 
 [project.scripts]
 dupecleaner = "dupecleaner.cli:main"
