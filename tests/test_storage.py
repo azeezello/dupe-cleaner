@@ -614,6 +614,13 @@ def test_opening_a_v4_database_adds_review_decisions_in_place(tmp_path: Path):
     conn = sqlite3.connect(str(db))
     conn.execute("DROP TABLE review_decisions")
     conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+    # A pre-task-18 index has no applied-migrations set at all, and that
+    # absence is what makes the stamp mean "everything up to 4 ran" (see
+    # ScanIndex.__init__). Leaving the set behind would make this a *newer*
+    # index with a hand-lowered stamp, where the set is the authority and
+    # correctly reports 5 as already applied — a different situation than
+    # the one this test is about.
+    conn.execute("DELETE FROM meta WHERE key = 'applied_migrations'")
     conn.commit()
     conn.close()
 
