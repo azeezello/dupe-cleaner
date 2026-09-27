@@ -45,7 +45,7 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
 # than colliding in the middle of a merge — and the bookkeeping in
 # `__init__` below was changed at the same time so that a gap is a fact
 # the index can record instead of a hole it silently skips.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -285,6 +285,52 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         embedding    BLOB NOT NULL,
         PRIMARY KEY (content_hash, face_index)
     );
+    """,
+    # v8 (task 19, Р4/Р11 continued): персоны — кластеры эмбеддингов из
+    # `content_faces`, с необязательной человеческой меткой. Тот же выбор
+    # ключа, что и у самих эмбеддингов, и по той же причине: персона —
+    # это функция пикселей, а не пути, поэтому назначение лица персоне
+    # хранится по (content_hash, face_index), а не по display_path.
+    # Разметка (`persons.label`) переживает перемещение файла в карантин
+    # и обратно и переживает повторный скан — ровно то же обещание, что
+    # Р9 уже держит для превью и Р10 для решений по группам.
+    #
+    # `person_faces` не заменяет `content_faces` — она поверх неё, тонкая
+    # (content_hash, face_index) -> person_id. Лицо, ни разу не
+    # кластеризованное, просто отсутствует в этой таблице: это не
+    # ошибка и не требует отдельного «ещё не смотрели», как v7 потребовал
+    # для скана в целом, потому что кластеризация — быстрая CPU-операция
+    # над уже посчитанными векторами (без декодирования файлов), и её
+    # можно перезапускать когда угодно без стоимости самого скана.
+    #
+    # `persons` без имени — рабочий кластер, «Человек №N»; CLI показывает
+    # такое имя, но не хранит его как строку, чтобы номер не расходился
+    # между вызовами при удалении/слиянии в будущем — `person_id` это уже
+    # число, этого достаточно.
+    8: """
+    CREATE TABLE IF NOT EXISTS persons (
+        person_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        label      TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+
+    -- `similarity` — косинус между эмбеддингом и центроидом персоны на
+    -- момент присоединения; хранится не для алгоритма (центроид всегда
+    -- пересчитывается заново из текущих участников — см. persons.py), а
+    -- как та же самая улика, которую faces.py уже хранит для score и
+    -- width: задача 19 должна уметь показать, почему лицо оказалось в
+    -- этом кластере, не пересчитывая всё заново.
+    CREATE TABLE IF NOT EXISTS person_faces (
+        content_hash TEXT NOT NULL,
+        face_index   INTEGER NOT NULL,
+        person_id    INTEGER NOT NULL REFERENCES persons(person_id),
+        similarity   REAL NOT NULL,
+        assigned_at  REAL NOT NULL,
+        PRIMARY KEY (content_hash, face_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_person_faces_person
+        ON person_faces(person_id);
     """,
 }
 
@@ -876,6 +922,157 @@ class ScanIndex:
             "SELECT COALESCE(SUM(LENGTH(embedding)), 0) AS n FROM content_faces"
         ).fetchone()
         return int(row["n"])
+
+    # --- persons (see persons.py) -------------------------------------------
+    #
+    # Clustering itself lives in persons.py, storage-agnostic like
+    # events.cluster_events — everything here only reads and writes the two
+    # v8 tables. Keyed by (content_hash, face_index), the same key
+    # content_faces already uses, so a label survives a rescan and a trip
+    # through quarantine exactly as content_previews already does (Р9).
+
+    def unclustered_faces(self, scan_id: str) -> Iterator[sqlite3.Row]:
+        """Faces this scan can see that no person has claimed yet.
+
+        Same shape as `iter_scan_faces` (DISTINCT on content, fresh-hash
+        only) minus whatever `person_faces` already has an opinion about —
+        this is the whole set `persons.cluster_new_faces` needs to place.
+        """
+        return self._conn.execute(
+            f"""
+            SELECT DISTINCT cf.content_hash, cf.face_index, cf.x, cf.y,
+                   cf.width, cf.height, cf.score, cf.embedding
+              FROM content_faces cf
+              JOIN files f ON f.full_hash = cf.content_hash
+              LEFT JOIN person_faces pf
+                     ON pf.content_hash = cf.content_hash
+                    AND pf.face_index   = cf.face_index
+             WHERE f.last_scan_id = ? AND {_HASH_IS_FRESH}
+               AND pf.person_id IS NULL
+             ORDER BY cf.content_hash, cf.face_index
+            """,
+            (scan_id,),
+        )
+
+    def list_persons(self) -> list[sqlite3.Row]:
+        """Every person this index knows about, with how many faces and
+        how many distinct photos (content hashes) back it — a person
+        appearing four times in one well-archived photo counts once."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT p.person_id, p.label, p.created_at, p.updated_at,
+                       COUNT(pf.content_hash) AS face_count,
+                       COUNT(DISTINCT pf.content_hash) AS photo_count
+                  FROM persons p
+                  LEFT JOIN person_faces pf ON pf.person_id = p.person_id
+                 GROUP BY p.person_id
+                 ORDER BY p.person_id
+                """
+            )
+        )
+
+    def get_person(self, person_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM persons WHERE person_id = ?", (person_id,)
+        ).fetchone()
+
+    def create_person(self, *, label: str | None = None) -> int:
+        now = time.time()
+        cursor = self._conn.execute(
+            "INSERT INTO persons (label, created_at, updated_at) VALUES (?, ?, ?)",
+            (label, now, now),
+        )
+        return int(cursor.lastrowid)
+
+    def set_person_label(self, person_id: int, label: str | None) -> None:
+        """Attach or clear a human-given name. `label=None` puts the person
+        back to being shown as an unlabelled "Человек №N" — it does not
+        delete the person or its members, because the whole point of
+        keeping clustering and labelling apart is that a wrong name can be
+        taken back without re-running anything.
+        """
+        self._conn.execute(
+            "UPDATE persons SET label = ?, updated_at = ? WHERE person_id = ?",
+            (label, time.time(), person_id),
+        )
+
+    def person_embeddings(self, person_id: int) -> list[bytes]:
+        """Every embedding currently backing one person's centroid.
+
+        Read on demand rather than caching the centroid in `persons`,
+        because a stored centroid would drift out of sync the moment a
+        member is reassigned and nothing would notice — the same
+        reasoning `events.py` gives for not storing clusters at all.
+        """
+        return [
+            row["embedding"]
+            for row in self._conn.execute(
+                """
+                SELECT cf.embedding
+                  FROM person_faces pf
+                  JOIN content_faces cf
+                    ON cf.content_hash = pf.content_hash
+                   AND cf.face_index   = pf.face_index
+                 WHERE pf.person_id = ?
+                """,
+                (person_id,),
+            )
+        ]
+
+    def assign_faces_to_persons(
+        self, assignments: Iterable[tuple[str, int, int, float]]
+    ) -> None:
+        """Record `(content_hash, face_index, person_id, similarity)` rows,
+        replacing any prior assignment for the same face — the same
+        replace-rather-than-merge choice `set_faces` makes for one photo's
+        detections, applied to one face's cluster membership.
+        """
+        now = time.time()
+        rows = [
+            (content_hash, face_index, person_id, float(similarity), now)
+            for content_hash, face_index, person_id, similarity in assignments
+        ]
+        if not rows:
+            return
+        self._conn.executemany(
+            """
+            INSERT INTO person_faces (
+                content_hash, face_index, person_id, similarity, assigned_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash, face_index) DO UPDATE SET
+                person_id   = excluded.person_id,
+                similarity  = excluded.similarity,
+                assigned_at = excluded.assigned_at
+            """,
+            rows,
+        )
+        touched = sorted({r[2] for r in rows})
+        self._conn.executemany(
+            "UPDATE persons SET updated_at = ? WHERE person_id = ?",
+            [(now, pid) for pid in touched],
+        )
+
+    def person_sample_paths(
+        self, scan_id: str, person_id: int, limit: int = 3
+    ) -> list[str]:
+        """A few example paths for one person, for the CLI and the report
+        to show a human something they can actually look at rather than a
+        row of floats."""
+        return [
+            row["display_path"]
+            for row in self._conn.execute(
+                f"""
+                SELECT DISTINCT f.display_path
+                  FROM person_faces pf
+                  JOIN files f ON f.full_hash = pf.content_hash
+                 WHERE pf.person_id = ? AND f.last_scan_id = ? AND {_HASH_IS_FRESH}
+                 ORDER BY f.display_path
+                 LIMIT ?
+                """,
+                (person_id, scan_id, limit),
+            )
+        ]
 
     # --- capture moments (see events.py) -----------------------------------
 

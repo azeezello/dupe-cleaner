@@ -21,6 +21,14 @@ from .events import (
 )
 from .jobs import ScanJob
 from .models import ArchiveClass, MediaKind, ScanMode, ScanReport
+from .persons import (
+    PersonThresholds,
+    centroid_from_embeddings,
+    cluster_new_faces,
+    cosine_similarity,
+    observation_from_row,
+    person_display_name,
+)
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
@@ -740,6 +748,133 @@ def _cmd_faces(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_persons(args: argparse.Namespace) -> int:
+    """Cluster faces into persons and let a human name a cluster (task
+    19, Р4/Р11 continued).
+
+    Read-only towards the photographs themselves — like `events`, this
+    never moves or renames a file. Unlike `events` it does write to the
+    index: a cluster assignment (`person_faces`) and a label (`persons`)
+    are exactly the kind of index bookkeeping `content_previews` and
+    `review_decisions` already are, not a change to anyone's library.
+
+    Every run only clusters faces `person_faces` has no opinion about yet
+    (`ScanIndex.unclustered_faces`) — a face already assigned keeps its
+    person unless `--label` explicitly renames that person. That is the
+    whole of "разметка делается один раз и переиспользуется": naming a
+    cluster does not get undone by the next scan finding new photographs.
+    """
+    with ScanIndex(args.db) as index:
+        scan_id = args.scan_id or index.latest_scan_id()
+        if scan_id is None:
+            print(
+                "В индексе нет ни одного скана. Сначала: dupecleaner scan --mode full <папки>",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.label is not None:
+            try:
+                person_id_str, name = args.label.split("=", 1)
+                person_id = int(person_id_str)
+            except ValueError:
+                print(
+                    "--label ожидает ID=Имя, например --label 3=Карим "
+                    "(или --label 3= чтобы снять имя)",
+                    file=sys.stderr,
+                )
+                return 1
+            if index.get_person(person_id) is None:
+                print(f"Персоны {person_id} нет в индексе.", file=sys.stderr)
+                return 1
+            index.set_person_label(person_id, name or None)
+            index.commit()
+            shown = name or f"Человек №{person_id}"
+            print(f"Персона {person_id} теперь называется «{shown}».")
+
+        thresholds = PersonThresholds(merge_cosine=args.merge_threshold)
+
+        existing = index.list_persons()
+        existing_centroids = {
+            int(row["person_id"]): centroid_from_embeddings(
+                index.person_embeddings(int(row["person_id"]))
+            )
+            for row in existing
+            if row["face_count"]
+        }
+
+        new_rows = list(index.unclustered_faces(scan_id))
+        if new_rows:
+            observations = [observation_from_row(row) for row in new_rows]
+            clustering = cluster_new_faces(
+                observations, existing_centroids=existing_centroids, thresholds=thresholds
+            )
+
+            assignments = [
+                (content_hash, face_index, person_id, similarity)
+                for (content_hash, face_index), (
+                    person_id,
+                    similarity,
+                ) in clustering.joined_existing.items()
+            ]
+            created = 0
+            for cluster in clustering.new_clusters:
+                person_id = index.create_person()
+                created += 1
+                for member in cluster.members:
+                    similarity = cosine_similarity(member.embedding, cluster.centroid)
+                    assignments.append(
+                        (member.content_hash, member.face_index, person_id, similarity)
+                    )
+            index.assign_faces_to_persons(assignments)
+            index.commit()
+            print(
+                f"Новых лиц: {len(new_rows)} — присоединено к существующим "
+                f"персонам: {len(clustering.joined_existing)}, новых персон: {created}"
+            )
+        else:
+            print("Новых лиц с прошлой кластеризации нет.")
+
+        persons = index.list_persons()
+        print(f"\nПорог склейки: косинус ≥ {thresholds.merge_cosine:.2f}")
+        print(f"Персон всего: {len(persons)}")
+
+        rows_out = []
+        for row in sorted(persons, key=lambda r: -r["face_count"])[: args.limit]:
+            person_id = int(row["person_id"])
+            name = person_display_name(row["label"], person_id)
+            samples = index.person_sample_paths(scan_id, person_id, limit=3)
+            print(
+                f"  [{row['face_count']:4d} лиц, {row['photo_count']:4d} снимков] "
+                f"{name}"
+            )
+            for path in samples:
+                print(f"          {path}")
+            rows_out.append(
+                {
+                    "person_id": person_id,
+                    "label": row["label"],
+                    "display_name": name,
+                    "face_count": row["face_count"],
+                    "photo_count": row["photo_count"],
+                    "sample_paths": samples,
+                }
+            )
+
+        if args.json:
+            payload = {
+                "scan_id": scan_id,
+                "merge_threshold": thresholds.merge_cosine,
+                "persons": rows_out,
+            }
+            Path(args.json).write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            print(f"\nПерсоны сохранены в {args.json}")
+
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -939,6 +1074,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--models-dir", help="Куда класть модели (по умолчанию рядом с индексом)"
     )
     faces_p.set_defaults(func=_cmd_faces)
+
+    persons_p = subparsers.add_parser(
+        "persons",
+        help="Кластеризовать лица по персонам и подписать кластер (Р4, задача 19)",
+    )
+    persons_p.add_argument(
+        "--scan-id",
+        default=None,
+        help="Какой скан кластеризовать. По умолчанию последний в индексе.",
+    )
+    persons_p.add_argument(
+        "--merge-threshold",
+        type=float,
+        default=PersonThresholds().merge_cosine,
+        help="Косинусное сходство, начиная с которого лицо присоединяется к "
+        f"персоне (по умолчанию {PersonThresholds().merge_cosine:.2f} — измерено "
+        "на D:\\Photos, см. docs/task-19-persons-report.md). Выше — меньше "
+        "случайных слияний разных людей, но один человек чаще разваливается "
+        "на несколько персон.",
+    )
+    persons_p.add_argument(
+        "--label",
+        default=None,
+        metavar="ID=Имя",
+        help="Подписать персону по номеру, например --label 3=Карим. "
+        "--label 3= снимает имя (снова «Человек №3»).",
+    )
+    persons_p.add_argument(
+        "--limit", type=int, default=30, help="Сколько персон распечатать"
+    )
+    persons_p.add_argument("--json", default=None, help="Сохранить персоны в JSON")
+    persons_p.set_defaults(func=_cmd_persons)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")
