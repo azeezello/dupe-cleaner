@@ -32,6 +32,7 @@ PHASE_LABELS = {
     "grouping": "Формирование групп",
     "previewing": "Миниатюры для просмотра",
     "classifying_origin": "Происхождение снимков",
+    "detecting_faces": "Лица на снимках",
     "done": "Готово",
     "cancelled": "Остановлено",
     "failed": "Ошибка",

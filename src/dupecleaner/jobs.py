@@ -20,11 +20,14 @@ The `files_from_cache` counter shows exactly how much was skipped.
 
 from __future__ import annotations
 
+import io
 import threading
 import time
 import uuid
 from pathlib import Path
 
+from . import faces as faces_module
+from . import hashing
 from . import origin as origin_module
 from . import thumbnails
 from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
@@ -112,6 +115,11 @@ class ScanJob:
         self.progress = ScanProgress(scan_id=self.scan_id, roots=roots)
         self.report: ScanReport | None = None
 
+        # Warnings this job produced itself, as opposed to the ones the
+        # Scanner collected while walking. Kept apart because the two are
+        # merged exactly once, at the end — see `_warn`.
+        self._own_warnings: list[str] = []
+
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -136,6 +144,28 @@ class ScanJob:
         if self._cancel.is_set():
             raise ScanCancelled()
 
+    def _warn(self, message: str) -> None:
+        """Record a warning the *job* produced — an unreadable file, a
+        photo that would not decode, a phase that could not start.
+
+        It goes in two places on purpose. `progress.warnings` is what the
+        web UI polls while the scan is running, so a person watching sees
+        it immediately; `_own_warnings` is what survives to the end.
+
+        The second list exists because it used to be lost. `run()`
+        finishes by assigning `scanner.warnings` over `progress.warnings`,
+        which silently discarded everything appended during hashing — so a
+        scan that failed to read forty files reported none of it once it
+        was over, in either the progress or the saved report. Found while
+        wiring up task 18, whose "faces were not looked for" line
+        disappeared the same way; see `_merged_warnings`.
+        """
+        self._own_warnings.append(message)
+        self.progress.warnings.append(message)
+
+    def _merged_warnings(self, scanner: Scanner) -> list[str]:
+        return list(scanner.warnings) + self._own_warnings
+
     # --- the actual work ---------------------------------------------------
 
     def run(self) -> ScanReport | None:
@@ -159,6 +189,7 @@ class ScanJob:
 
             self._preview_phase(index, groups)
             self._origin_phase(index)
+            self._faces_phase(index)
 
             files_total, _ = index.scan_totals(self.scan_id)
             report = ScanReport(
@@ -178,19 +209,20 @@ class ScanJob:
             report.skipped_archives.extend(
                 unread_skipped_entries(classify_archives(report), report.skipped_archives)
             )
+            report.warnings = self._merged_warnings(scanner)
             self.report = report
-            self.progress.warnings = scanner.warnings
+            self.progress.warnings = list(report.warnings)
             self.progress.finish("done")
             return self.report
 
         except ScanCancelled:
             index.commit()
-            self.progress.warnings = scanner.warnings
+            self.progress.warnings = self._merged_warnings(scanner)
             self.progress.finish("cancelled")
             return None
         except Exception as exc:  # noqa: BLE001 - a scan must never take the server down
             index.commit()
-            self.progress.warnings = scanner.warnings
+            self.progress.warnings = self._merged_warnings(scanner)
             self.progress.finish("failed", error=f"{type(exc).__name__}: {exc}")
             return None
         finally:
@@ -402,6 +434,104 @@ class ScanJob:
 
         index.commit()
 
+    def _faces_phase(self, index: ScanIndex) -> None:
+        r"""Find faces and compute their embeddings (task 18, Р2/Р4).
+
+        Over the whole library, like `_origin_phase` and unlike
+        `_preview_phase`: Р4 makes a person a filter across every event,
+        so a face index built only from duplicate groups would answer a
+        question nobody asked. Storage is keyed by content hash all the
+        same, so four filed copies of one photograph still cost one
+        decode between them.
+
+        That key is also why this phase hashes. A photo whose size is
+        unique on disk never enters the funnel and therefore has no
+        `full_hash` at all — most of the library, in other words — so
+        there would be nothing to key its faces by. The phase reads the
+        whole file regardless (a JPEG decoder has to read the entire
+        entropy-coded stream even to produce a quarter-scale image), so
+        the bytes are already in hand and xxh3 over them is lost in the
+        noise next to a 120 ms decode. Writing that hash back through
+        `set_full_hash` is what makes the *second* scan cheap (Р6), and it
+        cannot invent duplicate groups: two files can only be
+        byte-identical if their sizes match, and every same-size pair has
+        already been through the funnel by the time this runs. There is a
+        test for exactly that.
+
+        Cost, measured on `D:\Photos` (see
+        `claude/task-18-faces-report.md`): about 120 ms of CPU per
+        photograph, which is an order of magnitude more than any other
+        phase spends per file and the reason `ScanMode.detect_faces`
+        exists as its own switch. Single-threaded here, deliberately —
+        the same thread-pool question task 8 left open, and the same
+        answer for now, except that `FaceEngine` is documented as
+        one-per-thread so the answer can change without a redesign.
+
+        Best-effort at both levels. No models installed or no OpenCV means
+        the phase does not run and says so once, in `warnings`, rather
+        than failing a scan that is otherwise complete — a person who
+        never asked for faces should not have their duplicate report die
+        over them. A single photograph that will not decode becomes one
+        warning and the scan continues, as everywhere else.
+        """
+        if not self.mode.detect_faces:
+            return
+
+        targets = index.needs_faces(self.scan_id)
+        if not targets:
+            return
+
+        try:
+            engine = faces_module.FaceEngine()
+        except faces_module.FaceEngineUnavailable as exc:
+            self._warn(f"Лица не распознавались: {exc}")
+            return
+
+        self.progress.enter_phase("detecting_faces", files_total=len(targets))
+        last_commit = time.time()
+        processed_since_commit = 0
+
+        for record in targets:
+            self._check_cancelled()
+            self.progress.advance(current_path=record.display_path)
+            try:
+                data = Path(record.real_path).read_bytes()
+                content_hash = hashing.full_hash(io.BytesIO(data))
+                # Two copies of one photo: the first one through pays for
+                # the decode, the rest only for the read that produced
+                # the hash proving they are the same photo.
+                if not index.has_face_scan(content_hash):
+                    found = engine.analyse_path(
+                        Path(record.real_path), data=data
+                    )
+                    index.set_faces(
+                        content_hash,
+                        [
+                            (f.index, f.x, f.y, f.width, f.height, f.score,
+                             f.embedding)
+                            for f in found.faces
+                            if f.embedding is not None
+                        ],
+                        engine=found.engine,
+                        detect_long_side=found.detect_long_side,
+                        skipped_small=found.skipped_small,
+                    )
+                index.set_full_hash(record.display_path, content_hash)
+            except Exception as exc:  # noqa: BLE001 - one photo must not stop a scan
+                self._warn(f"Не удалось разобрать лица в {record.display_path}: {exc}")
+
+            self.progress.advance(files=1, count_as_hashed=False)
+            processed_since_commit += 1
+
+            if processed_since_commit >= COMMIT_EVERY_FILES or (
+                time.time() - last_commit
+            ) > COMMIT_EVERY_SECONDS:
+                index.commit()
+                processed_since_commit = 0
+                last_commit = time.time()
+
+        index.commit()
+
     def _hash_loop(self, index: ScanIndex, candidates, work, cost) -> None:
         last_commit = time.time()
         processed_since_commit = 0
@@ -415,9 +545,7 @@ class ScanJob:
             try:
                 work(index, record)
             except Exception as exc:  # noqa: BLE001 - one bad file must not stop the scan
-                self.progress.warnings.append(
-                    f"Не удалось прочитать {record.display_path}: {exc}"
-                )
+                self._warn(f"Не удалось прочитать {record.display_path}: {exc}")
 
             self.progress.advance(files=1, size_bytes=cost(record))
             processed_since_commit += 1
@@ -479,9 +607,7 @@ class ScanJob:
             for record in members:
                 exc = error_by_member.get(record.member_name)
                 if exc is not None:
-                    self.progress.warnings.append(
-                        f"Не удалось прочитать {record.display_path}: {exc}"
-                    )
+                    self._warn(f"Не удалось прочитать {record.display_path}: {exc}")
                 self.progress.advance(files=1, size_bytes=cost(record))
                 processed_since_commit += 1
 
