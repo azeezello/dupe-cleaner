@@ -25,9 +25,11 @@ import time
 import uuid
 from pathlib import Path
 
+from . import events as events_module
 from . import origin as origin_module
 from . import thumbnails
 from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
+from .events import MomentPolicy
 from .archive_classify import classify_archives, unread_skipped_entries
 from .models import DuplicateGroup, FileRecord, MediaKind, ScanMode, ScanReport
 from .progress import ScanProgress
@@ -93,11 +95,18 @@ class ScanJob:
         include_archives: bool | None = None,
         scan_id: str | None = None,
         mode: ScanMode = ScanMode.FULL,
+        moment_policy: MomentPolicy | None = None,
     ) -> None:
         self.scan_id = scan_id or str(uuid.uuid4())
         self.roots = roots
         self.db_path = db_path
         self.mode = mode
+        # How epoch timestamps (a Google sidecar, a file's mtime) are put on
+        # the same wall clock as EXIF, which has no zone. Defaults to this
+        # machine's own zone, which is right when the tool runs where the
+        # photos live; `events.py` explains why mixing the two scales
+        # unnoticed would move boundaries by more than any threshold.
+        self.moment_policy = moment_policy or MomentPolicy()
         # `include_archives` is the pre-Р7 switch and stays as an escape
         # hatch (`--no-archives`), but it may only ever *narrow* what the
         # mode allows, never widen it. A quick run that could be talked
@@ -158,7 +167,7 @@ class ScanJob:
             self.progress.groups_found = len(groups)
 
             self._preview_phase(index, groups)
-            self._origin_phase(index)
+            self._header_phase(index)
 
             files_total, _ = index.scan_totals(self.scan_id)
             report = ScanReport(
@@ -341,8 +350,25 @@ class ScanJob:
 
         index.commit()
 
-    def _origin_phase(self, index: ScanIndex) -> None:
-        """Give every photo on disk an origin verdict (Р3, task 15).
+    def _header_phase(self, index: ScanIndex) -> None:
+        """One header read per media file; two answers out of it.
+
+        Task 15 asked this phase for an origin verdict (Р3). Task 16 needs
+        the capture time and position of the same photo, and both come out
+        of the *same* `origin.read_signals` call — so this stayed one phase
+        rather than becoming two. A second pass would have doubled the only
+        expensive thing either feature costs, to re-read bytes already in
+        hand.
+
+        Videos join the phase here without opening anything: Pillow cannot
+        read their metadata, but `VID_20190101_120000.mp4` and the
+        filesystem both can be asked for free, and a clip shot at an event
+        belongs in that event. They get a moment and no origin verdict — Р3
+        classifies images.
+
+        (The rest of this docstring is task 15's and still accurate.)
+
+        Gives every photo on disk an origin verdict (Р3, task 15).
 
         Runs over the whole scan, not over the duplicate groups — the one
         place this pipeline deliberately does *not* follow the preview
@@ -367,28 +393,47 @@ class ScanJob:
         if not self.mode.classify_origin:
             return
 
-        targets = index.needs_origin(self.scan_id)
+        targets = index.needs_header(self.scan_id)
         if not targets:
             return
 
-        self.progress.enter_phase("classifying_origin", files_total=len(targets))
+        self.progress.enter_phase("reading_headers", files_total=len(targets))
         last_commit = time.time()
         processed_since_commit = 0
 
         for record in targets:
             self._check_cancelled()
             self.progress.advance(current_path=record.display_path)
-            # read_signals never raises: a file that will not open still
-            # yields a verdict from its path, which is most of the
-            # evidence anyway. A scan must not die over one bad JPEG.
-            verdict = origin_module.classify_file(
-                Path(record.real_path), display_path=record.display_path
-            )
-            index.set_origin(
+
+            if record.media_kind is MediaKind.PHOTO:
+                # read_signals never raises: a file that will not open still
+                # yields a verdict from its path, which is most of the
+                # evidence anyway. A scan must not die over one bad JPEG.
+                signals = origin_module.read_signals(
+                    Path(record.real_path), display_path=record.display_path
+                )
+                verdict = origin_module.classify(signals)
+                index.set_origin(
+                    record.display_path,
+                    verdict.origin.value,
+                    verdict.confidence.value,
+                    verdict.evidence,
+                )
+                moment = events_module.moment_from_signals(
+                    signals, mtime=record.mtime, policy=self.moment_policy
+                )
+            else:
+                moment = events_module.moment_without_header(
+                    record.display_path, mtime=record.mtime, policy=self.moment_policy
+                )
+
+            index.set_moment(
                 record.display_path,
-                verdict.origin.value,
-                verdict.confidence.value,
-                verdict.evidence,
+                moment.taken_at,
+                moment.time_source.value,
+                moment.latitude,
+                moment.longitude,
+                moment.geo_source.value,
             )
             self.progress.advance(files=1, count_as_hashed=False)
             processed_since_commit += 1

@@ -38,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -147,6 +147,45 @@ def _migrate_v4_origin(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE files ADD COLUMN {column} {declaration}")
 
 
+# v6 adds task 16's capture moment — when and where the photo was taken —
+# next to task 15's origin verdict, in `files`, and for the same reason:
+# the evidence is partly the path. A filename like `20170416_145106.jpg` is
+# a capture time (the only one Google left behind on 1156 of these photos),
+# and the same bytes sitting in two folders can carry two different
+# filenames, so a hash-keyed row could not hold both.
+#
+# Stamped separately from the origin verdict even though one header read
+# produces both. They are written together today, but an index built by
+# task 15 has verdicts and no moments, and `needs_moment` has to be able to
+# tell that apart from "not classified at all" — the same argument that
+# gave hashes and origins their own stamps.
+#
+# Clusters themselves are deliberately NOT stored. Every threshold in
+# `events.EventThresholds` is meant to be changed and re-run; a stored
+# clustering would be a cached answer to a question whose parameters are
+# the point, and the expensive half (the header read) is what this table
+# already keeps.
+#
+# The number 6, not 5, and that is worth a word: task 12 is adding
+# `review_decisions` as v5 on `main` at the same time as this branch is
+# written. Both migrations are additive and independent, so after the merge
+# the dict simply holds both; numbering this one 5 as well would have made
+# one of them unreachable on any index that had already seen the other.
+def _migrate_v6_moment(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+    for column, declaration in (
+        ("taken_at", "REAL"),
+        ("time_source", "TEXT"),
+        ("gps_lat", "REAL"),
+        ("gps_lon", "REAL"),
+        ("geo_source", "TEXT"),
+        ("moment_stamp_size", "INTEGER"),
+        ("moment_stamp_mtime", "REAL"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {column} {declaration}")
+
+
 _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     2: """
     CREATE TABLE IF NOT EXISTS content_previews (
@@ -168,6 +207,7 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     """,
     3: _migrate_v3_quality_metrics,
     4: _migrate_v4_origin,
+    6: _migrate_v6_moment,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -185,6 +225,14 @@ _HASH_IS_FRESH = (
 # an index built before v4 has hashes and no verdicts.
 _ORIGIN_IS_FRESH = (
     "(origin_stamp_size = source_size AND origin_stamp_mtime = source_mtime)"
+)
+
+# And the same for task 16's capture moment. `time_source` rather than
+# `taken_at` is the presence test on purpose: a file with no date at all is
+# a legitimate answer ("none"), and re-reading its header on every scan to
+# rediscover that would be the one avoidable cost in the phase.
+_MOMENT_IS_FRESH = (
+    "(moment_stamp_size = source_size AND moment_stamp_mtime = source_mtime)"
 )
 
 
@@ -520,6 +568,204 @@ class ScanIndex:
              ORDER BY display_path
             """,
             (scan_id, "screenshot_desktop", "screenshot_phone"),
+        )
+        return [row["display_path"] for row in cursor]
+
+    # --- capture moments (see events.py) -----------------------------------
+
+    def needs_header(self, scan_id: str) -> list[FileRecord]:
+        """Files whose header this scan still has to read.
+
+        The union of "needs an origin verdict" and "needs a capture
+        moment", because both come out of one `origin.read_signals` call
+        and reading the same header twice to answer two questions would
+        double the only expensive part of either feature.
+
+        Wider than `needs_origin` in one way: videos are included. A clip
+        shot at the party belongs in the party's event, and its moment
+        comes from its filename or its mtime at no cost at all — nothing
+        opens it (see `events.moment_without_header`). Р3 has no verdict to
+        give a video, so it never gets one.
+        """
+        cursor = self._conn.execute(
+            f"""
+            SELECT * FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND media_kind IN ('photo', 'video')
+               AND (
+                    (media_kind = 'photo'
+                     AND (origin_class IS NULL OR NOT {_ORIGIN_IS_FRESH}))
+                 OR (time_source IS NULL OR NOT {_MOMENT_IS_FRESH})
+               )
+             ORDER BY display_path
+            """,
+            (scan_id,),
+        )
+        return [_row_to_record(row) for row in cursor]
+
+    def needs_moment(self, scan_id: str) -> list[FileRecord]:
+        """Files with no usable capture moment. Photos and videos both."""
+        cursor = self._conn.execute(
+            f"""
+            SELECT * FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND media_kind IN ('photo', 'video')
+               AND (time_source IS NULL OR NOT {_MOMENT_IS_FRESH})
+             ORDER BY display_path
+            """,
+            (scan_id,),
+        )
+        return [_row_to_record(row) for row in cursor]
+
+    def set_moment(
+        self,
+        display_path: str,
+        taken_at: float | None,
+        time_source: str,
+        latitude: float | None = None,
+        longitude: float | None = None,
+        geo_source: str = "none",
+    ) -> None:
+        """Store when and where one file was taken, stamped with its bytes.
+
+        `taken_at` may legitimately be NULL — a photo with no date anywhere
+        is Р5's `_unsorted/`, not an error — which is why the stamp, and
+        not the value, is what says the work was done.
+        """
+        self._conn.execute(
+            """
+            UPDATE files
+               SET taken_at           = ?,
+                   time_source        = ?,
+                   gps_lat            = ?,
+                   gps_lon            = ?,
+                   geo_source         = ?,
+                   moment_stamp_size  = source_size,
+                   moment_stamp_mtime = source_mtime
+             WHERE display_path = ?
+            """,
+            (taken_at, time_source, latitude, longitude, geo_source, display_path),
+        )
+
+    def moments(self, scan_id: str, *, exclude_origins: Iterable[str] = ()) -> list[tuple]:
+        """Every media file in this scan as a raw tuple:
+
+            (display_path, taken_at, time_source, gps_lat, gps_lon,
+             geo_source, mtime)
+
+        `mtime` rides along deliberately. Whether the filesystem's
+        modification time may stand in for a missing capture date is a
+        decision with a threshold-shaped answer — it is wrong by six years
+        on this library and right on one that was never bulk-copied — so it
+        belongs to the moment the clustering runs, not to the moment the
+        scan wrote the row. Keeping it here means `--use-mtime` costs a
+        re-cluster and not a re-scan.
+
+        Returned as plain tuples rather than `events.PhotoMoment` so this
+        module stays free of the event layer — `storage` is imported by the
+        CLI's `index --stats` and by a quarantine run reading a saved
+        report, neither of which should pull in the clusterer. `events`
+        knows how to build itself from these; the direction of the
+        dependency is the point.
+
+        `exclude_origins` is applied in SQL rather than in Python because
+        Р3's exclusion list is thousands of rows on a real library, and
+        `screenshot_paths` already established that the index answers this
+        kind of question in one query instead of thirty thousand.
+        """
+        excluded = list(exclude_origins)
+        clause = ""
+        params: list[object] = [scan_id]
+        if excluded:
+            placeholders = ",".join("?" * len(excluded))
+            clause = f" AND (origin_class IS NULL OR origin_class NOT IN ({placeholders}))"
+            params.extend(excluded)
+        cursor = self._conn.execute(
+            f"""
+            SELECT display_path, taken_at, time_source, gps_lat, gps_lon,
+                   geo_source, mtime
+              FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND media_kind IN ('photo', 'video'){clause}
+             ORDER BY taken_at IS NULL, taken_at, display_path
+            """,
+            params,
+        )
+        return [
+            (
+                row["display_path"],
+                row["taken_at"],
+                row["time_source"] or "none",
+                row["gps_lat"],
+                row["gps_lon"],
+                row["geo_source"] or "none",
+                row["mtime"],
+            )
+            for row in cursor
+        ]
+
+    def latest_scan_id(self) -> str | None:
+        """The scan whose rows are newest in the index.
+
+        Needed because a report on disk does not carry its scan id, while
+        every phase's results are keyed by one. Without this, `dupecleaner
+        events` would have to ask a person to copy a UUID out of a log in
+        order to do the obvious thing.
+        """
+        row = self._conn.execute(
+            "SELECT last_scan_id FROM files ORDER BY seen_at DESC LIMIT 1"
+        ).fetchone()
+        return row["last_scan_id"] if row else None
+
+    def moment_coverage(self, scan_id: str) -> dict[str, int]:
+        """Counts per time source, plus how many have coordinates.
+
+        The number that decides whether an event boundary is worth
+        believing: a library timed mostly by `mtime` is a library whose
+        events are a guess, and this is where that shows up before anyone
+        looks at a cluster.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT COALESCE(time_source, 'unknown') AS src, COUNT(*) AS n
+              FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND media_kind IN ('photo', 'video')
+             GROUP BY src
+            """,
+            (scan_id,),
+        )
+        out = {row["src"]: int(row["n"]) for row in cursor}
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND gps_lat IS NOT NULL AND gps_lon IS NOT NULL
+            """,
+            (scan_id,),
+        ).fetchone()
+        out["with_geo"] = int(row["n"])
+        return out
+
+    def excluded_from_albums_paths(self, scan_id: str) -> list[str]:
+        """Everything Р3 keeps out of albums: screenshots *and* scans.
+
+        `screenshot_paths` (task 15) answers the narrower question and is
+        kept as it is. This is `OriginClass.excluded_from_albums` expressed
+        in SQL — the class list is imported from `origin` so there is one
+        definition of the set rather than a second copy that drifts.
+        """
+        from .origin import OriginClass
+
+        classes = [c.value for c in OriginClass if c.excluded_from_albums]
+        placeholders = ",".join("?" * len(classes))
+        cursor = self._conn.execute(
+            f"""
+            SELECT display_path FROM files
+             WHERE last_scan_id = ? AND origin_class IN ({placeholders})
+             ORDER BY display_path
+            """,
+            (scan_id, *classes),
         )
         return [row["display_path"] for row in cursor]
 
