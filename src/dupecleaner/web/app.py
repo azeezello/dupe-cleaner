@@ -33,6 +33,8 @@ from ..quarantine import (
     restore_from_journal,
     run_quarantine,
 )
+from ..similar import PHASH_ALGO, entries_from_rows, find_similar_groups
+from ..similar_review import DEFAULT_UI_THRESHOLD, build_review, thresholds_for
 from ..storage import DEFAULT_DB_PATH, ScanIndex
 
 BASE_DIR = Path(__file__).parent
@@ -451,7 +453,17 @@ def restore_quarantine(req: RestoreRequest):
 
 
 @app.get("/api/thumbnail")
-def thumbnail(path: str, content_hash: Optional[str] = Query(default=None, alias="hash")):
+def thumbnail(
+    path: str,
+    content_hash: Optional[str] = Query(default=None, alias="hash"),
+    store: bool = Query(
+        default=True,
+        description="Сохранять ли результат декодирования в кэш превью. "
+        "Вкладка похожих (задача 14) просит store=0: отпечатки есть у всей "
+        "библиотеки, а кэш на 512 МБ (Р9) рассчитан на группы дублей — "
+        "просмотр похожих вытеснил бы из него именно то, за чем он нужен.",
+    ),
+):
     """Serve a cached preview so you can actually *see* which photo you're
     about to quarantine — instant once a scan has run, because
     `dedupe.run_full_stage` already generated and cached it (see
@@ -479,10 +491,74 @@ def thumbnail(path: str, content_hash: Optional[str] = Query(default=None, alias
         except Exception as exc:  # noqa: BLE001 - not every "image" opens cleanly
             raise HTTPException(415, f"Не удалось построить превью: {exc}") from exc
 
-        if resolved_hash:
+        if resolved_hash and store:
             # Stores the quality metrics from this same decode too, so a
             # photo first seen through this fallback is as measured as one
-            # the scan reached (thumbnails.store).
+            # the scan reached (thumbnails.store). Skipped when the caller
+            # asked not to pollute the cache -- see `store` above.
             thumbnails.store(index, resolved_hash, preview)
 
         return StreamingResponse(io.BytesIO(preview.data), media_type="image/jpeg")
+
+
+@app.get("/api/scan/{scan_id}/similar")
+def scan_similar(
+    scan_id: str,
+    max_distance: int = Query(
+        default=DEFAULT_UI_THRESHOLD,
+        description="Порог Хэмминга. Нечётное округляется вниз: расстояния "
+        "чётные по построению, см. similar_review.UI_THRESHOLDS.",
+    ),
+):
+    r"""Похожие снимки — четвёртый тип группы на экране (задача 14, Р2).
+
+    **Только чтение, и это свойство формы, а не дисциплины.** Ручка возвращает
+    словари, собранные `similar_review.build_review`: ни `ScanReport`, ни
+    `DuplicateGroup`, ни `keeper` — то есть ни одного объекта, который
+    `quarantine.py` умеет принять. Отдельного запрета «не отправлять похожие
+    в карантин» здесь нет, потому что нечего запрещать: пути не существует
+    (см. докстринг `similar.py` и `tests/test_similar_never_quarantines.py`).
+
+    Группировка считается **на каждый запрос**, а не берётся из отчёта, и это
+    то же решение, что у `dupecleaner similar` и у `events`: порог — ровно
+    то, что человек будет двигать, а сохранённая кластеризация была бы
+    закэшированным ответом на вопрос, параметр которого и есть суть. Дорогая
+    половина (один декод на снимок) уже лежит в индексе, кластеризация 6000
+    отпечатков — десятые доли секунды.
+
+    Не привязано к `job.report`: отпечатки живут в индексе по хэшу
+    содержимого и переживают перезапуск сервера, в отличие от объекта отчёта
+    (см. «Мелочь» в plan.md). Нужен только `scan_id` — он есть у джобы, и по
+    нему `phash_rows` отбирает снимки этого скана.
+    """
+    job = registry.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Скан не найден.")
+
+    thresholds = thresholds_for(max_distance)
+    with ScanIndex(DB_PATH) as index:
+        stats = index.phash_stats(scan_id, PHASH_ALGO)
+        rows = index.phash_rows(scan_id, PHASH_ALGO)
+        entries = entries_from_rows(rows)
+        quality = index.quality_for_hashes(e.content_hash for e in entries)
+        # Момент съёмки (задача 16) — чтобы «похожи» могло означать «соседние
+        # кадры серии», а не только «близкие отпечатки». Одним запросом по
+        # всему скану, а не по группам: группы ещё не собраны, а строить их
+        # дважды ради выборки путей дороже, чем прочитать таблицу один раз.
+        moments = {
+            row[0]: row[1] for row in index.moments(scan_id) if row[1] is not None
+        }
+
+    clustering = find_similar_groups(
+        entries, thresholds, entries_without_hash=stats["without_phash"]
+    )
+    payload = build_review(
+        clustering, quality=quality, taken_at=moments, coverage=stats
+    )
+    payload["scan_id"] = scan_id
+    payload["mode"] = job.mode.value
+    # Р7: перцептивные хэши — часть полной обработки. В быстром режиме их
+    # нет вовсе, и экран обязан сказать это прямо, а не показать пустой
+    # список, который читается как «похожих не нашлось».
+    payload["phash_available"] = bool(entries)
+    return payload
