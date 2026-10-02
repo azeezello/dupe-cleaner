@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from .albums import DEFAULT_POLICY as DEFAULT_NAME_POLICY
+from .albums import NamePolicy, suggest_names
 from .archive_classify import classify_archives
 from .dedupe import verify_group
 from .events import (
@@ -21,6 +23,13 @@ from .events import (
 )
 from .jobs import ScanJob
 from .models import ArchiveClass, MediaKind, ScanMode, ScanReport
+from .geocode import (
+    default_gazetteer_path,
+    gazetteer_from_geonames,
+    gazetteer_from_geonamescache,
+    load_gazetteer,
+    write_gazetteer,
+)
 from .persons import (
     PersonThresholds,
     centroid_from_embeddings,
@@ -875,6 +884,226 @@ def _cmd_persons(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_gazetteer(args: argparse.Namespace, target: Path) -> int:
+    """The one command that is allowed to need data from outside.
+
+    Same shape as `faces --install-models` (Р11): the gazetteer is
+    converted once, by an explicit command, and every album name afterwards
+    is computed from a local file. `--install-gazetteer geonamescache`
+    reads the table out of the optional package; anything else is treated
+    as a path to a GeoNames `cities*.txt` dump the person downloaded
+    themselves. Neither path makes a network call from inside this tool.
+    """
+    source = args.install_gazetteer
+    if source == "geonamescache":
+        try:
+            places = gazetteer_from_geonamescache(min_population=args.min_population)
+        except ImportError:
+            print(
+                "Пакет geonamescache не установлен. Либо `pip install "
+                "geonamescache` (данные лежат внутри пакета, в сеть при подборе "
+                "названий инструмент не ходит), либо скачайте дамп "
+                "cities15000.zip с download.geonames.org и укажите путь к "
+                "распакованному cities15000.txt.",
+                file=sys.stderr,
+            )
+            return 1
+        origin = "пакет geonamescache"
+    else:
+        dump = Path(source).expanduser()
+        if not dump.exists():
+            print(f"Файла нет: {dump}", file=sys.stderr)
+            return 1
+        places = gazetteer_from_geonames(dump, min_population=args.min_population)
+        origin = str(dump)
+
+    if not places:
+        print("В источнике не нашлось ни одного населённого пункта.", file=sys.stderr)
+        return 1
+    write_gazetteer(places, target)
+    print(f"Геокодер: {len(places)} населённых пунктов из {origin} → {target}")
+    print(
+        "Это единственный шаг, которому нужны данные извне. Дальше подбор "
+        "названий читает только этот файл — никаких сетевых запросов (Р4)."
+    )
+    return 0
+
+
+def _cmd_albums(args: argparse.Namespace) -> int:
+    """Suggest a name for every event (Р4, задача 20). Read-only.
+
+    The only thing this command can write is a name a person explicitly
+    confirmed with `--confirm`. It does not rename, move or touch a single
+    photograph: materialising the library out of these names is задача 21,
+    and that one shows its whole plan first.
+    """
+    gazetteer_path = Path(args.gazetteer) if args.gazetteer else default_gazetteer_path(args.db)
+
+    if args.install_gazetteer:
+        return _install_gazetteer(args, gazetteer_path)
+
+    policy = NamePolicy(
+        place_share=args.place_share,
+        folder_share=args.folder_share,
+        person_share=args.person_share,
+        subject_order=tuple(s.strip() for s in args.subject_order.split(",") if s.strip()),
+    )
+    unknown = set(policy.subject_order) - {"place", "person", "folder"}
+    if unknown:
+        print(
+            f"--subject-order: неизвестные звенья {sorted(unknown)}; "
+            "допустимы place, person, folder.",
+            file=sys.stderr,
+        )
+        return 2
+
+    gazetteer = None
+    if gazetteer_path.exists():
+        gazetteer = load_gazetteer(gazetteer_path)
+    else:
+        print(
+            f"Геокодера нет ({gazetteer_path}) — первое звено цепочки Р4 молчит, "
+            "события будут названы по папкам, лицам и датам. Поставить: "
+            "dupecleaner albums --install-gazetteer geonamescache",
+            file=sys.stderr,
+        )
+
+    thresholds = EventThresholds(session_gap_seconds=args.session_gap_hours * 3600)
+    moment_policy = MomentPolicy(
+        utc_offset_seconds=(
+            args.utc_offset_hours * 3600 if args.utc_offset_hours is not None else None
+        ),
+        use_mtime=args.use_mtime,
+    )
+
+    with ScanIndex(args.db) as index:
+        scan_id = args.scan_id or index.latest_scan_id()
+        if scan_id is None:
+            print(
+                "В индексе нет ни одного скана. Сначала: dupecleaner scan --mode full <папки>",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.forget:
+            existed = index.forget_album_name(args.forget)
+            print(
+                f"Подтверждение снято: {args.forget}"
+                if existed
+                else f"Подтверждённого названия с таким ключом нет: {args.forget}"
+            )
+            return 0 if existed else 1
+
+        rows = index.moments(scan_id)
+        excluded = [] if args.include_screenshots else index.excluded_from_albums_paths(scan_id)
+        hashes = index.content_hash_by_path(scan_id)
+        persons_by_hash = index.persons_by_content_hash(scan_id)
+        labels = index.person_labels()
+        confirmed = index.confirmed_album_names()
+
+        moments = moments_from_rows(rows, policy=moment_policy)
+        if not any(m.has_time for m in moments):
+            print(
+                "Ни у одного файла нет времени съёмки. Фаза метаданных работает "
+                "только в полном режиме: dupecleaner scan --mode full с тем же --db.",
+                file=sys.stderr,
+            )
+            return 1
+
+        clustering = cluster_events(moments, thresholds=thresholds, excluded_paths=excluded)
+        naming = suggest_names(
+            clustering,
+            gazetteer=gazetteer,
+            content_hashes=hashes,
+            persons_by_hash=persons_by_hash,
+            person_labels=labels,
+            confirmed=confirmed,
+            policy=policy,
+        )
+
+        if args.confirm:
+            anchor, _, label = args.confirm.partition("=")
+            anchor, label = anchor.strip(), label.strip()
+            found = next((s for s in naming.suggestions if s.anchor == anchor), None)
+            if not label:
+                print(
+                    "--confirm ждёт КЛЮЧ=Название. Ключ события печатается "
+                    "рядом с предложением.",
+                    file=sys.stderr,
+                )
+                return 2
+            index.confirm_album_name(
+                anchor,
+                label,
+                suggested=found.primary.text if found else None,
+                source=found.primary.source if found else None,
+            )
+            print(f"Подтверждено: «{label}» (ключ {anchor})")
+            if found and found.primary.text != label:
+                print(f"  предложено было: «{found.primary.text}» ({found.primary.source})")
+            return 0
+
+    summary = naming.summary()
+    print(f"Скан: {scan_id}")
+    print(
+        "Геокодер: "
+        + (f"{len(gazetteer)} населённых пунктов, офлайн" if gazetteer else "не установлен")
+    )
+    print(
+        f"Событий: {summary['events']}, подтверждено вручную: {summary['confirmed']}"
+    )
+    print(
+        "Откуда взялось название: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(summary["by_source"].items()))
+    )
+    print(
+        f"Только диапазон дат (ни места, ни лиц, ни названной папки): "
+        f"{summary['dates_only']}"
+    )
+    print(
+        "Событий, где доминирует один пока не подписанный кластер лиц: "
+        f"{summary['unlabelled_dominant']} — их названия появятся после "
+        "dupecleaner persons --label"
+    )
+
+    shown = sorted(naming.suggestions, key=lambda s: -s.size)[: args.limit]
+    print(f"\nКрупнейшие события ({len(shown)} из {summary['events']}):")
+    for suggestion in shown:
+        mark = "✓" if suggestion.confirmed else " "
+        print(
+            f"{mark} «{suggestion.name}»  [{suggestion.size} снимков, "
+            f"{suggestion.primary.source}]  ключ {suggestion.anchor[:16]}"
+        )
+        print(f"      {suggestion.primary.evidence}")
+        for alternative in suggestion.alternatives:
+            print(f"      ещё вариант: «{alternative.text}» ({alternative.source})")
+
+    print(
+        "\nНазвание — предложение. Подтвердить: "
+        "dupecleaner albums --confirm КЛЮЧ=Название"
+    )
+
+    if args.json:
+        payload = {
+            "scan_id": scan_id,
+            "gazetteer": str(gazetteer_path) if gazetteer else None,
+            "policy": {
+                "place_share": policy.place_share,
+                "folder_share": policy.folder_share,
+                "person_share": policy.person_share,
+                "subject_order": list(policy.subject_order),
+            },
+            "summary": summary,
+            "albums": [s.to_dict() for s in naming.suggestions],
+        }
+        Path(args.json).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"Названия сохранены в {args.json}")
+
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -1106,6 +1335,91 @@ def build_parser() -> argparse.ArgumentParser:
     )
     persons_p.add_argument("--json", default=None, help="Сохранить персоны в JSON")
     persons_p.set_defaults(func=_cmd_persons)
+
+    albums_p = subparsers.add_parser(
+        "albums",
+        help="Предложить названия альбомов для событий (Р4, задача 20)",
+    )
+    albums_p.add_argument(
+        "--scan-id", default=None, help="Какой скан назвать. По умолчанию последний."
+    )
+    albums_p.add_argument(
+        "--gazetteer",
+        default=None,
+        help="Файл офлайн-геокодера (по умолчанию gazetteer.tsv рядом с индексом).",
+    )
+    albums_p.add_argument(
+        "--install-gazetteer",
+        default=None,
+        metavar="ИСТОЧНИК",
+        help="Собрать геокодер один раз: geonamescache (данные внутри пакета) "
+        "или путь к распакованному cities15000.txt с download.geonames.org. "
+        "Единственный шаг, которому нужны данные извне — сам подбор названий "
+        "в сеть не ходит никогда (Р4).",
+    )
+    albums_p.add_argument(
+        "--min-population",
+        type=int,
+        default=0,
+        help="Отбросить при установке населённые пункты меньше этого размера.",
+    )
+    albums_p.add_argument(
+        "--subject-order",
+        default=",".join(DEFAULT_NAME_POLICY.subject_order),
+        help="Порядок звеньев цепочки Р4, из которых берётся подлежащее названия "
+        f"(по умолчанию {','.join(DEFAULT_NAME_POLICY.subject_order)} — как в Р4). "
+        "Вариант folder,place,person ставит вашу собственную папку впереди "
+        "геокодера, см. claude/task-20-album-names-report.md.",
+    )
+    albums_p.add_argument(
+        "--place-share",
+        type=float,
+        default=DEFAULT_NAME_POLICY.place_share,
+        help="Какая доля снимков с координатами должна сойтись на одном месте, "
+        f"чтобы оно дало название (по умолчанию {DEFAULT_NAME_POLICY.place_share}).",
+    )
+    albums_p.add_argument(
+        "--folder-share",
+        type=float,
+        default=DEFAULT_NAME_POLICY.folder_share,
+        help="Какая доля снимков должна лежать в одной названной вами папке "
+        f"(по умолчанию {DEFAULT_NAME_POLICY.folder_share}).",
+    )
+    albums_p.add_argument(
+        "--person-share",
+        type=float,
+        default=DEFAULT_NAME_POLICY.person_share,
+        help="Какая доля снимков с лицами должна содержать одну персону "
+        f"(по умолчанию {DEFAULT_NAME_POLICY.person_share}).",
+    )
+    albums_p.add_argument(
+        "--session-gap-hours",
+        type=float,
+        default=DEFAULT_THRESHOLDS.session_gap_seconds / 3600,
+        help="Тот же порог события, что у команды events; тонкая настройка "
+        "границ живёт там.",
+    )
+    albums_p.add_argument("--use-mtime", action="store_true", help="См. events --use-mtime")
+    albums_p.add_argument("--utc-offset-hours", type=float, default=None)
+    albums_p.add_argument(
+        "--include-screenshots",
+        action="store_true",
+        help="Не исключать скриншоты и сканы (Р3 исключает их из альбомов).",
+    )
+    albums_p.add_argument(
+        "--confirm",
+        default=None,
+        metavar="КЛЮЧ=Название",
+        help="Подтвердить название вручную. Ключ события печатается рядом с "
+        "предложением; подтверждение переживает пересканирование и перенос "
+        "файла, потому что ключ — хэш содержимого, а не путь.",
+    )
+    albums_p.add_argument(
+        "--forget", default=None, metavar="КЛЮЧ", help="Снять подтверждённое название."
+    )
+    albums_p.add_argument("--limit", type=int, default=20, help="Сколько событий распечатать")
+    albums_p.add_argument("--json", default=None, help="Сохранить названия в JSON")
+    albums_p.set_defaults(func=_cmd_albums)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")

@@ -38,14 +38,24 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-# Highest migration this build knows about. Note the gap at 5: that
+# Highest migration this build knows about. There are now two gaps in
+# this sequence, and both are deliberate. 9 is reserved for задача 13's
+# perceptual hashes, which is still open: задача 20 took 10 rather than
+# 9 so that the two can land in either order without a collision. The
+# collision is not theoretical and it is not loud — `_MIGRATIONS` is a
+# dict, so two branches both claiming a number leave one of the two
+# statements simply absent, and the table it was supposed to create
+# never exists. That is exactly what nearly happened on the merge of 27
+# September, and it is why a gap is cheaper than a renumber.
+#
+# Note the gap at 5: that
 # number belongs to task 12's `review_decisions`, which landed on `main`
 # in a session running in parallel with this one. Two branches cannot
 # both own "the next number", so this one took 6 and left 5 alone rather
 # than colliding in the middle of a merge — and the bookkeeping in
 # `__init__` below was changed at the same time so that a gap is a fact
 # the index can record instead of a hole it silently skips.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -331,6 +341,38 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     );
     CREATE INDEX IF NOT EXISTS idx_person_faces_person
         ON person_faces(person_id);
+    """,
+    # Задача 20: подтверждённые вручную названия альбомов (Р4, Р13).
+    #
+    # Хранится только то, что человек подтвердил. Предложение не
+    # хранится: оно пересчитывается из событий, геокодера, персон и путей
+    # за секунды, а закэшированное предложение — это устаревший ответ на
+    # вопрос, у которого главное это параметры (тот же довод, по которому
+    # задача 16 сознательно не хранит сами кластеры событий).
+    #
+    # Ключ — `anchor_hash`, хэш содержимого самого раннего снимка
+    # события, а не путь и не номер события. Номера у события нет и не
+    # будет: пороги предназначены для того, чтобы их менять, и
+    # перекластеризация выдаёт другое разбиение. Путь не годится потому,
+    # что задача 21 файл переместит — а подтверждённое название обязано
+    # это пережить, как переживают превью (Р9), решения по группам (Р10)
+    # и метки персон (Р12). Если перекластеризация разрежет событие
+    # надвое, имя достанется той половине, в которой остался самый ранний
+    # снимок, а вторая снова станет неподписанной — деградация заметная и
+    # объяснимая, а не молчаливая.
+    #
+    # `suggested` и `source` пишутся рядом с подтверждённым именем как
+    # улика: по ним видно, подтвердил человек предложение или заменил
+    # его, — то есть можно измерить, насколько цепочка Р4 угадывает, не
+    # спрашивая человека второй раз.
+    10: """
+    CREATE TABLE IF NOT EXISTS album_names (
+        anchor_hash  TEXT PRIMARY KEY,
+        label        TEXT NOT NULL,
+        suggested    TEXT,
+        source       TEXT,
+        confirmed_at REAL NOT NULL
+    );
     """,
 }
 
@@ -1105,6 +1147,109 @@ class ScanIndex:
             (scan_id,),
         )
         return [_row_to_record(row) for row in cursor]
+
+    # --- задача 20: названия альбомов ------------------------------------
+
+    def content_hash_by_path(self, scan_id: str) -> dict[str, str]:
+        """`display_path` -> `full_hash` for this scan's plain media files.
+
+        The bridge задача 20 needs between two key spaces that exist for
+        good reasons and do not match: an event is a list of *paths*
+        (задача 16 keyed moments by path, because half the evidence for a
+        capture time is the filename), while faces are keyed by *content*
+        (Р11, because a face is a property of pixels). Only fresh hashes
+        are returned — a stale one would attach a person to bytes that are
+        no longer there.
+        """
+        cursor = self._conn.execute(
+            f"""
+            SELECT display_path, full_hash
+              FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND full_hash IS NOT NULL AND {_HASH_IS_FRESH}
+            """,
+            (scan_id,),
+        )
+        return {row["display_path"]: row["full_hash"] for row in cursor}
+
+    def persons_by_content_hash(self, scan_id: str) -> dict[str, list[int]]:
+        """Which persons appear in each photograph of this scan."""
+        cursor = self._conn.execute(
+            f"""
+            SELECT DISTINCT pf.content_hash, pf.person_id
+              FROM person_faces pf
+              JOIN files f ON f.full_hash = pf.content_hash
+             WHERE f.last_scan_id = ? AND {_HASH_IS_FRESH}
+            """,
+            (scan_id,),
+        )
+        out: dict[str, list[int]] = {}
+        for row in cursor:
+            out.setdefault(row["content_hash"], []).append(row["person_id"])
+        return out
+
+    def person_labels(self) -> dict[int, str | None]:
+        """Every person's human-given name, or None for «Человек №N»."""
+        return {
+            row["person_id"]: row["label"]
+            for row in self._conn.execute("SELECT person_id, label FROM persons")
+        }
+
+    def confirmed_album_names(self) -> dict[str, str]:
+        """`anchor_hash` -> the name a person confirmed for that event."""
+        return {
+            row["anchor_hash"]: row["label"]
+            for row in self._conn.execute("SELECT anchor_hash, label FROM album_names")
+        }
+
+    def album_name_rows(self) -> list[sqlite3.Row]:
+        """Confirmed names with their evidence — what was suggested at the
+        time and which link of Р4's chain suggested it. Kept so the
+        question "how often is the suggestion accepted as-is" can be
+        answered from the index instead of asked of Aziz again."""
+        return list(
+            self._conn.execute(
+                "SELECT * FROM album_names ORDER BY confirmed_at DESC"
+            )
+        )
+
+    def confirm_album_name(
+        self,
+        anchor_hash: str,
+        label: str,
+        *,
+        suggested: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        """Record a name a person confirmed. The only write задача 20 makes.
+
+        Re-confirming replaces the previous name rather than accumulating
+        versions — the same replace-not-append choice `set_person_label`
+        makes, and for the same reason: a name taken back should cost
+        nothing.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO album_names (
+                anchor_hash, label, suggested, source, confirmed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(anchor_hash) DO UPDATE SET
+                label        = excluded.label,
+                suggested    = excluded.suggested,
+                source       = excluded.source,
+                confirmed_at = excluded.confirmed_at
+            """,
+            (anchor_hash, label, suggested, source, time.time()),
+        )
+        self._conn.commit()
+
+    def forget_album_name(self, anchor_hash: str) -> bool:
+        """Drop a confirmation, so the event goes back to being suggested."""
+        cursor = self._conn.execute(
+            "DELETE FROM album_names WHERE anchor_hash = ?", (anchor_hash,)
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def needs_moment(self, scan_id: str) -> list[FileRecord]:
         """Files with no usable capture moment. Photos and videos both."""

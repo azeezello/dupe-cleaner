@@ -35,6 +35,7 @@ from PIL import Image
 
 from dupecleaner import faces
 from dupecleaner.jobs import ScanJob
+from dupecleaner.storage import SCHEMA_VERSION
 from dupecleaner.models import ScanMode
 from dupecleaner.storage import ScanIndex
 
@@ -214,8 +215,14 @@ def test_migration_runs_even_when_a_later_version_is_already_stamped(tmp_path):
     db = tmp_path / "index.db"
     _legacy_v4_database(db)
     conn = sqlite3.connect(db)
+    # Deliberately one past the current schema: the point of this test is a
+    # stamp from the FUTURE, so the number has to follow SCHEMA_VERSION rather
+    # than sit here as a literal that quietly stops being "later" the next time
+    # someone adds a migration.
+    ahead = str(SCHEMA_VERSION + 1)
     conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '9')"
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+        (ahead,),
     )
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value)"
@@ -232,7 +239,7 @@ def test_migration_runs_even_when_a_later_version_is_already_stamped(tmp_path):
     stamped = dict(conn.execute("SELECT key, value FROM meta"))
     conn.close()
     # and the newer stamp is not walked backwards
-    assert stamped["schema_version"] == "9"
+    assert stamped["schema_version"] == ahead
     assert "7" in stamped["applied_migrations"].split(",")
 
 
