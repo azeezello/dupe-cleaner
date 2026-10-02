@@ -574,6 +574,16 @@ function setActiveTab(tab) {
     btn.classList.toggle("active", btn.dataset.tab === tab);
   });
   hideGroupDetail();
+  hideSimilarDetail();
+  $("similar-panel").hidden = tab !== "similar";
+
+  if (tab === "similar") {
+    $("grid-viewport").hidden = true;
+    $("grid-empty").hidden = true;
+    $("archive-panel").hidden = true;
+    openSimilarTab();
+    return;
+  }
 
   if (tab === "archive") {
     $("grid-viewport").hidden = true;
@@ -961,6 +971,12 @@ document.addEventListener("keydown", (e) => {
   if (isTypingTarget(e.target)) return;
   if (!currentReport || $("results").hidden) return;
   if (activeTab === "archive") return; // no per-group grid on this tab
+  if (activeTab === "similar") {
+    // Своя навигация и никаких клавиш решения: у группы похожих решения
+    // не существует (Р2), поэтому Q/K/U/1-9 сюда не доходят.
+    handleSimilarKey(e);
+    return;
+  }
 
   const g = initGrid();
   const count = g.itemCount;
@@ -1135,9 +1151,14 @@ function renderReport(report) {
 
   document.querySelectorAll(".type-tab").forEach((btn) => {
     const tab = btn.dataset.tab;
+    // "Похожие" не живут в отчёте: это запрос над отпечатками в индексе,
+    // со своим порогом, и до первой загрузки у вкладки нет числа — там
+    // стоит прочерк, а не ноль, который читался бы как "не нашлось".
+    if (tab === "similar") return;
     const count = tab === "archive" ? archiveVerdictCount : buckets[tab].length;
     btn.querySelector(".cnt").textContent = fmtNumber(count);
   });
+  resetSimilarTab(report);
 
   // "Обычные файлы" is the natural first tab, but a real personal photo
   // library (the one this was tested against: D:\Photos plus a Google
@@ -1340,3 +1361,435 @@ $("journal-restore-selected-btn").addEventListener("click", async () => {
 });
 
 refreshIndexStats();
+
+// --- похожие снимки: четвёртая вкладка (задача 14) ------------------------
+//
+// Отдельная сетка, отдельная панель деталей и ни одной кнопки действия.
+// Переиспользовать плитку дублей было бы короче по коду и неверно по сути:
+// у группы похожих нет ни `keeper`, ни `wasted_bytes`, ни решения, потому
+// что ей нечем их обосновать (Р0, ось B; Р2). Плитка, у которой эти поля
+// просто пустые, читается как «ещё не посчитано», а не как «такого вопроса
+// здесь не существует» — поэтому у похожих своя плитка, пунктирная, с
+// бейджем «≈N» вместо «×N».
+//
+// Группы приходят с сервера на каждое движение ручки порога
+// (/api/scan/{id}/similar?max_distance=N): кластеризация — это запрос над
+// уже посчитанными отпечатками, а не часть отчёта. Поэтому вкладка грузится
+// по требованию, а не вместе с отчётом, и её счётчик до первой загрузки —
+// прочерк, а не ноль.
+
+let similarGrid = null;
+let similarState = {
+  loaded: false,
+  loading: false,
+  threshold: 6,
+  filter: "all",
+  data: null,
+  items: [],
+  detailId: null,
+  modeIsFull: false,
+};
+
+function initSimilarGrid() {
+  if (similarGrid) return similarGrid;
+  similarGrid = createVirtualGrid({
+    viewport: $("similar-viewport"),
+    sizer: $("similar-sizer"),
+    pool: $("similar-pool"),
+    tileWidth: 168,
+    tileHeight: 210,
+    gap: 9,
+    overscan: 3,
+    renderTile: renderSimilarTile,
+  });
+  return similarGrid;
+}
+
+function similarTabCount() {
+  return document.querySelector('.type-tab[data-tab="similar"] .cnt');
+}
+
+// Вызывается при каждом новом отчёте: вкладка обнуляется, но не грузится —
+// кластеризация стоит реального времени на сервере, и платить за неё должен
+// тот, кто на вкладку зашёл.
+function resetSimilarTab(report) {
+  similarState = {
+    loaded: false,
+    loading: false,
+    threshold: similarState.threshold || 6,
+    filter: similarState.filter || "all",
+    data: null,
+    items: [],
+    detailId: null,
+    modeIsFull: report.mode === "full",
+  };
+  similarTabCount().textContent = "—";
+  $("similar-threshold").value = String(similarState.threshold);
+  $("similar-threshold-value").textContent = String(similarState.threshold);
+  hideSimilarDetail();
+}
+
+function openSimilarTab() {
+  if (!similarState.modeIsFull) {
+    // Р7: отпечатков в быстром режиме не существует. Пустая сетка здесь
+    // читалась бы как «похожих нет» — ровно то недоразумение, про которое
+    // находка A1.
+    $("similar-viewport").hidden = true;
+    $("similar-empty").hidden = false;
+    $("similar-empty").textContent =
+      "Перцептивные отпечатки считаются только в полном режиме — в быстром " +
+      "сканировании их нет вовсе, поэтому похожие здесь не «не нашлись», а " +
+      "не искались. Нажмите «Досчитать полностью» выше.";
+    $("similar-summary").textContent = "";
+    $("similar-threshold-note").textContent = "";
+    return;
+  }
+  if (!similarState.loaded && !similarState.loading) {
+    loadSimilar(similarState.threshold);
+    return;
+  }
+  renderSimilar();
+}
+
+let similarRequestToken = 0;
+
+async function loadSimilar(threshold) {
+  if (!currentScanId) return;
+  const token = ++similarRequestToken;
+  similarState.loading = true;
+  similarState.threshold = threshold;
+  // Пересчёт идёт на сервере, и он дорожает с порогом быстрее, чем линейно:
+  // на библиотеке в 6000 отпечатков порог 6 — треть секунды, порог 12 —
+  // около восьми, порог 16 — две дюжины (замер в отчёте задачи 14; причина
+  // в similar.py: с ростом порога блоки индекса кандидатов сужаются, а
+  // корзины толстеют, и число пар-кандидатов растёт квадратично). Поэтому
+  // ручка на время расчёта блокируется вместо того, чтобы копить запросы, а
+  // ответ запроса, который обогнали, отбрасывается по токену.
+  $("similar-threshold").disabled = true;
+  $("similar-summary").textContent =
+    threshold >= 12
+      ? `Группирую отпечатки при пороге ${threshold} — на большой библиотеке это десятки секунд...`
+      : "Группирую отпечатки...";
+  $("similar-viewport").hidden = true;
+  $("similar-empty").hidden = true;
+  hideSimilarDetail();
+  try {
+    const resp = await fetch(
+      `/api/scan/${currentScanId}/similar?max_distance=${encodeURIComponent(threshold)}`
+    );
+    if (token !== similarRequestToken) return; // обогнали следующим движением ручки
+    if (!resp.ok) {
+      $("similar-summary").textContent = `Не удалось посчитать похожие: ${await resp.text()}`;
+      return;
+    }
+    similarState.data = await resp.json();
+    similarState.loaded = true;
+    // Сервер округляет нечётный порог вниз — ручка обязана показать то, что
+    // реально применено, а не то, что было запрошено.
+    const applied = similarState.data.threshold.max_distance;
+    similarState.threshold = applied;
+    $("similar-threshold").value = String(applied);
+    $("similar-threshold-value").textContent = String(applied);
+    renderSimilar();
+  } catch {
+    $("similar-summary").textContent = "Ошибка сети при запросе похожих.";
+  } finally {
+    if (token === similarRequestToken) {
+      similarState.loading = false;
+      $("similar-threshold").disabled = false;
+    }
+  }
+}
+
+function renderSimilarThresholdNote() {
+  const t = similarState.data.threshold;
+  const measured = t.measured[String(t.max_distance)];
+  const parts = [t.even_only_note];
+  if (t.max_distance >= 12) {
+    // Замеры задачи 13: при 12 и выше группы перестают быть группами копий
+    // (крупнейшая разрастается до 94 снимков при 16), а вето по форме кадра
+    // начинает выбрасывать настоящие пары пачками. Это сказано рядом с
+    // ручкой, а не только в отчёте, потому что ручку двигают здесь.
+    parts.push(
+      "Выше 12 группы перестают быть группами копий и становятся сценами, " +
+      "а пересчёт на большой библиотеке занимает десятки секунд."
+    );
+  }
+  if (measured) {
+    parts.push(
+      `Замер на ${t.measured_on}: при пороге ${t.max_distance} — ` +
+      `${fmtNumber(measured.groups)} групп, крупнейшая ${measured.largest} снимков, ` +
+      `из них собранных цепочкой ${fmtNumber(measured.chains)}.`
+    );
+  }
+  $("similar-threshold-note").textContent = parts.join(" ");
+}
+
+function renderSimilar() {
+  const data = similarState.data;
+  if (!data) return;
+
+  renderSimilarThresholdNote();
+
+  const s = data.summary;
+  const cov = data.coverage || {};
+  $("similar-summary").textContent =
+    `Групп похожих: ${fmtNumber(s.groups)} — из них копий ${fmtNumber(s.copy_groups)}, ` +
+    `похожих сцен (цепочек) ${fmtNumber(s.chain_groups)}. ` +
+    `Снимков в группах ${fmtNumber(s.contents_in_groups)}, файлов ${fmtNumber(s.files_in_groups)}, ` +
+    `крупнейшая группа ${fmtNumber(s.largest_group)}. ` +
+    `Отпечаток есть у ${fmtNumber(cov.with_phash || 0)} снимков из ${fmtNumber(cov.photos || 0)}` +
+    (cov.without_phash ? `, без структуры (пустой кадр) ${fmtNumber(cov.without_phash)}` : "") +
+    (cov.not_looked ? `, не смотрели ${fmtNumber(cov.not_looked)}` : "") + ".";
+
+  const warnings = data.warnings || [];
+  $("similar-warnings").hidden = warnings.length === 0;
+  $("similar-warnings").textContent = warnings.join(" ");
+
+  similarTabCount().textContent = fmtNumber(s.groups);
+
+  const filter = similarState.filter;
+  similarState.items = (data.groups || []).filter(
+    (g) => filter === "all" || g.kind === filter
+  );
+
+  const g = initSimilarGrid();
+  $("similar-viewport").hidden = similarState.items.length === 0;
+  $("similar-empty").hidden = similarState.items.length > 0;
+  if (similarState.items.length === 0) {
+    $("similar-empty").textContent = data.phash_available
+      ? `При пороге ${similarState.threshold} таких групп нет. Подвиньте ручку вправо — ` +
+        "но помните, что дальше 12 группы перестают быть группами копий."
+      : "Ни у одного снимка этого скана нет перцептивного отпечатка.";
+    hideSimilarDetail();
+    return;
+  }
+  g.setItems(similarState.items);
+  // setItems не сбрасывает memo-ключи пула: при смене порога у группы может
+  // поменяться разброс и тип при том же первом хэше, и плитка показала бы
+  // старое. refresh() заставляет перерисовать всё видимое.
+  g.refresh();
+  g.setActive(0);
+  openActiveSimilarDetail();
+}
+
+function referenceMember(group) {
+  return group.members.find((m) => m.is_reference) || group.members[0];
+}
+
+function renderSimilarTile(node, group) {
+  node.dataset.sid = group.id;
+  node.className = "tile similar-tile" + (group.kind === "scene" ? " scene" : "");
+  node.setAttribute(
+    "aria-label",
+    `${group.size} похожих снимков, ${group.kind === "scene" ? "похожая сцена" : "копии"}`
+  );
+
+  let refs = node._srefs;
+  if (!refs) {
+    refs = {
+      thumb: el("div", "tile-thumb"),
+      badge: el("div", "tile-similar-badge"),
+      ribbon: el("div", "tile-scene-ribbon"),
+      info: el("div", "tile-info"),
+      spread: el("div", "tile-spread"),
+      labels: el("div", "tile-labels"),
+    };
+    refs.info.appendChild(refs.spread);
+    refs.info.appendChild(refs.labels);
+    node.appendChild(refs.thumb);
+    node.appendChild(refs.badge);
+    node.appendChild(refs.ribbon);
+    node.appendChild(refs.info);
+    node._srefs = refs;
+    node.addEventListener("click", () => selectSimilarById(node.dataset.sid));
+    node.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectSimilarById(node.dataset.sid);
+      }
+    });
+  }
+
+  refs.badge.textContent = `≈${group.size}`;
+  refs.ribbon.hidden = group.kind !== "scene";
+  refs.ribbon.textContent = "сцена";
+
+  const ref = referenceMember(group);
+  refs.thumb.className = "tile-thumb";
+  refs.thumb.innerHTML = "";
+  const path = ref && ref.paths && ref.paths[0];
+  if (path) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = "";
+    // store=0: эти снимки в большинстве не попадали в группы дублей, поэтому
+    // готовой миниатюры у них нет, и `/api/thumbnail` декодирует на месте.
+    // Записывать результат в кэш превью нельзя — его 512 МБ (Р9) рассчитаны
+    // на группы дублей, и просмотр похожих вытеснил бы именно их.
+    img.src =
+      `/api/thumbnail?path=${encodeURIComponent(path)}` +
+      `&hash=${encodeURIComponent(ref.content_hash)}&store=0`;
+    img.addEventListener(
+      "error",
+      () => {
+        refs.thumb.className = "tile-thumb no-preview kind-image";
+        refs.thumb.innerHTML = "";
+        refs.thumb.appendChild(el("div", "tile-ext", "IMG"));
+        refs.thumb.appendChild(el("div", "tile-kind", "превью не вышло"));
+      },
+      { once: true }
+    );
+    refs.thumb.appendChild(img);
+  }
+
+  refs.spread.textContent =
+    group.spread == null
+      ? "разброс не измерялся"
+      : `разброс ${group.spread} бит${group.kind === "scene" ? " — цепочка" : ""}`;
+
+  const labels = new Set();
+  group.members.forEach((m) => m.labels.forEach((l) => labels.add(l)));
+  refs.labels.textContent = labels.size ? Array.from(labels).join(" · ") : `${group.file_count} файлов`;
+}
+
+function selectSimilarById(id) {
+  const idx = similarState.items.findIndex((g) => g.id === id);
+  if (idx < 0) return;
+  initSimilarGrid().setActive(idx);
+  openActiveSimilarDetail();
+}
+
+function openActiveSimilarDetail() {
+  const g = initSimilarGrid();
+  const item = g.getItem(g.activeIndex);
+  if (item) showSimilarDetail(item);
+  else hideSimilarDetail();
+}
+
+function fmtGap(seconds) {
+  if (seconds == null) return null;
+  if (seconds < 1) return "в тот же миг";
+  if (seconds < 90) return `${Math.round(seconds)} с спустя`;
+  return fmtDuration(seconds) + " спустя";
+}
+
+function showSimilarDetail(group) {
+  similarState.detailId = group.id;
+  $("similar-detail").hidden = false;
+  $("similar-detail-title").textContent =
+    (group.kind === "scene" ? "Похожая сцена: " : "Похожие копии: ") +
+    `${group.size} снимков, ${group.file_count} файлов`;
+
+  const why = $("similar-detail-why");
+  why.innerHTML = "";
+  group.explanation.forEach((line) => why.appendChild(el("p", null, line)));
+
+  const list = $("similar-detail-members");
+  list.innerHTML = "";
+  group.members.forEach((m) => {
+    const li = el("li", "similar-member" + (m.is_reference ? " reference" : ""));
+
+    const thumb = el("div", "similar-member-thumb");
+    const path = m.paths && m.paths[0];
+    if (path) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = "";
+      img.src =
+        `/api/thumbnail?path=${encodeURIComponent(path)}` +
+        `&hash=${encodeURIComponent(m.content_hash)}&store=0`;
+      thumb.appendChild(img);
+    }
+    li.appendChild(thumb);
+
+    const body = el("div", "similar-member-body");
+    body.appendChild(
+      el(
+        "div",
+        "similar-member-dist",
+        m.is_reference
+          ? "опорный для сравнения (самый тяжёлый файл в группе)"
+          : `${m.distance} бит из ${similarState.data.threshold.bits} от опорного`
+      )
+    );
+
+    const facts = [];
+    facts.push(fmtBytes(m.size));
+    if (m.size_ratio != null && !m.is_reference) {
+      if (m.size_ratio >= 1.05) facts.push(`в ${m.size_ratio.toFixed(1)} раза легче опорного`);
+      else if (m.size_ratio <= 0.95) facts.push(`в ${(1 / m.size_ratio).toFixed(1)} раза тяжелее опорного`);
+      else facts.push("тот же вес");
+    }
+    if (m.resolution) facts.push(m.resolution + (m.megapixels ? ` (${m.megapixels} МП)` : ""));
+    else facts.push("разрешение не измерялось");
+    const gap = m.is_reference ? null : fmtGap(m.seconds_from_reference);
+    if (gap) facts.push(gap);
+    body.appendChild(el("div", "similar-member-facts", facts.join(" · ")));
+
+    if (m.labels.length) {
+      const row = el("div");
+      m.labels.forEach((label) => {
+        row.appendChild(
+          el("span", "member-label" + (label === "дальше порога" ? " far" : ""), label)
+        );
+      });
+      body.appendChild(row);
+    }
+
+    m.paths.forEach((p) => body.appendChild(el("div", "similar-member-path", p)));
+    li.appendChild(body);
+    list.appendChild(li);
+  });
+
+  $("similar-detail").scrollIntoView({ block: "nearest" });
+}
+
+function hideSimilarDetail() {
+  $("similar-detail").hidden = true;
+  similarState.detailId = null;
+}
+
+// Клавиатура на вкладке похожих — только перемещение и открытие. Q/K/U/1-9
+// сюда не попадают вовсе: не «ничего не делают», а не доходят, потому что
+// решения у этой вкладки нет (Р2). Если когда-нибудь появится действие над
+// группой похожих, оно начнётся с переписывания этого комментария и Р2, а
+// не с добавления ветки в switch.
+function handleSimilarKey(e) {
+  const g = initSimilarGrid();
+  const count = g.itemCount;
+  if (count === 0) return;
+  const idx = g.activeIndex;
+  const cols = g.columns || 1;
+
+  const moveTo = (newIdx) => {
+    g.setActive(Math.max(0, Math.min(count - 1, newIdx)));
+    openActiveSimilarDetail();
+  };
+
+  switch (e.key) {
+    case "ArrowDown": e.preventDefault(); moveTo(idx < 0 ? 0 : idx + cols); return;
+    case "ArrowUp": e.preventDefault(); moveTo(idx < 0 ? 0 : idx - cols); return;
+    case "ArrowRight": e.preventDefault(); moveTo(idx < 0 ? 0 : idx + 1); return;
+    case "ArrowLeft": e.preventDefault(); moveTo(idx < 0 ? 0 : idx - 1); return;
+    case "Enter":
+    case " ": e.preventDefault(); moveTo(idx < 0 ? 0 : idx); return;
+    default: return;
+  }
+}
+
+// `change`, а не `input`: кластеризация считается на сервере, и пересчитывать
+// её на каждый шаг перетаскивания ручки значило бы заказать девять расчётов
+// по дороге к одному нужному. Цифра рядом с ручкой при этом двигается сразу
+// (слушатель `input` ниже), так что ручка не кажется залипшей.
+$("similar-threshold").addEventListener("input", (e) => {
+  $("similar-threshold-value").textContent = e.target.value;
+});
+$("similar-threshold").addEventListener("change", (e) => {
+  loadSimilar(Number(e.target.value));
+});
+$("similar-filter").addEventListener("change", (e) => {
+  similarState.filter = e.target.value;
+  if (similarState.loaded) renderSimilar();
+});
+$("similar-detail-close").addEventListener("click", hideSimilarDetail);

@@ -107,6 +107,7 @@
       <button class="type-tab active" data-tab="plain" role="tab">Обычные файлы <span class="cnt">0</span></button>
       <button class="type-tab" data-tab="media" role="tab">⚠️ Медиа — ручная проверка <span class="cnt">0</span></button>
       <button class="type-tab" data-tab="archive" role="tab">📦 Архивы <span class="cnt">0</span></button>
+      <button class="type-tab" data-tab="similar" role="tab">≈ Похожие — только просмотр <span class="cnt">—</span></button>
     </div>
 
     <div class="grid-card">
@@ -121,6 +122,45 @@
           перечитываются и сверяются заново в момент нажатия, а не по данным скана.</p>
         <div id="archive-cards"></div>
         <p class="hint" id="archive-empty" hidden>Архивов в этом скане не было.</p>
+      </div>
+
+      <div id="similar-panel" class="similar-panel" hidden>
+        <p class="similar-banner">
+          <strong>Это список на просмотр, а не очередь на удаление.</strong>
+          Похожие снимки найдены по перцептивному отпечатку: он говорит «одна и та
+          же картинка», но не доказывает этого байтами. Поэтому у групп похожих нет
+          ни решения, ни кнопки «в карантин» — ни в одном режиме и ни при каком
+          пороге (Р0, Р2). Клавиши <kbd>Q</kbd>/<kbd>K</kbd>/<kbd>U</kbd> здесь не работают.
+        </p>
+
+        <div class="threshold-row">
+          <label for="similar-threshold">Порог похожести</label>
+          <input type="range" id="similar-threshold" min="0" max="16" step="2" value="6">
+          <output id="similar-threshold-value" class="threshold-value">6</output>
+          <span class="threshold-units">бит из 63</span>
+          <select id="similar-filter" class="similar-filter">
+            <option value="all">Все группы</option>
+            <option value="copies">Только копии</option>
+            <option value="scene">Только похожие сцены</option>
+          </select>
+        </div>
+        <p class="hint" id="similar-threshold-note"></p>
+        <p class="hint" id="similar-summary"></p>
+        <p class="hint similar-warn" id="similar-warnings" hidden></p>
+
+        <div class="grid-viewport similar-viewport" id="similar-viewport">
+          <div class="grid-sizer" id="similar-sizer"><div class="grid-pool" id="similar-pool"></div></div>
+        </div>
+        <p class="hint grid-empty" id="similar-empty" hidden></p>
+
+        <div class="card similar-detail" id="similar-detail" hidden>
+          <div class="detail-head">
+            <strong id="similar-detail-title"></strong>
+            <button id="similar-detail-close" class="btn-close" aria-label="Закрыть">✕</button>
+          </div>
+          <div id="similar-detail-why" class="similar-why"></div>
+          <ul id="similar-detail-members" class="similar-members"></ul>
+        </div>
       </div>
     </div>
 

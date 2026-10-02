@@ -338,3 +338,110 @@ kbd {
 .journal-entry.status-restored .journal-status-badge { background: color-mix(in srgb, currentColor 14%, transparent); color: var(--muted); }
 .journal-entry.status-failed .journal-status-badge { background: var(--danger); color: #fff; }
 .journal-entry.status-pending .journal-status-badge { background: var(--warn-soft); color: var(--warn); }
+
+/* --- похожие снимки (задача 14) ----------------------------------------
+   Отдельный визуальный язык, а не ещё один оттенок того же. Группа точных
+   дублей — утверждение, проверенное хэшем: сплошная рамка, бейдж «×N»,
+   решение в один клик. Группа похожих — предположение: пунктирная рамка,
+   бейдж «≈N», и ни одной кнопки действия во всей вкладке. Разница должна
+   читаться с расстояния, до чтения подписей, иначе человек, разобравший
+   восемь тысяч точных дублей на скорости, по инерции применит ту же
+   скорость к догадке. Палитра — та же четырёхцветная (задача 10): для
+   похожих берётся --warn, который во всём проекте значит «посмотри
+   глазами». --- */
+
+.similar-banner {
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
+  padding: 0.5rem 0.7rem;
+  margin: 0 0 0.7rem;
+  font-size: 0.85rem;
+  border-radius: 0 6px 6px 0;
+}
+
+.threshold-row {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  margin-bottom: 0.3rem;
+}
+.threshold-row label { margin: 0; white-space: nowrap; }
+.threshold-row input[type="range"] { flex: 1 1 180px; min-width: 140px; accent-color: var(--warn); }
+.threshold-value {
+  font-family: ui-monospace, Consolas, monospace;
+  font-weight: 700; font-size: 1rem; min-width: 1.6em; text-align: right;
+}
+.threshold-units { color: var(--muted); font-size: 0.8rem; }
+.similar-filter {
+  font-size: 0.82rem; padding: 0.3rem 0.4rem;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: inherit;
+}
+.similar-warn { color: var(--warn); }
+
+.similar-viewport { height: min(56vh, 560px); }
+
+/* Пунктирная рамка — главное отличие плитки похожих от плитки дубля. */
+.tile.similar-tile {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  height: 210px;
+}
+.tile.similar-tile:hover, .tile.similar-tile:focus-visible { border-color: var(--warn); }
+.tile.similar-tile.scene { box-shadow: inset 0 0 0 2px var(--warn-soft); }
+
+.tile-similar-badge {
+  position: absolute; left: 6px; top: 6px;
+  background: color-mix(in srgb, black 55%, transparent);
+  color: #fff; font-size: 0.68rem; font-weight: 600;
+  padding: 0.05rem 0.4rem; border-radius: 999px;
+}
+.tile-scene-ribbon {
+  position: absolute; right: 6px; top: 6px;
+  background: var(--warn); color: #fff;
+  font-size: 0.62rem; font-weight: 700; letter-spacing: 0.02em;
+  padding: 0.05rem 0.35rem; border-radius: 4px;
+}
+.tile-spread {
+  font-size: 0.7rem; color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.tile-labels {
+  font-size: 0.66rem; margin-top: 0.1rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted);
+}
+
+.similar-detail { margin-top: 0.7rem; border-left: 3px solid var(--warn); }
+.similar-why { font-size: 0.85rem; margin-bottom: 0.6rem; }
+.similar-why p { margin: 0 0 0.25rem; }
+.similar-why p:last-child { color: var(--muted); }
+
+.similar-members { list-style: none; margin: 0; padding: 0; }
+.similar-member {
+  display: flex; gap: 0.6rem; align-items: flex-start;
+  padding: 0.45rem 0; border-top: 1px solid var(--border-soft);
+}
+.similar-member:first-child { border-top: none; }
+.similar-member-thumb {
+  flex: 0 0 96px; width: 96px; height: 72px; border-radius: 6px;
+  background: var(--surface-sunken); overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.similar-member-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.similar-member-body { min-width: 0; flex: 1 1 auto; }
+.similar-member-dist {
+  font-family: ui-monospace, Consolas, monospace;
+  font-weight: 600; font-size: 0.82rem;
+}
+.similar-member-path {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.72rem; color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.similar-member-facts { font-size: 0.78rem; }
+.similar-member.reference .similar-member-dist { color: var(--warn); }
+.member-label {
+  display: inline-block; font-size: 0.68rem;
+  padding: 0.05rem 0.35rem; margin-right: 0.25rem;
+  border-radius: 4px; background: var(--surface-elev); color: var(--muted);
+}
+.member-label.far { background: var(--warn-soft); color: var(--warn); }
