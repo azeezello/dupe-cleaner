@@ -249,29 +249,49 @@ def _place_candidate(
     if not located:
         return None
 
-    labels: Counter[str] = Counter()
-    example: dict[str, Match] = {}
+    # Consensus is counted per **place**, not per `Match.label`, and the
+    # difference is not cosmetic. A town's reach is a few kilometres
+    # (Батуми, 152 839 people: 3.9 km), so a real trip there has photos
+    # inside it and photos the geocoder honestly returns as «Батуми
+    # (окрестности)». Keyed by the label, those two answers are different
+    # strings, and the city takes its own majority away: five photos in
+    # town and five along the coast gave 0.5 and 0.5, both under the
+    # threshold, and the event lost its place altogether. Found by the
+    # first test aimed at this function, not by reading it.
+    matches_by_place: dict[str, list[Match]] = {}
     for moment in located:
         match = gazetteer.lookup(moment.latitude, moment.longitude)
         if match is None:
             continue
-        labels[match.label] += 1
-        example.setdefault(match.label, match)
-    if not labels:
+        matches_by_place.setdefault(match.place.name, []).append(match)
+    if not matches_by_place:
         return None
 
-    label, count = labels.most_common(1)[0]
+    counted: Counter[str] = Counter(
+        {name: len(ms) for name, ms in matches_by_place.items()}
+    )
+    place_name, count = counted.most_common(1)[0]
     share = count / len(located)
     if share < policy.place_share:
         return None
 
-    match = example[label]
+    # The representative match carries the label and the distance shown to
+    # a person: the nearest photo that was actually inside the place when
+    # most of them were, and otherwise the nearest one of all — so
+    # «(окрестности)» is said exactly when the event really was outside.
+    found = matches_by_place[place_name]
+    inside = [m for m in found if m.inside]
+    pool = inside if len(inside) * 2 >= count else found
+    match = min(pool, key=lambda m: m.distance_m)
+    label = match.label
     solid = count >= policy.place_solid_photos
     population = f"{match.place.population:,}".replace(",", " ")
     detail = (
         f"{count} из {len(located)} снимков с координатами — {label} "
         f"({match.distance_m / 1000:.1f} км от центра, население {population})"
     )
+    if inside and len(inside) < count:
+        detail += f"; в черте города из них {len(inside)}"
     if not solid:
         detail += "; координаты есть у единиц — место правдоподобно, но не доказано"
     return NameCandidate(
