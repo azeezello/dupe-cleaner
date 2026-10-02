@@ -36,6 +36,12 @@ class ScanMode(str, Enum):
       UNREAD, so it can never grant permission to move one. That is
       enforced explicitly in `quarantine.quarantine_archives` rather than
       left to fall out of the mechanism.
+    - **No perceptual hashes, so no near-duplicate groups.** Р7 puts them
+      in "Полная обработка" explicitly. They cost one decode per
+      photograph over the whole library, not per duplicate group, because
+      two photos that merely *look* alike are by definition not
+      byte-identical and therefore never in a duplicate group at all
+      (similar.py).
     - **No previews and no quality metrics.** Both come out of one image
       decode per unique content hash — measured at roughly 4.5–9 minutes
       over the pilot's 6000 groups (задача 8; задача 9 added the metrics
@@ -68,6 +74,25 @@ class ScanMode(str, Enum):
         duplicated or not. They happen to agree today — Р7 puts both in
         "Полная обработка" — and the point of naming them separately is
         that a future mode can disagree without either becoming a lie.
+        """
+        return self is ScanMode.FULL
+
+    @property
+    def compute_phashes(self) -> bool:
+        """Whether perceptual hashes (task 13) are computed.
+
+        Its own property for the reason `classify_origin` is one, and with
+        the same shape of cost as `detect_faces`: one decode per
+        photograph over the whole library rather than per duplicate group.
+        Cheaper than faces (roughly 60-100 ms against 120, and no model
+        files, no OpenCV), dearer than the header read origin needs.
+
+        Named for what it switches on — the *hashes*. The grouping they
+        feed is a query run afterwards with a threshold in hand
+        (`similar.find_similar_groups`), not something a scan bakes into
+        its report; see similar.py for why the threshold must stay a
+        parameter, and why a similar-group must never travel on a
+        `ScanReport`.
         """
         return self is ScanMode.FULL
 

@@ -1,4 +1,4 @@
-"""Command-line entry point: `dupecleaner scan|events|quarantine|restore|serve|index`."""
+"""Command-line entry point: `dupecleaner scan|events|similar|quarantine|restore|serve|index`."""
 
 from __future__ import annotations
 
@@ -22,6 +22,14 @@ from .events import (
 from .jobs import ScanJob
 from .models import ArchiveClass, MediaKind, ScanMode, ScanReport
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
+from .similar import (
+    PHASH_ALGO,
+    PHASH_BITS,
+    SimilarThresholds,
+    distance_sensitivity,
+    entries_from_rows,
+    find_similar_groups,
+)
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
 MODE_LABEL = {ScanMode.QUICK: "быстрый", ScanMode.FULL: "полный"}
@@ -678,6 +686,136 @@ def _cmd_events(args: argparse.Namespace) -> int:
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(f"\nСобытия сохранены в {args.json}")
+def _cmd_similar(args: argparse.Namespace) -> int:
+    """Group a finished scan's photos by resemblance (task 13, Р2). Read-only.
+
+    Emphatically read-only, and not only because it happens not to write:
+    a similar-group carries no authority to move anything, in any mode and
+    at any threshold (Р0). This command cannot reach `quarantine` because
+    there is nothing to reach it with — it produces `SimilarGroup`s, and
+    every entry point into quarantine takes a `ScanReport` or a
+    `DuplicateGroup`. See similar.py.
+
+    Grouping is done here, at read time, rather than stored by the scan,
+    for the reason `events` is: the threshold is the thing a person is
+    expected to change, and a stored clustering would be a cached answer
+    to a question whose parameter is the point. The expensive half — one
+    decode per photograph — is what the index already keeps.
+    """
+    thresholds = SimilarThresholds(
+        max_distance=args.max_distance,
+        max_aspect_log_ratio=None if args.no_aspect_guard else args.aspect_tolerance,
+        max_bucket=args.max_bucket,
+    )
+
+    with ScanIndex(args.db) as index:
+        scan_id = args.scan_id or index.latest_scan_id()
+        if scan_id is None:
+            print(
+                "В индексе нет ни одного скана. Сначала: "
+                "dupecleaner scan --mode full <папки>",
+                file=sys.stderr,
+            )
+            return 1
+        stats = index.phash_stats(scan_id, PHASH_ALGO)
+        rows = index.phash_rows(scan_id, PHASH_ALGO)
+
+    entries = entries_from_rows(rows)
+    if not entries:
+        print(
+            "Ни у одного снимка нет перцептивного отпечатка. Эта фаза идёт "
+            "только в полном режиме: dupecleaner scan --mode full с тем же --db.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Скан: {scan_id}")
+    print("Пороги:")
+    for line in thresholds.describe():
+        print(f"  · {line}")
+    print(
+        f"\nСнимков: {stats['photos']}; с отпечатком {stats['with_phash']}, "
+        f"без структуры (пустой кадр) {stats['without_phash']}, "
+        f"не смотрели {stats['not_looked']}"
+    )
+    print(f"Уникальных содержимых с отпечатком: {len(entries)}")
+
+    clustering = find_similar_groups(
+        entries, thresholds, entries_without_hash=stats["without_phash"]
+    )
+    summary = clustering.summary
+    print(
+        f"\nГрупп похожих: {summary['groups']} "
+        f"(содержимых {summary['contents_in_groups']}, "
+        f"файлов {summary['files_in_groups']}, "
+        f"крупнейшая {summary['largest_group']}, "
+        f"наибольший разброс внутри группы {summary['max_spread']})"
+    )
+    print(
+        "  Разброс больше порога — это цепочка: A похож на B, B на C, "
+        "а A и C уже нет. Смотреть такие группы стоит первыми."
+    )
+    for warning in clustering.warnings:
+        print(f"  ! {warning}")
+
+    if args.sensitivity:
+        print("\nЧувствительность к порогу:")
+        distances = [int(d) for d in args.sensitivity.split(",")]
+        print(f"  {'порог':>5s} {'групп':>7s} {'содерж.':>8s} {'файлов':>7s} "
+              f"{'крупнейшая':>11s} {'разброс':>8s}")
+        for row in distance_sensitivity(entries, distances, base=thresholds):
+            mark = " ←" if row["max_distance"] == thresholds.max_distance else ""
+            print(
+                f"  {row['max_distance']:5d} {row['groups']:7d} "
+                f"{row['contents_in_groups']:8d} {row['files_in_groups']:7d} "
+                f"{row['largest_group']:11d} {row['max_spread']:8d}{mark}"
+            )
+        print(
+            f"  Расстояния всегда чётные: в отпечатке ровно 31 единица из "
+            f"{PHASH_BITS} бит, поэтому порог 7 — это тот же порог 6."
+        )
+
+    limit = args.limit
+    print(f"\nПервые {min(limit, len(clustering.groups))} групп:")
+    for group in clustering.groups[:limit]:
+        print(
+            f"  [{group.size:3d} содерж. / {group.file_count:3d} файлов] "
+            f"разброс {group.spread}"
+        )
+        for member in group.members[:4]:
+            print(f"      {member.paths[0]}")
+            for extra in member.paths[1:3]:
+                print(f"       = {extra}")
+        if group.size > 4:
+            print(f"      … и ещё {group.size - 4}")
+
+    print(
+        "\nЭто список на просмотр, а не список на перемещение: похожесть "
+        "не даёт права двигать файлы ни в каком режиме (Р0, Р2). "
+        "Решение по каждой группе — только человеком, экран — задача 14."
+    )
+
+    if args.json:
+        payload = {
+            "scan_id": scan_id,
+            "algo": PHASH_ALGO,
+            "thresholds": {
+                "max_distance": thresholds.max_distance,
+                "max_aspect_log_ratio": thresholds.max_aspect_log_ratio,
+                "max_bucket": thresholds.max_bucket,
+            },
+            "coverage": stats,
+            "summary": summary,
+            "warnings": clustering.warnings,
+            "groups": [g.to_dict() for g in clustering.groups],
+        }
+        Path(args.json).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"Группы сохранены в {args.json}")
+    return 0
+
+
 def _cmd_faces(args: argparse.Namespace) -> int:
     """Install and inspect the offline face models (task 18).
 
@@ -914,6 +1052,53 @@ def build_parser() -> argparse.ArgumentParser:
     events_p.add_argument("--limit", type=int, default=20, help="Сколько событий распечатать")
     events_p.add_argument("--json", default=None, help="Сохранить события в JSON")
     events_p.set_defaults(func=_cmd_events)
+
+    similar_p = subparsers.add_parser(
+        "similar",
+        help="Похожие снимки: перцептивные хэши (только отчёт, ничего не двигает)",
+    )
+    similar_p.add_argument("--db", default=str(DEFAULT_DB_PATH))
+    similar_p.add_argument(
+        "--scan-id", default=None, help="По умолчанию — последний скан в индексе"
+    )
+    similar_p.add_argument(
+        "--max-distance",
+        type=int,
+        default=SimilarThresholds.max_distance,
+        help="Расстояние Хэмминга, при котором снимки считаются похожими "
+        f"(0..{PHASH_BITS}). Измерения по порогам — в "
+        "claude/task-13-nearduplicate-report.md; значение по умолчанию "
+        "выбрано осторожным намеренно.",
+    )
+    similar_p.add_argument(
+        "--aspect-tolerance",
+        type=float,
+        default=SimilarThresholds.max_aspect_log_ratio,
+        help="Допустимая разница формы кадра, |ln(w/h ÷ w/h)|. 0.35 пропускает "
+        "кроп 16:9 из 4:3 и не даёт склеить портрет с пейзажем.",
+    )
+    similar_p.add_argument(
+        "--no-aspect-guard",
+        action="store_true",
+        help="Не учитывать форму кадра вовсе",
+    )
+    similar_p.add_argument(
+        "--max-bucket",
+        type=int,
+        default=SimilarThresholds.max_bucket,
+        help="Предел размера корзины индекса кандидатов; корзины крупнее "
+        "пропускаются, и об этом сообщается",
+    )
+    similar_p.add_argument(
+        "--sensitivity",
+        nargs="?",
+        const="0,2,4,6,8,10,12",
+        default=None,
+        help="Показать таблицу «порог → сколько групп» по этим порогам",
+    )
+    similar_p.add_argument("--limit", type=int, default=20, help="Сколько групп распечатать")
+    similar_p.add_argument("--json", default=None, help="Сохранить группы в JSON")
+    similar_p.set_defaults(func=_cmd_similar)
 
     index_p = subparsers.add_parser("index", help="Показать состояние индекса хэшей")
     index_p.add_argument(

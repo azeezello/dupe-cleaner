@@ -86,7 +86,7 @@ from typing import NamedTuple
 
 from PIL import Image, UnidentifiedImageError
 
-from . import quality
+from . import quality, similar
 from .storage import ScanIndex
 
 logger = logging.getLogger(__name__)
@@ -162,16 +162,27 @@ class Preview(NamedTuple):
 
     `data` is empty when the thumbnail was not asked for (`encode=False`,
     the metrics-backfill path below); `store` refuses such a Preview.
+
+    `phash` is the third thing this one decode produces (task 13). It
+    costs about 1.6 ms against the 54-90 ms decode that precedes it — 2% —
+    which is the whole argument for computing it here rather than in a
+    pass of its own. It is None only when the image would not decode far
+    enough to measure.
     """
 
     data: bytes
     width: int
     height: int
     metrics: quality.QualityMetrics | None
+    phash: similar.PerceptualHash | None = None
 
 
 def generate(
-    source_path: Path, *, encode: bool = True, file_bytes: int | None = None
+    source_path: Path,
+    *,
+    encode: bool = True,
+    file_bytes: int | None = None,
+    data: bytes | None = None,
 ) -> Preview:
     """Decode `source_path` once and produce a bounded JPEG thumbnail plus
     the quality metrics of task 9.
@@ -202,13 +213,22 @@ def generate(
     one HEIC's score slightly and can affect nothing else; a file whose
     size changed is re-hashed and re-recorded anyway (Р6).
 
+    `data` lets a caller that has already read the file hand the bytes over
+    instead of having them read a second time. `jobs.ScanJob._similar_phase`
+    does: it reads each photo to hash it (its rows are keyed by content
+    hash, and most of the library never reaches the hashing funnel at all),
+    and reading 60 GB twice to decode it once would be the whole cost of
+    that phase. Mirrors `faces.analyse_path(path, data=...)`, which exists
+    for the same reason.
+
     Raises `OSError`/`UnidentifiedImageError`/`ValueError` on anything
     Pillow can't open — callers treat that exactly like any other
     unreadable file (log and move on), never let it fail a scan.
     """
     if file_bytes is None:
-        file_bytes = Path(source_path).stat().st_size
-    with Image.open(source_path) as img:
+        file_bytes = len(data) if data is not None else Path(source_path).stat().st_size
+    source = io.BytesIO(data) if data is not None else source_path
+    with Image.open(source) as img:
         # Read before draft(): draft() rewrites img.size to the reduced
         # decode size, and the source's true resolution is one of the three
         # metrics. Free — this comes from the header, not the pixels.
@@ -239,8 +259,14 @@ def generate(
             quantization=quantization,
             file_bytes=file_bytes,
         )
-        data = _encode_bounded(img) if encode else b""
-        return Preview(data, img.width, img.height, metrics)
+        # Same reduced image the metrics were taken on, and deliberately
+        # so: both copies of a photograph arrive here through the same
+        # reduction, so the comparison is between pictures rather than
+        # between resolutions (see similar.py and
+        # quality.measure_sharpness, which makes the identical argument).
+        phash = similar.phash_image(img)
+        encoded = _encode_bounded(img) if encode else b""
+        return Preview(encoded, img.width, img.height, metrics, phash)
 
 
 def store(index: ScanIndex, content_hash: str, preview: Preview) -> None:
@@ -267,7 +293,29 @@ def store(index: ScanIndex, content_hash: str, preview: Preview) -> None:
         preview.height,
         metrics=preview.metrics,
     )
+    store_phash(index, content_hash, preview)
     _evict_if_needed(index, cache_dir)
+
+
+def store_phash(index: ScanIndex, content_hash: str, preview: Preview) -> None:
+    """Record the perceptual fingerprint this decode produced.
+
+    Its own call, and its own table, because the two have different
+    lifetimes: the thumbnail is a cache with a size cap and LRU eviction
+    (Р9), the fingerprint is not (see the v9 migration in storage.py). A
+    flat image — no low-frequency structure — writes a row with a NULL
+    hash rather than no row, so "decoded, nothing to fingerprint" stays
+    distinguishable from "never decoded".
+    """
+    if preview.phash is None:
+        return
+    index.set_phash(
+        content_hash,
+        preview.phash.hex,
+        preview.phash.structure,
+        preview.phash.aspect,
+        preview.phash.algo,
+    )
 
 
 def maybe_generate(
@@ -283,39 +331,51 @@ def maybe_generate(
     already has a preview waiting — the review grid never decodes on
     request.
 
-    Since task 9 it also fills in the quality metrics, from the same decode
-    (see `generate`). That makes the "already cached" test two questions
-    rather than one: an index written by task 8 holds thumbnails with no
-    metrics beside them, and the cheap check that used to mean "nothing to
-    do here" would have meant "those photos never get measured" — on Aziz's
-    own index, the only one that matters, that is every photo he has
-    already scanned. So a row that has a thumbnail but no metrics is
-    decoded again, once, and only the metrics are written.
+    Since task 9 it also fills in the quality metrics, and since task 13 the
+    perceptual fingerprint, all from the same decode (see `generate`). That
+    makes the "already cached" test three questions rather than one: an
+    index written by task 8 holds thumbnails with no metrics beside them
+    and none written before task 13 holds a fingerprint, and the cheap
+    check that used to mean "nothing to do here" would have meant "those
+    photos never get measured" — on Aziz's own index, the only one that
+    matters, that is every photo he has already scanned. So a row missing
+    any one of the three is decoded again, once, and only the missing
+    pieces are written.
 
     Best-effort: a broken/unreadable image never raises out of here — one
     bad photo must not stop the scan, matching how jobs.py already treats
     a hashing failure (turn it into a warning, keep going).
     """
     meta = index.get_thumbnail_meta(content_hash)
-    if meta is not None and meta["recompression_basis"] is not None:
+    has_thumbnail = meta is not None
+    has_metrics = meta is not None and meta["recompression_basis"] is not None
+    has_phash = index.has_phash(content_hash, similar.PHASH_ALGO)
+    if has_thumbnail and has_metrics and has_phash:
         # an earlier copy in this group (or an earlier scan) already cached
-        # both halves — the no-op that proves the content hash is a
+        # all three — the no-op that proves the content hash is a
         # sufficient key, see test_thumbnails.py
         return
 
     try:
-        preview = generate(source_path, encode=meta is None, file_bytes=file_bytes)
+        preview = generate(
+            source_path, encode=not has_thumbnail, file_bytes=file_bytes
+        )
     except (OSError, UnidentifiedImageError, ValueError) as exc:
         logger.debug("Не удалось построить миниатюру для %s: %s", source_path, exc)
         return
 
-    if meta is None:
-        store(index, content_hash, preview)
-    elif preview.metrics is not None:
-        # Thumbnail bytes are already on disk and unchanged (same content
-        # hash, therefore the same image) — rewriting them would be pure
-        # churn, and would reset accessed_at for no reason.
+    if not has_thumbnail:
+        store(index, content_hash, preview)  # thumbnail + metrics + phash
+        return
+
+    # Thumbnail bytes are already on disk and unchanged (same content
+    # hash, therefore the same image) — rewriting them would be pure
+    # churn, and would reset accessed_at for no reason. Only the pieces
+    # that are actually missing get written.
+    if not has_metrics and preview.metrics is not None:
         index.set_quality_metrics(content_hash, preview.metrics)
+    if not has_phash:
+        store_phash(index, content_hash, preview)
 
 
 def get_cached_path(index: ScanIndex, content_hash: str) -> Path | None:

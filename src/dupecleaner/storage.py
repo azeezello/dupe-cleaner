@@ -38,14 +38,21 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
     # --stats`, a quarantine run reading a saved report — for a type name.
     from .quality import QualityMetrics
 
-# Highest migration this build knows about. Note the gap at 5: that
+# Highest migration this build knows about. Note the gaps: 5 belongs to
+# task 12's `review_decisions` and 8 to task 19's face clusters, both
+# written on branches running beside this one. Task 13 took **9** rather
+# than the next free-looking number for the reason the note below spells
+# out, and the set-based bookkeeping in `__init__` is what makes a gap a
+# fact the index records instead of a hole it silently skips.
+#
+# Note the gap at 5: that
 # number belongs to task 12's `review_decisions`, which landed on `main`
 # in a session running in parallel with this one. Two branches cannot
 # both own "the next number", so this one took 6 and left 5 alone rather
 # than colliding in the middle of a merge — and the bookkeeping in
 # `__init__` below was changed at the same time so that a gap is a fact
 # the index can record instead of a hole it silently skips.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -284,6 +291,47 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         score        REAL NOT NULL,
         embedding    BLOB NOT NULL,
         PRIMARY KEY (content_hash, face_index)
+    );
+    """,
+    # Task 13: perceptual hashes. Keyed by content_hash for the third time
+    # in this file and for the third time with the same argument (Р9, Р11):
+    # what a photograph *looks like* is a property of its pixels, so the
+    # four copies of it filed in four folders share one answer and one
+    # decode. Origin verdicts (v4) went into `files` instead precisely
+    # because half of their evidence is the folder — none of a perceptual
+    # hash's is.
+    #
+    # A table of its own rather than two more columns on
+    # `content_previews`, which is the tempting shortcut since both are
+    # written by the same decode. `content_previews` is a **cache**: it is
+    # capped at 512 MB and evicted LRU (Р9), so its rows are expected to
+    # disappear. A perceptual hash is not cache — losing it means decoding
+    # the photograph again, which is the one expensive thing here — and
+    # attaching it to a row designed to be thrown away would mean a
+    # library that quietly forgets what it looks like whenever the
+    # thumbnail cache fills up.
+    #
+    # `phash` is NULLable on purpose, and the row's *existence* is the
+    # record that the photo was looked at. An image with no low-frequency
+    # structure (a frame shot in the dark, a blank scan — 30 of them on
+    # `D:\Photos`) gets no fingerprint, because a fingerprint of noise
+    # clusters with other noise for no reason. Without the row, every
+    # rescan would decode those again to rediscover the same nothing, and
+    # "not fingerprintable" would be indistinguishable from "not looked
+    # at" — pilot finding A1, one layer further down, exactly as
+    # `content_face_scans` says.
+    #
+    # `algo` is stored rather than assumed. Hashes made by two different
+    # definitions of "the hash" are not comparable, and a silent mix of
+    # them would surface as near-duplicate groups that are not.
+    9: """
+    CREATE TABLE IF NOT EXISTS content_phashes (
+        content_hash TEXT PRIMARY KEY,
+        phash        TEXT,             -- NULL = looked at, no usable hash
+        structure    REAL NOT NULL,    -- mean |coeff - median|, grey levels
+        aspect       REAL NOT NULL,    -- source width / height
+        algo         TEXT NOT NULL,
+        created_at   REAL NOT NULL
     );
     """,
 }
@@ -876,6 +924,174 @@ class ScanIndex:
             "SELECT COALESCE(SUM(LENGTH(embedding)), 0) AS n FROM content_faces"
         ).fetchone()
         return int(row["n"])
+
+    # --- perceptual hashes (see similar.py) --------------------------------
+    # Keyed by content hash like previews and faces: what a photograph
+    # looks like is a property of its pixels. See the v9 migration for why
+    # this is its own table and not two columns on the preview cache.
+
+    def has_phash(self, content_hash: str, algo: str | None = None) -> bool:
+        """Whether this content has been fingerprinted already.
+
+        A row with `phash IS NULL` still counts: it means the photo was
+        decoded and found to have no usable structure, which is an answer.
+        """
+        if algo is None:
+            row = self._conn.execute(
+                "SELECT 1 FROM content_phashes WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM content_phashes WHERE content_hash = ? AND algo = ?",
+                (content_hash, algo),
+            ).fetchone()
+        return row is not None
+
+    def set_phash(
+        self,
+        content_hash: str,
+        phash: str | None,
+        structure: float,
+        aspect: float,
+        algo: str,
+    ) -> None:
+        """Record one photograph's perceptual fingerprint, or its absence.
+
+        Plain values rather than a `similar.PerceptualHash`, so this module
+        stays importable without Pillow — the same reason `set_faces` takes
+        tuples instead of `faces.DetectedFace` (see the TYPE_CHECKING
+        import at the top).
+        """
+        self._conn.execute(
+            """
+            INSERT INTO content_phashes (
+                content_hash, phash, structure, aspect, algo, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                phash      = excluded.phash,
+                structure  = excluded.structure,
+                aspect     = excluded.aspect,
+                algo       = excluded.algo,
+                created_at = excluded.created_at
+            """,
+            (content_hash, phash, structure, aspect, algo, time.time()),
+        )
+
+    def needs_phash(self, scan_id: str, algo: str) -> list[FileRecord]:
+        """Photos in this scan with no perceptual fingerprint behind them.
+
+        Over the whole library, not over the duplicate groups, and here
+        that is not a preference but the definition of the job: two photos
+        that are *similar* are by construction **not** byte-identical, so
+        they are not in a duplicate group, so a near-duplicate pass
+        restricted to duplicate groups would be searching the one place
+        its answers cannot be. Same reach as `needs_faces` and
+        `needs_origin`, different reason from both.
+
+        A photo with no usable `full_hash` is included for the same reason
+        `needs_faces` includes it: the phase reads the whole file anyway
+        (the decoder does), so hashing those bytes on the way past is
+        nearly free, and it is what lets the next scan skip the photo
+        (Р6). Plain files only — decoding pixels out of an archive member
+        is finding A2 again, and Р1 treats archive contents as cold
+        storage.
+
+        `algo` is a parameter rather than a constant so this module need
+        not import `similar` (and through it Pillow) to know the name of
+        the current definition: a row stamped with another one is work to
+        redo, not work already done.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT f.* FROM files f
+            LEFT JOIN content_phashes p
+                   ON p.content_hash = f.full_hash AND p.algo = ?
+             WHERE f.last_scan_id = ?
+               AND f.is_archive_member = 0
+               AND f.media_kind = 'photo'
+               AND (
+                    f.full_hash IS NULL
+                 OR NOT (f.hashed_source_size = f.source_size
+                         AND f.hashed_source_mtime = f.source_mtime)
+                 OR p.content_hash IS NULL
+               )
+             ORDER BY f.display_path
+            """,
+            (algo, scan_id),
+        )
+        return [_row_to_record(row) for row in cursor]
+
+    def phash_rows(self, scan_id: str, algo: str) -> list[tuple]:
+        """Every fingerprinted photo this scan saw, as raw tuples:
+
+            (content_hash, phash, aspect, size, [display_path, ...])
+
+        Raw tuples rather than `similar.PhashEntry` for the layering reason
+        `moments()` returns tuples rather than `events.PhotoMoment`: this
+        module must not import the one that needs Pillow. The conversion
+        lives in `similar.entries_from_rows`.
+
+        One row per unique content with all of its paths attached, because
+        that is what the grouping works on: four filed copies of one
+        photograph are one fingerprint, and showing the reviewer the group
+        means showing all four paths.
+
+        Rows whose `phash` is NULL — decoded, no usable structure — are
+        **not** returned; `phash_stats` counts them instead. They are not
+        missing data, and they are not groupable either.
+        """
+        cursor = self._conn.execute(
+            f"""
+            SELECT f.full_hash AS ch, f.display_path, f.size,
+                   p.phash, p.aspect
+              FROM files f
+              JOIN content_phashes p
+                   ON p.content_hash = f.full_hash AND p.algo = ?
+             WHERE f.last_scan_id = ?
+               AND f.is_archive_member = 0
+               AND f.media_kind = 'photo'
+               AND f.full_hash IS NOT NULL AND {_HASH_IS_FRESH}
+               AND p.phash IS NOT NULL
+             ORDER BY f.full_hash, f.display_path
+            """,
+            (algo, scan_id),
+        )
+        by_hash: dict[str, list] = {}
+        for row in cursor:
+            entry = by_hash.get(row["ch"])
+            if entry is None:
+                by_hash[row["ch"]] = [row["ch"], row["phash"], row["aspect"],
+                                      row["size"], [row["display_path"]]]
+            else:
+                entry[4].append(row["display_path"])
+        return [tuple(v) for v in by_hash.values()]
+
+    def phash_stats(self, scan_id: str, algo: str) -> dict:
+        """Coverage, so a person can see how much of the library actually
+        carries a fingerprint before reading anything into the groups."""
+        row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS photos,
+                   SUM(CASE WHEN p.content_hash IS NOT NULL THEN 1 ELSE 0 END) AS looked,
+                   SUM(CASE WHEN p.phash IS NOT NULL THEN 1 ELSE 0 END) AS hashed
+              FROM files f
+              LEFT JOIN content_phashes p
+                     ON p.content_hash = f.full_hash AND p.algo = ?
+             WHERE f.last_scan_id = ? AND f.is_archive_member = 0
+               AND f.media_kind = 'photo'
+            """,
+            (algo, scan_id),
+        ).fetchone()
+        photos = int(row["photos"] or 0)
+        looked = int(row["looked"] or 0)
+        hashed = int(row["hashed"] or 0)
+        return {
+            "photos": photos,
+            "with_phash": hashed,
+            "without_phash": looked - hashed,   # decoded, no structure
+            "not_looked": photos - looked,
+        }
 
     # --- capture moments (see events.py) -----------------------------------
 
