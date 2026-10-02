@@ -30,6 +30,7 @@ from . import events as events_module
 from . import faces as faces_module
 from . import hashing
 from . import origin as origin_module
+from . import similar as similar_module
 from . import thumbnails
 from .dedupe import group_by_archive, hash_archive_members, run_full_stage, run_quick_stage
 from .events import MomentPolicy
@@ -198,6 +199,7 @@ class ScanJob:
 
             self._preview_phase(index, groups)
             self._header_phase(index)
+            self._similar_phase(index)
             self._faces_phase(index)
 
             files_total, _ = index.scan_totals(self.scan_id)
@@ -467,6 +469,85 @@ class ScanJob:
                 moment.longitude,
                 moment.geo_source.value,
             )
+            self.progress.advance(files=1, count_as_hashed=False)
+            processed_since_commit += 1
+
+            if processed_since_commit >= COMMIT_EVERY_FILES or (
+                time.time() - last_commit
+            ) > COMMIT_EVERY_SECONDS:
+                index.commit()
+                processed_since_commit = 0
+                last_commit = time.time()
+
+        index.commit()
+
+    def _similar_phase(self, index: ScanIndex) -> None:
+        r"""Give every photograph in the library a perceptual fingerprint
+        (task 13, Р2/Р7).
+
+        Over the whole library rather than over the duplicate groups, and
+        unlike `_preview_phase` this is not a matter of taste: two
+        photographs that merely *look* alike are not byte-identical, so
+        they are not in a duplicate group, so a near-duplicate pass that
+        only visited duplicate groups would be searching the one place its
+        answers cannot be. `_preview_phase` has already fingerprinted the
+        group members on its way past — one decode, three products
+        (`thumbnails.generate`) — so what is left here is the rest, which
+        is most of it.
+
+        Like the faces phase this hashes as it goes, and for the same
+        reason: rows are keyed by content hash, and a photo whose size is
+        unique on disk never enters the funnel and so has no `full_hash`
+        to key anything by. The file is read in full regardless — a JPEG
+        decoder reads the entire entropy-coded stream even to produce a
+        quarter-scale image — so xxh3 over bytes already in hand is lost in
+        the noise beside the decode, and writing it back through
+        `set_full_hash` is what makes the *second* scan cheap (Р6). It
+        cannot invent duplicate groups: two files can only be
+        byte-identical if their sizes match, and every same-size pair has
+        already been through the funnel by the time this runs.
+
+        No thumbnail is written here. The 512 MB preview cache (Р9) is
+        sized for the photos a person will actually open — the duplicate
+        groups — and filling it with one entry per photograph in the
+        library would evict exactly those. `generate(encode=False)`
+        decodes without encoding, which is the whole difference.
+
+        Best-effort per photo, as everywhere else: one file that will not
+        decode becomes one warning and the scan carries on.
+        """
+        if not self.mode.compute_phashes:
+            return
+
+        targets = index.needs_phash(self.scan_id, similar_module.PHASH_ALGO)
+        if not targets:
+            return
+
+        self.progress.enter_phase("perceptual_hashing", files_total=len(targets))
+        last_commit = time.time()
+        processed_since_commit = 0
+
+        for record in targets:
+            self._check_cancelled()
+            self.progress.advance(current_path=record.display_path)
+            try:
+                data = Path(record.real_path).read_bytes()
+                content_hash = hashing.full_hash(io.BytesIO(data))
+                # Two filed copies of one photograph: the first through
+                # pays for the decode, the rest only for the read that
+                # proved they are the same photograph.
+                if not index.has_phash(content_hash, similar_module.PHASH_ALGO):
+                    preview = thumbnails.generate(
+                        Path(record.real_path), encode=False, data=data
+                    )
+                    thumbnails.store_phash(index, content_hash, preview)
+                index.set_full_hash(record.display_path, content_hash)
+            except Exception as exc:  # noqa: BLE001 - one photo must not stop a scan
+                self._warn(
+                    f"Не удалось посчитать перцептивный хэш для "
+                    f"{record.display_path}: {exc}"
+                )
+
             self.progress.advance(files=1, count_as_hashed=False)
             processed_since_commit += 1
 

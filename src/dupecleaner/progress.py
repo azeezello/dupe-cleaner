@@ -36,6 +36,7 @@ PHASE_LABELS = {
     "reading_headers": "Метаданные: происхождение, время, место",
     # Kept so a progress payload saved by an older run still renders.
     "classifying_origin": "Происхождение снимков",
+    "perceptual_hashing": "Отпечатки похожих снимков",
     "detecting_faces": "Лица на снимках",
     "done": "Готово",
     "cancelled": "Остановлено",
