@@ -306,6 +306,15 @@ def store_phash(index: ScanIndex, content_hash: str, preview: Preview) -> None:
     flat image — no low-frequency structure — writes a row with a NULL
     hash rather than no row, so "decoded, nothing to fingerprint" stays
     distinguishable from "never decoded".
+
+    The quality metrics of задача 9 ride along (v12, задача 17). They came
+    out of this same decode and were, until now, discarded on this path:
+    `_similar_phase` is the only pass that visits the *whole* library, and
+    the one table metrics lived in is a capped LRU cache (Р9) that must not
+    hold a row per library photo. Writing them beside the fingerprint costs
+    six columns and no decoding at all, and it is what lets задача 17 rank
+    copies in the groups задача 14 could only label "разрешение не
+    измерялось".
     """
     if preview.phash is None:
         return
@@ -315,6 +324,7 @@ def store_phash(index: ScanIndex, content_hash: str, preview: Preview) -> None:
         preview.phash.structure,
         preview.phash.aspect,
         preview.phash.algo,
+        metrics=preview.metrics,
     )
 
 

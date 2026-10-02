@@ -359,3 +359,133 @@ def test_every_notch_produces_a_usable_payload(threshold: int):
     for shown in review["groups"]:
         assert shown["kind"] in (KIND_COPIES, KIND_SCENE)
         assert sum(1 for m in shown["members"] if m["is_reference"]) == 1
+
+
+# --- задача 17: лучшая копия внутри группы --------------------------------
+#
+# Деление на «копии» и «похожую сцену» задача 17 берёт готовым и своего не
+# вводит: в клике лучшая копия — осмысленный ответ, в цепочке кадры разные,
+# и там тот же блок подписан как сравнение технического качества. Опорный
+# снимок задачи 14 (самый тяжёлый файл) при этом остаётся точкой отсчёта
+# для расстояний и лучшей копией не становится — это два разных понятия, и
+# они обязаны уметь разойтись.
+
+
+def _quality(width, height, *, sharp=50.0, recomp=0.1, jq=92, basis="jpeg_quant_tables"):
+    return {
+        "source_width": width,
+        "source_height": height,
+        "megapixels": round(width * height / 1_000_000, 2),
+        "sharpness": sharp,
+        "recompression": recomp,
+        "recompression_basis": basis,
+        "jpeg_quality": jq,
+    }
+
+
+def test_a_copy_group_gets_a_best_copy_with_a_reason_in_metric_terms():
+    clustering = cluster([entry("big", bits_of(*range(31))),
+                          entry("small", bits_of(*range(2, 33)))])
+    quality = {
+        "big": _quality(4000, 3000),
+        "small": _quality(1000, 750),
+    }
+    payload = build_review(clustering, quality=quality)
+    group = payload["groups"][0]
+    assert group["kind"] == KIND_COPIES
+    block = group["best_copy"]
+    assert block["is_choice"] is True
+    assert block["best"] == "big"
+    assert "выше разрешение" in block["reason"]
+    # И каждая копия знает своё место, чтобы панель деталей не считала
+    # порядок второй раз и не разошлась с ним.
+    ranks = {m["content_hash"]: m["quality_rank"] for m in group["members"]}
+    assert ranks == {"big": 1, "small": 2}
+    assert [m["is_best_copy"] for m in group["members"] if m["content_hash"] == "big"] == [True]
+
+
+def test_the_best_copy_and_the_reference_are_allowed_to_differ():
+    """Опорный — самый тяжёлый файл; лучшая копия — та, в которой больше
+    картинки. Лёгкий файл с вдвое большим разрешением разводит их, и это
+    не ошибка, а причина, по которой задача 17 вообще существует."""
+    clustering = cluster([
+        entry("heavy_small", bits_of(*range(31)), size=9_000_000),
+        entry("light_big", bits_of(*range(2, 33)), size=1_000_000),
+    ])
+    quality = {
+        "heavy_small": _quality(1000, 750),
+        "light_big": _quality(4000, 3000),
+    }
+    group = build_review(clustering, quality=quality)["groups"][0]
+    reference = [m for m in group["members"] if m["is_reference"]][0]
+    assert reference["content_hash"] == "heavy_small"
+    assert group["best_copy"]["best"] == "light_big"
+
+
+def test_a_scene_group_says_this_is_not_a_choice_between_copies():
+    # Цепочка: A∼B, B∼C, A и C дальше порога — ровно то, что задача 14
+    # называет похожей сценой.
+    a = bits_of(*range(31))
+    b = bits_of(*range(4, 35))
+    c = bits_of(*range(8, 39))
+    clustering = cluster([entry("a", a), entry("b", b), entry("c", c)], max_distance=8)
+    group = build_review(
+        clustering,
+        quality={"a": _quality(4000, 3000), "b": _quality(1000, 750), "c": _quality(900, 600)},
+    )["groups"][0]
+    assert group["kind"] == KIND_SCENE
+    assert group["best_copy"]["is_choice"] is False
+    assert "не выбор копии" in group["best_copy"]["headline"]
+
+
+def test_without_metrics_the_screen_says_so_instead_of_ranking():
+    """Основное состояние индекса, собранного до миграции 12. Экран обязан
+    сказать «сравнить не на чем», а не разложить копии по весу, выдав это
+    за качество."""
+    clustering = cluster([entry("a", bits_of(*range(31))),
+                          entry("b", bits_of(*range(2, 33)))])
+    group = build_review(clustering)["groups"][0]
+    assert group["best_copy"]["best"] is None
+    assert group["best_copy"]["measured"] == 0
+    assert all(m["quality_rank"] is None for m in group["members"])
+
+
+def test_the_summary_counts_groups_that_could_and_could_not_be_ranked():
+    ranked = [entry("big", bits_of(*range(31))), entry("small", bits_of(*range(2, 33)))]
+    blind = [entry("x", bits_of(*range(40, 63), 0, 1, 2, 3, 4, 5, 6, 7)),
+             entry("y", bits_of(*range(40, 63), 0, 1, 2, 3, 4, 5, 6, 9))]
+    clustering = cluster(ranked + blind)
+    payload = build_review(
+        clustering,
+        quality={"big": _quality(4000, 3000), "small": _quality(1000, 750)},
+    )
+    assert payload["summary"]["ranked_groups"] == 1
+    assert payload["summary"]["contested_groups"] == 0
+
+
+def test_contested_groups_are_counted_so_the_number_is_visible():
+    clustering = cluster([entry("up", bits_of(*range(31))),
+                          entry("orig", bits_of(*range(2, 33)))])
+    payload = build_review(
+        clustering,
+        quality={
+            "up": _quality(6000, 4500, sharp=30.0, recomp=0.1, jq=92),
+            "orig": _quality(3000, 2250, sharp=150.0, recomp=0.1, jq=92),
+        },
+    )
+    assert payload["summary"]["contested_groups"] == 1
+    assert payload["groups"][0]["best_copy"]["contested"][0]["better_in"] == ["резкости"]
+
+
+def test_the_three_metrics_travel_with_each_member_so_the_phrase_is_checkable():
+    clustering = cluster([entry("a", bits_of(*range(31))),
+                          entry("b", bits_of(*range(2, 33)))])
+    group = build_review(
+        clustering, quality={"a": _quality(4000, 3000), "b": _quality(1000, 750)}
+    )["groups"][0]
+    member = [m for m in group["members"] if m["content_hash"] == "a"][0]
+    assert member["sharpness"] == 50.0
+    assert member["jpeg_quality"] == 92
+    # Оценка сжатия без основания — приглашение сравнить несравнимое (Р2),
+    # поэтому они едут парой.
+    assert member["recompression_basis"] == "jpeg_quant_tables"

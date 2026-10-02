@@ -39,6 +39,7 @@ from .persons import (
     person_display_name,
 )
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
+from .best_copy import rank_copies
 from .similar import (
     PHASH_ALGO,
     PHASH_BITS,
@@ -47,6 +48,7 @@ from .similar import (
     entries_from_rows,
     find_similar_groups,
 )
+from .similar_review import KIND_COPIES, group_kind
 from .storage import DEFAULT_DB_PATH, ScanIndex
 
 MODE_LABEL = {ScanMode.QUICK: "быстрый", ScanMode.FULL: "полный"}
@@ -736,6 +738,12 @@ def _cmd_similar(args: argparse.Namespace) -> int:
             return 1
         stats = index.phash_stats(scan_id, PHASH_ALGO)
         rows = index.phash_rows(scan_id, PHASH_ALGO)
+        # Метрики качества (задача 9) для ранжирования копий внутри группы
+        # (задача 17). Одним запросом по всем отпечаткам, а не по группам:
+        # группы ещё не собраны. С миграции 12 они лежат рядом с самим
+        # отпечатком, поэтому есть не только у снимков из групп точных
+        # дублей.
+        quality = index.quality_for_hashes(row[0] for row in rows)
 
     entries = entries_from_rows(rows)
     if not entries:
@@ -799,8 +807,36 @@ def _cmd_similar(args: argparse.Namespace) -> int:
             f"  [{group.size:3d} содерж. / {group.file_count:3d} файлов] "
             f"разброс {group.spread}"
         )
+        # Задача 17: лучшая копия и причина — теми же словами, что на
+        # экране, и из того же модуля. Два вывода одного правила, которые
+        # могли бы разойтись в формулировках, — это находка P1.5 в
+        # миниатюре.
+        kind = group_kind(group, thresholds.max_distance)
+        block = rank_copies(
+            [{"content_hash": m.content_hash, "size": m.size} for m in group.members],
+            quality,
+            is_copy_group=kind == KIND_COPIES,
+        )
+        best_paths = {m.content_hash: m.paths[0] for m in group.members}
+        if block["best"] is not None:
+            label = "лучшая копия" if block["is_choice"] else "лучшая по качеству кадра"
+            print(f"      {label}: {best_paths[block['best']]}")
+            print(f"        ({block['reason']})")
+        elif block["unmeasured"]:
+            print(
+                f"      качество не сравнить: метрик нет у "
+                f"{block['unmeasured']} из {group.size} копий"
+            )
+        # Оговорки печатаются здесь, а не только на экране. Живой прогон
+        # поймал ровно это: группа, где увеличенная копия обошла оригинал
+        # по разрешению, в веб-интерфейсе была помечена «признаки спорят»,
+        # а в CLI выглядела уверенным ответом. Два вывода одного правила,
+        # говорящие разное, — это находка P1.5 в миниатюре.
+        for note in block["notes"]:
+            print(f"        ! {note}")
         for member in group.members[:4]:
-            print(f"      {member.paths[0]}")
+            mark = " ★" if member.content_hash == block["best"] else "  "
+            print(f"     {mark} {member.paths[0]}")
             for extra in member.paths[1:3]:
                 print(f"       = {extra}")
         if group.size > 4:

@@ -237,3 +237,57 @@ def test_similar_survives_a_lost_report_object(client: TestClient, photo_tree: P
 
     payload = _similar(client, scan_id)
     assert len(payload["groups"]) == 1
+
+
+# --- задача 17: лучшая копия доезжает до ручки -----------------------------
+
+
+def test_the_handle_ranks_the_copies_on_a_real_full_scan(
+    client: TestClient, photo_tree: Path
+):
+    """Сквозная проверка того, что добавила задача 17: метрики, посчитанные
+    фазой перцептивных хэшей на настоящих файлах, доезжают до ранжирования
+    через индекс. До миграции 12 оба снимка этой группы были бы «разрешение
+    не измерялось» — ни один из них не попадает в группу точных дублей,
+    поэтому строки превью у них нет и быть не может (кэш Р9 рассчитан на
+    группы дублей)."""
+    group = _similar(client, _scan(client, photo_tree))["groups"][0]
+
+    block = group["best_copy"]
+    assert block["measured"] == 2 and block["unmeasured"] == 0
+    assert block["is_choice"] is True
+
+    best = next(m for m in group["members"] if m["content_hash"] == block["best"])
+    assert Path(best["paths"][0]).name == "original.jpg"
+    # 1200x900 против 600x450 — первая ступень лестницы, и фраза обязана
+    # называть именно её.
+    assert "выше разрешение" in block["reason"]
+    assert block["confident"] is True
+    assert best["resolution"] == "1200×900"
+    # И числа, по которым это посчитано, лежат рядом с каждой копией.
+    assert best["jpeg_quality"] is not None and best["sharpness"] is not None
+
+
+def test_a_quick_scan_has_no_ranking_rather_than_an_empty_one(
+    client: TestClient, photo_tree: Path
+):
+    """Р7: перцептивные хэши — часть полной обработки, а значит и метрики
+    рядом с ними. Вкладка обязана сказать «не искали», а не показать
+    группы без порядка."""
+    payload = _similar(client, _scan(client, photo_tree, mode="quick"))
+    assert payload["phash_available"] is False
+    assert payload["groups"] == []
+
+
+def test_ranking_adds_no_way_to_move_anything(client: TestClient, photo_tree: Path):
+    """То же, чем задача 14 держит Р0/Р2, но после задачи 17: подсказка о
+    лучшей копии не привезла с собой ни одного объекта, который
+    `quarantine.py` умеет принять."""
+    payload = _similar(client, _scan(client, photo_tree))
+    blob = json.dumps(payload, ensure_ascii=False)
+    for forbidden in ("keeper", "wasted", "освободится", "applied_at", "decision"):
+        assert forbidden not in blob, forbidden
+    # И ни одной ручки действия над похожими не появилось.
+    assert client.post(
+        f"/api/scan/{payload['scan_id']}/similar", json={}
+    ).status_code in (404, 405)

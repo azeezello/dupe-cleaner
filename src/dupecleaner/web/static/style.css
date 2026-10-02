@@ -445,3 +445,31 @@ kbd {
   border-radius: 4px; background: var(--surface-elev); color: var(--muted);
 }
 .member-label.far { background: var(--warn-soft); color: var(--warn); }
+
+/* Задача 17: лучшая копия по качеству. Цвет — из решённой четырёхцветной
+   палитры (задача 10), без новых оттенков: --ok там, где выбор однозначен,
+   --warn там, где признаки спорят (тот же цвет, которым во всём проекте
+   помечено «посмотри глазами»), --muted там, где сравнивать не на чем.
+   Кнопок в этом блоке нет и быть не может: у вкладки похожих действия нет
+   ни одного (Р0, Р2). */
+.similar-best {
+  border-left: 3px solid var(--ok);
+  background: var(--surface-sunken);
+  padding: 0.45rem 0.6rem;
+  margin-bottom: 0.6rem;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.85rem;
+}
+.similar-best.contested { border-left-color: var(--warn); background: var(--warn-soft); }
+.similar-best.scene { border-left-color: var(--muted); }
+.similar-best-head { font-weight: 600; }
+.similar-best-reason { margin-top: 0.15rem; }
+.similar-best-note { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.8rem; }
+
+.similar-member-rank { font-size: 0.78rem; color: var(--muted); }
+.similar-member-rank.best { color: var(--ok); font-weight: 600; }
+.similar-member-quality { font-size: 0.76rem; color: var(--muted); font-family: ui-monospace, monospace; }
+
+.tile-best { font-size: 0.7rem; }
+.tile-best.muted { color: var(--muted); }
+.tile-best.warn { color: var(--warn); }

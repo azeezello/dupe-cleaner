@@ -20,12 +20,21 @@ r"""Похожие снимки для экрана просмотра: тип �
 
 Чего здесь нет, и это проверяется тестом
 -----------------------------------------
-Ни `keeper`, ни «лучшая копия», ни «освободится N байт». Группа похожих —
-список на просмотр (Р0, ось B; Р2), и единственный честный способ это
-удержать — не производить объект, который можно было бы передать в
-карантин. Поэтому модуль импортирует только `similar` — ни `models`, ни
-`quarantine` — и возвращает словари, а не `DuplicateGroup`. `tests/test_similar_review.py` держит это, включая
-проверку, что в выдаче нет ни одного ключа со словом keeper.
+Ни хранителя группы по Р8, ни «освободится N байт», ни отметки о
+применении. Группа похожих — список на просмотр (Р0, ось B; Р2), и
+единственный честный способ это удержать — не производить объект, который
+можно было бы передать в карантин. Поэтому модуль импортирует только
+`similar` и `best_copy` — ни `models`, ни `quarantine` — и возвращает
+словари, а не `DuplicateGroup`. `tests/test_similar_review.py` держит это,
+включая проверку, что в выдаче нет ни одного ключа со словом keeper.
+
+Задача 17 добавила сюда блок `best_copy` — и это ровно то, что Р2
+качеству разрешает: ранжирование **внутри** группы, подсказка без права
+на действие. Разница с Р8 не в тоне, а в предмете: Р8 отвечает, какая из
+байт-в-байт равных копий остаётся на диске, и за этим ответом стоит
+перемещение файла; `best_copy` отвечает, в какой из разных по качеству
+копий больше картинки, и за этим ответом не стоит ничего, кроме
+собственных глаз человека.
 
 Опорный снимок — это точка отсчёта, а не рекомендация
 ------------------------------------------------------
@@ -41,17 +50,27 @@ r"""Похожие снимки для экрана просмотра: тип �
 качеству, а не по тому, кто здесь оказался опорным. В выдаче он помечен
 `is_reference`, и в интерфейсе подписан как «опорный для сравнения».
 
-Чего не хватает, честно
-------------------------
-Разрешение (`source_width`/`source_height`) лежит в `content_previews` —
-то есть только у снимков, которые попали в группы точных дублей
-(`_preview_phase`). У остальных `_similar_phase` намеренно не пишет
-миниатюру (бюджет кэша Р9), поэтому разрешения у них нет, и «разница в
-разрешении» для таких пар показывается как разница в байтах. Это
-измеримая дыра, а не оценка: см. отчёт задачи 14. Закрывается двумя
-колонками в `content_phashes` и одной миграцией — сознательно не сделано в
-этой задаче, потому что схему трогать ради подписи на экране дороже, чем
-сказать правду о том, чего не знаешь.
+Разрешение: дыра задачи 14 закрыта, и не там, где предполагалось
+-----------------------------------------------------------------
+В задаче 14 разрешение было известно только у снимков из групп точных
+дублей: метрики жили в `content_previews`, а это кэш с потолком 512 МБ и
+вытеснением (Р9), и `_similar_phase` намеренно не писал туда ничего.
+Отчёт 14 предлагал добавить в `content_phashes` две колонки
+`width`/`height`.
+
+Задача 17 добавила шесть (миграция 12) — все метрики задачи 9, а не одно
+разрешение. Причина в том, что обнаружилось по дороге: `_similar_phase`
+уже считал их все для каждого снимка библиотеки и выбрасывал, потому что
+`store_phash` писал только отпечаток. Две колонки дали бы ранжирование по
+единственной метрике, которую Р2 называет фактом, и оставили бы без
+данных две, которые Р2 называет уликами, — ровно в тех группах, ради
+которых задача 17 существует. Шесть колонок не стоят ни одного
+дополнительного декодирования.
+
+Остаётся честная оговорка: у снимка, попавшего в индекс до миграции 12,
+метрик нет, пока его не пересчитает следующая полная обработка. На экране
+это по-прежнему «разрешение не измерялось», а в блоке `best_copy` —
+строка о том, у скольких копий метрики есть.
 """
 
 from __future__ import annotations
@@ -59,6 +78,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Mapping, Sequence
 
+from .best_copy import rank_copies
 from .similar import (
     PHASH_BITS,
     SimilarClustering,
@@ -305,6 +325,8 @@ def build_review(
     groups: list[dict] = []
     chains = 0
     bursts = 0
+    ranked_groups = 0
+    contested_groups = 0
 
     for group in clustering.groups:
         reference = max(group.members, key=lambda m: (m.size, m.content_hash))
@@ -343,6 +365,18 @@ def build_review(
                         None if resolution is None else f"{resolution[0]}×{resolution[1]}"
                     ),
                     "megapixels": (member_quality or {}).get("megapixels"),
+                    # Три метрики задачи 9 как есть, чтобы человек мог
+                    # проверить фразу из `best_copy` по числам, а не верить
+                    # ей на слово. `recompression_basis` едет вместе со
+                    # значением и без него не показывается: Р2 запрещает
+                    # сравнивать оценки с разными основаниями, и число без
+                    # основания — приглашение сделать именно это.
+                    "sharpness": (member_quality or {}).get("sharpness"),
+                    "recompression": (member_quality or {}).get("recompression"),
+                    "recompression_basis": (member_quality or {}).get(
+                        "recompression_basis"
+                    ),
+                    "jpeg_quality": (member_quality or {}).get("jpeg_quality"),
                     "taken_at": member_time,
                     "seconds_from_reference": seconds_apart,
                     "is_reference": member.content_hash == reference.content_hash,
@@ -366,6 +400,20 @@ def build_review(
         if burst:
             bursts += 1
 
+        # Задача 17. Тип группы берётся готовым (задача 14) и своего
+        # деления здесь не вводится: в клике «копии» лучшая копия — это
+        # осмысленный ответ, в цепочке «похожая сцена» кадры разные, и там
+        # тот же блок подписан как сравнение технического качества.
+        best = rank_copies(members, dict(quality), is_copy_group=kind == KIND_COPIES)
+        if best["measured"] >= 2:
+            ranked_groups += 1
+            if best["contested"]:
+                contested_groups += 1
+        rank_by_hash = {h: i + 1 for i, h in enumerate(best["order"])}
+        for member in members:
+            member["quality_rank"] = rank_by_hash.get(member["content_hash"])
+            member["is_best_copy"] = member["content_hash"] == best["best"]
+
         groups.append(
             {
                 "id": group.members[0].content_hash,
@@ -377,6 +425,7 @@ def build_review(
                 "explanation": group_explanation(
                     group, kind, clustering.thresholds, burst=burst
                 ),
+                "best_copy": best,
                 "members": members,
             }
         )
@@ -385,6 +434,12 @@ def build_review(
     summary["chain_groups"] = chains
     summary["copy_groups"] = len(clustering.groups) - chains
     summary["burst_groups"] = bursts
+    # Сколько групп вообще удалось отранжировать и в скольких признаки
+    # спорят. Первое число — честный размер дыры «метрик нет» на этой
+    # библиотеке прямо сейчас, второе — размер того случая, где подсказке
+    # верить не стоит. Оба на экране, а не в отчёте о замере.
+    summary["ranked_groups"] = ranked_groups
+    summary["contested_groups"] = contested_groups
 
     return {
         "threshold": threshold_block(clustering.thresholds, len(clustering.groups)),

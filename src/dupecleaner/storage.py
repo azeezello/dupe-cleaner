@@ -55,7 +55,11 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
 # than colliding in the middle of a merge — and the bookkeeping in
 # `__init__` below was changed at the same time so that a gap is a fact
 # the index can record instead of a hole it silently skips.
-SCHEMA_VERSION = 10
+# 11 is reserved for задача 21 (library move plan) and deliberately
+# skipped here: задача 17 took 12 so the two sessions could not claim one
+# number. The set-based bookkeeping below applies 11 whenever that branch
+# lands, even on an index already stamped 12.
+SCHEMA_VERSION = 12
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -134,6 +138,51 @@ def _migrate_v3_quality_metrics(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(
                 f"ALTER TABLE content_previews ADD COLUMN {column} {declaration}"
+            )
+
+
+# v12 (задача 17) puts the quality metrics of задача 9 **next to the
+# perceptual hash** instead of only next to the thumbnail, and that is the
+# whole content of the decision this task had to make.
+#
+# The numbers were already being computed for every photograph in the
+# library and thrown away. `jobs.ScanJob._similar_phase` calls
+# `thumbnails.generate(encode=False)`, which decodes the file and returns a
+# `Preview` carrying both the fingerprint and a full `QualityMetrics` — but
+# `thumbnails.store_phash` wrote only the fingerprint, because the one place
+# metrics lived (`content_previews`) is a 512 MB LRU cache (Р9) sized for
+# the duplicate groups a person actually opens. Writing one preview row per
+# library photo would evict exactly those, which is why задача 14 had to put
+# "разрешение не измерялось" on most of its tiles.
+#
+# `content_phashes` has no size cap and no eviction, so the metrics can live
+# here for the whole library at the cost of six columns and no decoding at
+# all. That is strictly more than the two `width`/`height` columns the
+# задача 14 report proposed: resolution alone would have ranked copies on
+# the one metric Р2 calls a fact, and left the two it calls evidence —
+# sharpness and compression strength — unavailable in exactly the groups
+# задача 17 exists for.
+#
+# The duplication against `content_previews` is real and harmless: both
+# rows come from one function over one content hash, so they cannot
+# disagree. `quality_for_hashes` reads previews first and fills the gaps
+# from here, which keeps every number задача 9 already stored authoritative
+# and makes this table the answer for everything else.
+def _migrate_v12_similar_quality(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(content_phashes)")
+    }
+    for column, declaration in (
+        ("source_width", "INTEGER"),
+        ("source_height", "INTEGER"),
+        ("sharpness_score", "REAL"),
+        ("recompression_score", "REAL"),
+        ("recompression_basis", "TEXT"),
+        ("jpeg_quality", "INTEGER"),
+    ):
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE content_phashes ADD COLUMN {column} {declaration}"
             )
 
 
@@ -415,6 +464,9 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         confirmed_at REAL NOT NULL
     );
     """,
+    # 11 belongs to задача 21; see SCHEMA_VERSION above for why it is skipped
+    # rather than renumbered.
+    12: _migrate_v12_similar_quality,
 }
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
@@ -1161,20 +1213,38 @@ class ScanIndex:
     # looks like is a property of its pixels. See the v9 migration for why
     # this is its own table and not two columns on the preview cache.
 
-    def has_phash(self, content_hash: str, algo: str | None = None) -> bool:
+    def has_phash(
+        self,
+        content_hash: str,
+        algo: str | None = None,
+        *,
+        with_quality: bool = False,
+    ) -> bool:
         """Whether this content has been fingerprinted already.
 
         A row with `phash IS NULL` still counts: it means the photo was
         decoded and found to have no usable structure, which is an answer.
+
+        `with_quality=True` additionally demands the задача 17 metrics
+        (v12) beside the fingerprint, and that is what makes the backfill
+        work: an index written before v12 has fingerprint rows with NULL
+        metrics, and the phase has to decode those once more to fill them.
+        Without this the `needs_phash` row would be handed to the phase and
+        the phase would skip it as already done, forever. Same shape of
+        precedent as `count_quality_metrics`, which exists to show that a
+        re-run really did backfill an index built before задача 9.
         """
+        quality_clause = " AND recompression_basis IS NOT NULL" if with_quality else ""
         if algo is None:
             row = self._conn.execute(
-                "SELECT 1 FROM content_phashes WHERE content_hash = ?",
+                "SELECT 1 FROM content_phashes WHERE content_hash = ?"
+                + quality_clause,
                 (content_hash,),
             ).fetchone()
         else:
             row = self._conn.execute(
-                "SELECT 1 FROM content_phashes WHERE content_hash = ? AND algo = ?",
+                "SELECT 1 FROM content_phashes WHERE content_hash = ? AND algo = ?"
+                + quality_clause,
                 (content_hash, algo),
             ).fetchone()
         return row is not None
@@ -1186,27 +1256,64 @@ class ScanIndex:
         structure: float,
         aspect: float,
         algo: str,
+        metrics: "QualityMetrics | None" = None,
     ) -> None:
-        """Record one photograph's perceptual fingerprint, or its absence.
+        """Record one photograph's perceptual fingerprint, or its absence —
+        and, since v12, the quality metrics that came out of the same decode.
 
         Plain values rather than a `similar.PerceptualHash`, so this module
         stays importable without Pillow — the same reason `set_faces` takes
         tuples instead of `faces.DetectedFace` (see the TYPE_CHECKING
-        import at the top).
+        import at the top). `metrics` is the one exception, for the reason
+        `upsert_thumbnail` already makes it: it is a plain dataclass of
+        numbers and splitting it into six positional arguments would make
+        the call site unreadable without making this module any lighter.
+
+        `metrics=None` leaves whatever is already stored alone instead of
+        clearing it. A caller that has a fingerprint but no measurement
+        (a hand-built row in a test, a future caller that reads only the
+        header) must not silently erase numbers a real decode produced.
         """
         self._conn.execute(
             """
             INSERT INTO content_phashes (
-                content_hash, phash, structure, aspect, algo, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                content_hash, phash, structure, aspect, algo, created_at,
+                source_width, source_height, sharpness_score,
+                recompression_score, recompression_basis, jpeg_quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(content_hash) DO UPDATE SET
                 phash      = excluded.phash,
                 structure  = excluded.structure,
                 aspect     = excluded.aspect,
                 algo       = excluded.algo,
-                created_at = excluded.created_at
+                created_at = excluded.created_at,
+                source_width        = COALESCE(excluded.source_width,
+                                               content_phashes.source_width),
+                source_height       = COALESCE(excluded.source_height,
+                                               content_phashes.source_height),
+                sharpness_score     = COALESCE(excluded.sharpness_score,
+                                               content_phashes.sharpness_score),
+                recompression_score = COALESCE(excluded.recompression_score,
+                                               content_phashes.recompression_score),
+                recompression_basis = COALESCE(excluded.recompression_basis,
+                                               content_phashes.recompression_basis),
+                jpeg_quality        = COALESCE(excluded.jpeg_quality,
+                                               content_phashes.jpeg_quality)
             """,
-            (content_hash, phash, structure, aspect, algo, time.time()),
+            (
+                content_hash,
+                phash,
+                structure,
+                aspect,
+                algo,
+                time.time(),
+                None if metrics is None else metrics.source_width,
+                None if metrics is None else metrics.source_height,
+                None if metrics is None else metrics.sharpness,
+                None if metrics is None else metrics.recompression,
+                None if metrics is None else metrics.recompression_basis,
+                None if metrics is None else metrics.jpeg_quality,
+            ),
         )
 
     def needs_phash(self, scan_id: str, algo: str) -> list[FileRecord]:
@@ -1246,6 +1353,16 @@ class ScanIndex:
                  OR NOT (f.hashed_source_size = f.source_size
                          AND f.hashed_source_mtime = f.source_mtime)
                  OR p.content_hash IS NULL
+                 -- v12 (задача 17): a fingerprint with no metrics beside it
+                 -- is half-done work, not done work. An index written
+                 -- before v12 has one such row per library photo, and the
+                 -- next full scan backfills them with one decode each --
+                 -- exactly what задача 9 did to indexes written before it
+                 -- (see `count_quality_metrics`). Nothing here loops
+                 -- forever on an unmeasurable file: a file that will not
+                 -- decode never gets a row at all, so the clause above
+                 -- already owns that case.
+                 OR p.recompression_basis IS NULL
                )
              ORDER BY f.display_path
             """,
@@ -1744,6 +1861,32 @@ class ScanIndex:
             )
             for row in cursor:
                 out[row["content_hash"]] = _row_to_quality_dict(row)
+
+        # Gaps filled from `content_phashes` (v12, задача 17). Previews win
+        # when both exist, which costs nothing — one function over one
+        # content hash produced both rows, so they hold the same numbers —
+        # and keeps every reading задача 9 already stored as the one the
+        # screen shows. What this adds is the rest of the library: a photo
+        # that never entered a duplicate group has no preview row and never
+        # will (Р9's cache is sized for the groups), and it is precisely
+        # those photos that the near-duplicate groups are made of.
+        missing = [h for h in wanted if h not in out]
+        for start in range(0, len(missing), 500):
+            chunk = missing[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self._conn.execute(
+                f"""
+                SELECT content_hash, source_width, source_height,
+                       sharpness_score, recompression_score,
+                       recompression_basis, jpeg_quality
+                  FROM content_phashes
+                 WHERE content_hash IN ({placeholders})
+                   AND recompression_basis IS NOT NULL
+                """,
+                chunk,
+            )
+            for row in cursor:
+                out[row["content_hash"]] = _row_to_quality_dict(row)
         return out
 
     def count_quality_metrics(self) -> int:
@@ -1940,13 +2083,20 @@ class ScanIndex:
 
 
 def _row_to_quality_dict(row: sqlite3.Row) -> dict:
-    """Shape one `content_previews` row for the web layer.
+    """Shape one metrics row for the web layer — from `content_previews` or,
+    since v12, from `content_phashes`.
 
     `megapixels` is derived here rather than stored: it is the form a
     person reads ("12.2 МП"), while the pixel counts are the form a
     comparison needs, and deriving is cheaper than keeping two columns
     honest about each other.
+
+    `thumbnail_width`/`height` are absent from a `content_phashes` row and
+    reported as None rather than guessed: that table stores no thumbnail,
+    which is the whole reason the metrics could move there (no 512 MB cap,
+    no eviction — see the v12 migration).
     """
+    keys = set(row.keys())
     source_width = row["source_width"]
     source_height = row["source_height"]
     megapixels = (
@@ -1970,8 +2120,8 @@ def _row_to_quality_dict(row: sqlite3.Row) -> dict:
         ),
         "recompression_basis": row["recompression_basis"],
         "jpeg_quality": row["jpeg_quality"],
-        "thumbnail_width": row["width"],
-        "thumbnail_height": row["height"],
+        "thumbnail_width": row["width"] if "width" in keys else None,
+        "thumbnail_height": row["height"] if "height" in keys else None,
     }
 
 

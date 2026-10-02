@@ -162,3 +162,15 @@ def test_no_quarantine_path_imports_the_similarity_module():
     source = Path(quarantine_module.__file__).read_text(encoding="utf-8")
     assert "import similar" not in source
     assert "SimilarGroup" not in source
+
+
+def test_no_quarantine_path_imports_the_best_copy_module():
+    """То же для задачи 17: `quarantine.py` не знает, что существует
+    «лучшая копия», и не должен узнать. Подсказка о качестве — это ось B
+    из Р0 без права двигать файлы (Р2), и день, когда их свяжут, должен
+    начаться с падения этого теста, а не с перемещённого файла."""
+    from dupecleaner import quarantine as quarantine_module
+
+    source = Path(quarantine_module.__file__).read_text(encoding="utf-8")
+    assert "best_copy" not in source
+    assert "rank_copies" not in source

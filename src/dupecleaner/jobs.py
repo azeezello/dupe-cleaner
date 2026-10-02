@@ -513,6 +513,14 @@ class ScanJob:
         library would evict exactly those. `generate(encode=False)`
         decodes without encoding, which is the whole difference.
 
+        The quality metrics of задача 9 *are* written here, into
+        `content_phashes` (v12, задача 17). The same decode has always
+        produced them and this phase always threw them away, because the
+        only table that held them was the capped cache above. They are the
+        three numbers задача 17 ranks near-duplicate copies by, and without
+        them most groups had nothing to rank on — see the v12 migration in
+        storage.py.
+
         Best-effort per photo, as everywhere else: one file that will not
         decode becomes one warning and the scan carries on.
         """
@@ -536,7 +544,15 @@ class ScanJob:
                 # Two filed copies of one photograph: the first through
                 # pays for the decode, the rest only for the read that
                 # proved they are the same photograph.
-                if not index.has_phash(content_hash, similar_module.PHASH_ALGO):
+                #
+                # `with_quality=True` (v12, задача 17): a row carrying a
+                # fingerprint but no metrics is work half done, and an
+                # index written before v12 is full of them. Asking only
+                # "is there a row" would hand `needs_phash` the photo and
+                # then skip it here, so the backfill would never happen.
+                if not index.has_phash(
+                    content_hash, similar_module.PHASH_ALGO, with_quality=True
+                ):
                     preview = thumbnails.generate(
                         Path(record.real_path), encode=False, data=data
                     )

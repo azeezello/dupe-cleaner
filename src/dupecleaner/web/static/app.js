@@ -1540,7 +1540,13 @@ function renderSimilar() {
     `крупнейшая группа ${fmtNumber(s.largest_group)}. ` +
     `Отпечаток есть у ${fmtNumber(cov.with_phash || 0)} снимков из ${fmtNumber(cov.photos || 0)}` +
     (cov.without_phash ? `, без структуры (пустой кадр) ${fmtNumber(cov.without_phash)}` : "") +
-    (cov.not_looked ? `, не смотрели ${fmtNumber(cov.not_looked)}` : "") + ".";
+    (cov.not_looked ? `, не смотрели ${fmtNumber(cov.not_looked)}` : "") + ". " +
+    // Задача 17: размер дыры «метрик нет» и размер случая «подсказке
+    // верить не стоит» — числами на этой библиотеке, а не обещанием.
+    `Качество удалось сравнить в ${fmtNumber(s.ranked_groups || 0)} группах` +
+    (s.contested_groups
+      ? `, в ${fmtNumber(s.contested_groups)} из них признаки спорят между собой.`
+      : ".");
 
   const warnings = data.warnings || [];
   $("similar-warnings").hidden = warnings.length === 0;
@@ -1594,9 +1600,11 @@ function renderSimilarTile(node, group) {
       info: el("div", "tile-info"),
       spread: el("div", "tile-spread"),
       labels: el("div", "tile-labels"),
+      best: el("div", "tile-best"),
     };
     refs.info.appendChild(refs.spread);
     refs.info.appendChild(refs.labels);
+    refs.info.appendChild(refs.best);
     node.appendChild(refs.thumb);
     node.appendChild(refs.badge);
     node.appendChild(refs.ribbon);
@@ -1651,6 +1659,27 @@ function renderSimilarTile(node, group) {
   const labels = new Set();
   group.members.forEach((m) => m.labels.forEach((l) => labels.add(l)));
   refs.labels.textContent = labels.size ? Array.from(labels).join(" · ") : `${group.file_count} файлов`;
+
+  // Задача 17 одной строкой: удалось ли вообще отранжировать копии и
+  // спорят ли признаки. Строка намеренно не содержит самого вывода —
+  // «выше разрешение» без второй копии рядом ничего не значит, а плитка
+  // показывает только опорное превью. Вывод — в панели деталей.
+  const best = group.best_copy;
+  refs.best.className = "tile-best";
+  if (!best || best.measured < 2) {
+    refs.best.textContent = "качество не сравнить: метрик нет";
+    refs.best.classList.add("muted");
+  } else if (best.contested.length) {
+    refs.best.textContent = "лучшая копия спорна";
+    refs.best.classList.add("warn");
+  } else if (!best.is_choice) {
+    refs.best.textContent = "сравнение качества кадров";
+    refs.best.classList.add("muted");
+  } else {
+    refs.best.textContent = best.confident
+      ? "лучшая копия выбрана"
+      : "лучшая копия выбрана (перевес малый)";
+  }
 }
 
 function selectSimilarById(id) {
@@ -1665,6 +1694,44 @@ function openActiveSimilarDetail() {
   const item = g.getItem(g.activeIndex);
   if (item) showSimilarDetail(item);
   else hideSimilarDetail();
+}
+
+// Подписи оснований шкалы сжатия — те же три, что в best_copy.py.
+const BASIS_LABELS = {
+  jpeg_quant_tables: "таблицы квантования JPEG",
+  bits_per_pixel: "бит на пиксель",
+  lossless: "сжатие без потерь",
+};
+
+// Задача 17. Блок объясняет выбор так же, как `keeper.keeper_reason`
+// объясняет Р8 на вкладке дублей: называется не победитель, а признак, на
+// котором он впервые обошёл следующую копию. Разница в том, что здесь за
+// объяснением не стоит никакого действия — ни кнопки, ни горячей клавиши.
+function renderBestCopy(group) {
+  const box = $("similar-detail-best");
+  const best = group.best_copy;
+  box.innerHTML = "";
+  if (!best) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.className =
+    "similar-best" +
+    (best.contested.length ? " contested" : "") +
+    (best.is_choice ? "" : " scene");
+
+  box.appendChild(el("div", "similar-best-head", best.headline));
+  if (best.reason) {
+    box.appendChild(
+      el(
+        "div",
+        "similar-best-reason",
+        best.reason + (best.confident ? "" : " — перевес малый")
+      )
+    );
+  }
+  best.notes.forEach((note) => box.appendChild(el("p", "similar-best-note", note)));
 }
 
 function fmtGap(seconds) {
@@ -1684,6 +1751,8 @@ function showSimilarDetail(group) {
   const why = $("similar-detail-why");
   why.innerHTML = "";
   group.explanation.forEach((line) => why.appendChild(el("p", null, line)));
+
+  renderBestCopy(group);
 
   const list = $("similar-detail-members");
   list.innerHTML = "";
@@ -1714,6 +1783,19 @@ function showSimilarDetail(group) {
       )
     );
 
+    if (m.is_best_copy || m.quality_rank) {
+      const mark = el(
+        "div",
+        "similar-member-rank" + (m.is_best_copy ? " best" : ""),
+        m.is_best_copy
+          ? group.best_copy && group.best_copy.is_choice
+            ? "★ лучшая копия по качеству"
+            : "★ лучшая по техническому качеству"
+          : `${m.quality_rank}-я по качеству`
+      );
+      body.appendChild(mark);
+    }
+
     const facts = [];
     facts.push(fmtBytes(m.size));
     if (m.size_ratio != null && !m.is_reference) {
@@ -1726,6 +1808,18 @@ function showSimilarDetail(group) {
     const gap = m.is_reference ? null : fmtGap(m.seconds_from_reference);
     if (gap) facts.push(gap);
     body.appendChild(el("div", "similar-member-facts", facts.join(" · ")));
+
+    // Числа, по которым посчитан порядок (задача 17). Рядом, а не вместо
+    // фразы: фраза говорит, какая копия лучше, числа дают её проверить.
+    // Оценка сжатия показывается только вместе со своим основанием — Р2
+    // запрещает сравнивать оценки с разными основаниями, а число без
+    // основания приглашает это сделать.
+    const qf = [];
+    if (m.sharpness != null) qf.push(`резкость ${m.sharpness.toFixed(0)}`);
+    if (m.jpeg_quality != null) qf.push(`качество JPEG ${m.jpeg_quality}`);
+    else if (m.recompression != null && m.recompression_basis)
+      qf.push(`сжатие ${m.recompression.toFixed(2)} (${BASIS_LABELS[m.recompression_basis] || m.recompression_basis})`);
+    if (qf.length) body.appendChild(el("div", "similar-member-quality", qf.join(" · ")));
 
     if (m.labels.length) {
       const row = el("div");

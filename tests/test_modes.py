@@ -650,3 +650,58 @@ def test_a_second_full_scan_does_not_reclassify_what_it_already_knows(tmp_path: 
         # The verdict survived the re-scan's upsert rather than being
         # dropped and recomputed: the bytes did not change.
         assert index.needs_origin(second.scan_id) == []
+
+
+# --- задача 17: лучшая копия в выводе CLI ---------------------------------
+
+
+def test_cli_similar_prints_the_best_copy_its_reason_and_its_caveats(
+    tmp_path: Path, capsys
+):
+    r"""Живой прогон задачи 17 поймал расхождение двух выводов одного
+    правила: группа, где увеличенная копия обошла оригинал по разрешению,
+    в веб-интерфейсе была помечена «признаки спорят», а в CLI выглядела
+    уверенным ответом. Это находка P1.5 в миниатюре, и тест держит
+    именно её: причина и оговорки печатаются там же, где выбор.
+    """
+    from PIL import Image
+
+    def photo(seed: int, size=(1200, 900)) -> Image.Image:
+        small = Image.new("RGB", (12, 9))
+        small.putdata(
+            [
+                (
+                    (seed * 37 + i * 29) % 256,
+                    (seed * 61 + i * 17) % 256,
+                    (seed * 13 + i * 53) % 256,
+                )
+                for i in range(12 * 9)
+            ]
+        )
+        return small.resize(size, Image.Resampling.BICUBIC)
+
+    root = tmp_path / "lib"
+    root.mkdir()
+    base = photo(3).convert("RGB")
+    base.save(root / "original.jpg", quality=95)
+    base.resize((2400, 1800), Image.Resampling.LANCZOS).save(
+        root / "upscaled.jpg", quality=85
+    )
+
+    db = tmp_path / "idx.db"
+    # `--db` у `scan` глобальный, у `similar` свой — так в парсере, и тест
+    # вызывает обе команды так, как их вызывает человек.
+    assert main([
+        "--db", str(db), "scan", str(root), "--mode", "full",
+        "--report", str(tmp_path / "report.json"),
+    ]) == 0
+    capsys.readouterr()
+
+    assert main(["similar", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "лучшая копия:" in out
+    assert "выше разрешение" in out
+    # Увеличенная копия выигрывает первую ступень — и об этом сказано, а
+    # не умолчано.
+    assert "upscaled.jpg" in out
+    assert "признаки спорят" in out

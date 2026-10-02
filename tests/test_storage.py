@@ -647,3 +647,155 @@ def test_the_v5_migration_is_safe_to_run_again(tmp_path: Path):
         index.record_decision("h1", "keep")
     with ScanIndex(db) as index:  # reopening at the current version is a no-op
         assert index.decisions_for_hashes(["h1"])["h1"]["action"] == "keep"
+
+
+# --- задача 17: метрики качества рядом с отпечатком (миграция 12) ----------
+#
+# Разрешение, резкость и сила сжатия считались для каждого снимка
+# библиотеки и выбрасывались: единственная таблица, где они жили
+# (`content_previews`), это кэш с потолком 512 МБ и вытеснением (Р9).
+# Поэтому в задаче 14 большинство плиток похожих писали «разрешение не
+# измерялось». Миграция 12 кладёт те же числа в `content_phashes`, у
+# которой потолка нет, и ничего при этом не декодирует заново.
+
+
+def _photo_record(path: str, size: int = 10, mtime: float = 1.0) -> FileRecord:
+    return FileRecord(
+        display_path=path,
+        real_path=path,
+        size=size,
+        mtime=mtime,
+        media_kind=MediaKind.PHOTO,
+    )
+
+
+class _Metrics:
+    """Минимальная подделка `quality.QualityMetrics` — `storage` знает о ней
+    только через TYPE_CHECKING и читает шесть полей."""
+
+    def __init__(self, w=4000, h=3000, sharp=12.5, recomp=0.25, basis="jpeg_quant_tables", jq=85):
+        self.source_width = w
+        self.source_height = h
+        self.sharpness = sharp
+        self.recompression = recomp
+        self.recompression_basis = basis
+        self.jpeg_quality = jq
+
+
+def test_v12_migration_adds_quality_columns_to_a_v10_index(tmp_path: Path):
+    """Индекс Азиза уже собран — отпечатки в нём самое дорогое, и он
+    обязан получить колонки, а не быть пересобран."""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    with ScanIndex(db) as index:
+        index.set_phash("h1", "00ff00ff00ff00ff", 4.0, 1.33, "phash-dct8-63-v1")
+        index.commit()
+
+    conn = sqlite3.connect(str(db))
+    for column in (
+        "source_width", "source_height", "sharpness_score",
+        "recompression_score", "recompression_basis", "jpeg_quality",
+    ):
+        conn.execute(f"ALTER TABLE content_phashes DROP COLUMN {column}")
+    conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+    conn.execute(
+        "UPDATE meta SET value = '2,3,4,5,6,7,8,9,10' "
+        "WHERE key = 'applied_migrations'"
+    )
+    conn.commit()
+    conn.close()
+
+    with ScanIndex(db) as index:
+        columns = {
+            row["name"]
+            for row in index._conn.execute("PRAGMA table_info(content_phashes)")
+        }
+        assert {"source_width", "sharpness_score", "recompression_basis"} <= columns
+        # Отпечаток уцелел — именно это и есть смысл миграции, а не
+        # пересоздания таблицы.
+        assert index.has_phash("h1", "phash-dct8-63-v1")
+        # А метрик у него нет, и это надо уметь увидеть: строка с
+        # отпечатком без метрик — работа, сделанная наполовину.
+        assert not index.has_phash("h1", "phash-dct8-63-v1", with_quality=True)
+
+
+def test_v12_migration_is_idempotent(tmp_path: Path):
+    db = tmp_path / "i.db"
+    with ScanIndex(db) as index:
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "a", metrics=_Metrics())
+    with ScanIndex(db) as index:  # повторное открытие ничего не теряет
+        assert index.quality_for_hashes(["h1"])["h1"]["source_width"] == 4000
+
+
+def test_set_phash_stores_the_metrics_from_the_same_decode(tmp_path: Path):
+    with ScanIndex(":memory:") as index:
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "a", metrics=_Metrics(jq=91))
+        row = index.quality_for_hashes(["h1"])["h1"]
+        assert row["source_width"] == 4000 and row["source_height"] == 3000
+        assert row["megapixels"] == 12.0
+        assert row["jpeg_quality"] == 91
+        assert row["recompression_basis"] == "jpeg_quant_tables"
+        # Миниатюры у этой строки нет и быть не может — ровно поэтому
+        # метрики и смогли туда переехать.
+        assert row["thumbnail_width"] is None
+
+
+def test_rewriting_a_phash_without_metrics_does_not_erase_them(tmp_path: Path):
+    """Вызывающий, у которого есть отпечаток и нет измерения, не имеет
+    права стереть числа, которые дало настоящее декодирование."""
+    with ScanIndex(":memory:") as index:
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "a", metrics=_Metrics())
+        index.set_phash("h1", "1e1e", 5.0, 1.33, "a")
+        row = index.quality_for_hashes(["h1"])["h1"]
+        assert row["source_width"] == 4000
+        assert index.has_phash("h1", "a", with_quality=True)
+
+
+def test_quality_for_hashes_falls_back_to_the_phash_table(tmp_path: Path):
+    """Главное следствие миграции 12: у снимка, который никогда не попадал
+    в группу точных дублей, строки превью нет и не будет (кэш Р9 рассчитан
+    на группы), а метрики теперь есть."""
+    with ScanIndex(":memory:") as index:
+        index.set_phash("only_phash", "0f0f", 4.0, 1.33, "a", metrics=_Metrics(w=1000, h=750))
+        got = index.quality_for_hashes(["only_phash", "nobody"])
+        assert set(got) == {"only_phash"}
+        assert got["only_phash"]["source_width"] == 1000
+
+
+def test_a_preview_row_wins_over_the_phash_row_for_the_same_hash(tmp_path: Path):
+    """Числа совпадают по построению (одна функция, один хэш содержимого),
+    так что выбор ничего не меняет по существу — но он должен быть
+    определённым, а не зависеть от порядка строк."""
+    with ScanIndex(":memory:") as index:
+        index.upsert_thumbnail("h1", 100, 240, 180, metrics=_Metrics(w=4000, h=3000))
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "a", metrics=_Metrics(w=1111, h=1111))
+        row = index.quality_for_hashes(["h1"])["h1"]
+        assert row["source_width"] == 4000
+        assert row["thumbnail_width"] == 240
+
+
+def test_a_fingerprint_without_metrics_is_still_work_to_do(tmp_path: Path):
+    """`needs_phash` обязан вернуть такой снимок — иначе индекс, собранный
+    до миграции 12, никогда не досчитает метрики. И обязан перестать его
+    возвращать, когда метрики появились."""
+    with ScanIndex(":memory:") as index:
+        index.upsert_files([_photo_record("a.jpg")], "s1")
+        index.set_full_hash("a.jpg", "h1")
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "algo1")
+        index.commit()
+        assert [r.display_path for r in index.needs_phash("s1", "algo1")] == ["a.jpg"]
+
+        index.set_phash("h1", "0f0f", 4.0, 1.33, "algo1", metrics=_Metrics())
+        index.commit()
+        assert index.needs_phash("s1", "algo1") == []
+
+
+def test_schema_version_matches_the_highest_migration(tmp_path: Path):
+    """Два ключа с одним номером в `_MIGRATIONS` молча вытесняют друг
+    друга, поэтому после каждого мержа схемы проверяется не «тесты
+    зелёные», а это. 11 намеренно пропущена — она за задачей 21."""
+    from dupecleaner.storage import _MIGRATIONS, SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == max(_MIGRATIONS)
+    assert sorted(_MIGRATIONS) == [2, 3, 4, 5, 6, 7, 8, 9, 10, 12]
