@@ -10,6 +10,7 @@ r"""Задача 21: планировщик библиотеки — план с
 from __future__ import annotations
 
 import ast
+import collections
 import datetime as dt
 import inspect
 import os
@@ -563,3 +564,103 @@ def test_a_confirmed_name_is_used_verbatim():
     )
     assert "Свадьба Wedding 16042017" in plan.albums[0].folder
     assert plan.albums[0].confirmed
+
+
+# --- 15. мелкий день уезжает в месяц, а не получает свою папку --------------
+#
+# Это поведение добавлено после того, как раскладка была посчитана на
+# настоящей библиотеке: при пороге события 6 часов получалось 2163 папки, и
+# 866 из них держали один-два снимка. Порог размера альбома — ответ на это,
+# и он выключен по умолчанию (0), потому что на маленькой библиотеке делить
+# нечего.
+
+
+def month_plan(sizes: list[int], *, floor: int, confirmed: dict[int, str] | None = None):
+    """План по нескольким событиям заданных размеров, все в апреле 2017."""
+    confirmed = confirmed or {}
+    events, suggestions, records, keys = [], [], {}, {}
+    for n, size in enumerate(sizes):
+        paths = [rf"D:\Photos\src\e{n}_{i}.jpg" for i in range(size)]
+        stamp = wall(day=2 + n * 3)          # разные дни, одна и та же весна
+        events.append(ev.EventCluster(moments=[moment(p, stamp + i) for i, p in enumerate(paths)]))
+        suggestions.append(
+            suggestion(paths[0], f"Город{n}", size=size, confirmed=confirmed.get(n))
+        )
+        for i, p in enumerate(paths):
+            records[p] = record(p)
+            keys[p] = f"h{n}_{i}"
+    return lib.plan_library(
+        ev.EventClustering(events=events),
+        AlbumNaming(suggestions=suggestions),
+        records=records,
+        layout=layout(min_album_photos=floor),
+        content_keys=keys,
+    )
+
+
+def test_an_event_below_the_floor_is_filed_under_its_month():
+    plan = month_plan([3], floor=20)
+    assert {m.bucket for m in plan.moves} == {lib.Bucket.MONTH}
+    assert all("2017-04 Апрель" in m.destination for m in plan.moves)
+    assert [a.source for a in plan.albums] == ["month"]
+    assert plan.albums[0].name == "2017-04 Апрель"
+
+
+def test_an_event_at_the_floor_keeps_its_own_folder():
+    plan = month_plan([20], floor=20)
+    assert {m.bucket for m in plan.moves} == {lib.Bucket.EVENT}
+    assert all("2017-04-02 Город0" in m.destination for m in plan.moves)
+
+
+def test_small_days_of_one_month_share_one_folder_and_are_counted():
+    plan = month_plan([2, 3, 4], floor=20)
+    months = [a for a in plan.albums if a.source == "month"]
+    assert len(months) == 1
+    assert months[0].merged_events == 3
+    assert months[0].photos == 9
+    assert len({m.destination.rsplit("\\", 1)[0] for m in plan.moves}) == 1
+
+
+def test_big_and_small_live_side_by_side():
+    plan = month_plan([30, 2], floor=20)
+    by_bucket = collections.Counter(m.bucket for m in plan.moves)
+    assert by_bucket[lib.Bucket.EVENT] == 30
+    assert by_bucket[lib.Bucket.MONTH] == 2
+    folders = {a.folder for a in plan.albums}
+    assert any("2017-04-02 Город0" in f for f in folders)
+    assert any("2017-04 Апрель" in f for f in folders)
+
+
+def test_the_floor_is_off_by_default():
+    plan = month_plan([1, 2], floor=0)
+    assert {m.bucket for m in plan.moves} == {lib.Bucket.EVENT}
+    assert not [a for a in plan.albums if a.source == "month"]
+
+
+def test_a_name_you_confirmed_keeps_its_folder_however_small():
+    """Вы сказали, что это было. Размер события — не мера того, важно ли оно."""
+    plan = month_plan([2, 2], floor=20, confirmed={1: "День рождения Карима"})
+    kept = [m for m in plan.moves if m.bucket is lib.Bucket.EVENT]
+    assert len(kept) == 2
+    assert all("День рождения Карима" in m.destination for m in kept)
+    assert len([m for m in plan.moves if m.bucket is lib.Bucket.MONTH]) == 2
+
+
+def test_two_small_days_of_one_month_are_not_a_collision():
+    """До порога это были бы два события, просящие одну папку по дате."""
+    plan = month_plan([2, 2], floor=20)
+    assert not [p for p in plan.problems if p.kind is lib.Problem.ALBUM_COLLISION]
+
+
+def test_the_month_move_says_why_in_words():
+    plan = month_plan([2], floor=20)
+    assert "слишком мал" in plan.moves[0].reason
+    assert "2017-04 Апрель" in plan.moves[0].reason
+
+
+def test_the_floor_survives_the_round_trip():
+    plan = month_plan([2, 30], floor=20)
+    restored = lib.plan_from_dict(plan.to_dict())
+    assert restored.layout.min_album_photos == 20
+    assert restored.fingerprint() == plan.fingerprint()
+    assert [m.bucket for m in restored.moves] == [m.bucket for m in plan.moves]

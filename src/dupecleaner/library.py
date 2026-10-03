@@ -119,6 +119,15 @@ UNSORTED_DIR = "_unsorted"
 #: not mixed in with a year it cannot be shown to belong to.
 UNDATED_DIR = "_undated"
 
+#: Month names for the folder a small day lands in. Russian, in the
+#: nominative, because the folder name is read as a label («2021-07 Июль»)
+#: and not as part of a sentence — the same choice `albums` makes for a
+#: confirmed name.
+MONTH_NAMES = (
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+)
+
 #: Characters Windows refuses in a path component, plus the control range.
 #: An album name comes from a geocoder, from a folder a person named, or
 #: from a name a person typed by hand at `albums --confirm`, so it can
@@ -139,6 +148,12 @@ class Bucket(str, Enum):
     """Which of Р5's trees a file belongs to."""
 
     EVENT = "event"
+    #: A day too small to deserve a folder of its own, filed under its
+    #: month. Not a failure of clustering: two frames shot on a Tuesday
+    #: are a Tuesday, not an occasion, and a library where every such
+    #: Tuesday is a folder is unreadable — measured on this library, 866
+    #: of 2163 folders would hold one or two photographs.
+    MONTH = "month"
     SCREENSHOTS = "screenshots"
     DOCUMENTS = "documents"
     UNSORTED = "unsorted"
@@ -406,6 +421,13 @@ class LibraryLayout:
     #: Two events on one day, neither of which has a subject, share a
     #: folder: see the module docstring.
     merge_same_day_unnamed: bool = True
+    #: Below this many photographs an event gets no folder of its own and
+    #: is filed under its month instead. 0 keeps every event's folder,
+    #: which is the behaviour this field was added to make optional rather
+    #: than mandatory. A name a person confirmed by hand always keeps its
+    #: own folder regardless of size: they said what it is, and the size
+    #: of an occasion is not the measure of whether it mattered.
+    min_album_photos: int = 0
 
     def year_folder(self, date: dt.date) -> str:
         return join_path(self.root, str(date.year)) if self.year_level else self.root
@@ -418,6 +440,21 @@ class LibraryLayout:
 
     def event_folder(self, start: dt.date, subject: str) -> str:
         return join_path(self.year_folder(start), self.event_folder_name(start, subject))
+
+    def month_folder(self, date: dt.date) -> str:
+        """`<root>/<year>/<year>-<month> <Месяц>` — where a small day goes.
+
+        Same shape as an event folder, date first, so the month sorts in
+        among the events of that year rather than above or below them all.
+        """
+        stamp = f"{date.year:04d}-{date.month:02d}"
+        return join_path(
+            self.year_folder(date),
+            sanitize_component(
+                f"{stamp} {MONTH_NAMES[date.month - 1]}",
+                max_chars=self.max_component_chars,
+            ),
+        )
 
     def screenshots_folder(self, date: dt.date | None) -> str:
         bucket = str(date.year) if date else UNDATED_DIR
@@ -436,6 +473,7 @@ class LibraryLayout:
             "max_path_chars": self.max_path_chars,
             "max_component_chars": self.max_component_chars,
             "merge_same_day_unnamed": self.merge_same_day_unnamed,
+            "min_album_photos": self.min_album_photos,
         }
 
 
@@ -719,24 +757,63 @@ def _plan_albums(
     clustering: EventClustering,
     naming: AlbumNaming,
     layout: LibraryLayout,
-) -> tuple[dict[int, str], list[PlannedAlbum], list[PlanProblem]]:
+) -> tuple[dict[int, str], set[int], list[PlannedAlbum], list[PlanProblem]]:
     """Decide one folder per event, and report the folders two events want.
 
-    Returns `(event index -> folder, albums, problems)`. The folder map is
-    what the move pass reads; the collision rules are in the module
-    docstring.
+    Returns `(event index -> folder, indices filed under a month, albums,
+    problems)`. The folder map is what the move pass reads; the collision
+    rules are in the module docstring.
+
+    Events below `layout.min_album_photos` are taken out first and filed
+    under their month, so they never reach the collision rules — two small
+    days of one month are not two events claiming one folder, they are the
+    month doing its job.
     """
     pairs: list[tuple[int, EventCluster, AlbumSuggestion]] = list(
         zip(range(len(clustering.events)), clustering.events, naming.suggestions)
     )
     folder_of: dict[int, str] = {}
+    in_month: set[int] = set()
+    albums: list[PlannedAlbum] = []
+
+    floor = max(0, layout.min_album_photos)
+    if floor:
+        small = [
+            (index, event, suggestion)
+            for index, event, suggestion in pairs
+            # A confirmed name outranks the floor: see `min_album_photos`.
+            if event.size < floor and not suggestion.confirmed
+        ]
+        by_month: dict[tuple[int, int], list[tuple[int, EventCluster, AlbumSuggestion]]] = {}
+        for item in small:
+            start, _ = item[1].date_range
+            by_month.setdefault((start.year, start.month), []).append(item)
+        for (year, month), members in sorted(by_month.items()):
+            folder = layout.month_folder(dt.date(year, month, 1))
+            for index, _, _ in members:
+                folder_of[index] = folder
+                in_month.add(index)
+            first = min(members, key=lambda m: m[1].start)
+            albums.append(
+                PlannedAlbum(
+                    folder=folder,
+                    name=f"{year:04d}-{month:02d} {MONTH_NAMES[month - 1]}",
+                    anchor=first[2].anchor,
+                    start=min(m[1].date_range[0] for m in members),
+                    end=max(m[1].date_range[1] for m in members),
+                    photos=sum(m[1].size for m in members),
+                    source="month",
+                    confirmed=False,
+                    merged_events=len(members),
+                )
+            )
+        pairs = [item for item in pairs if item[0] not in in_month]
     by_folder: dict[str, list[tuple[int, EventCluster, AlbumSuggestion]]] = {}
     for index, event, suggestion in pairs:
         start, _ = event.date_range
         folder = layout.event_folder(start, album_subject(suggestion))
         by_folder.setdefault(folder, []).append((index, event, suggestion))
 
-    albums: list[PlannedAlbum] = []
     problems: list[PlanProblem] = []
     for folder, claimants in sorted(by_folder.items()):
         subjects = {album_subject(s).strip() for _, _, s in claimants}
@@ -805,7 +882,7 @@ def _plan_albums(
                     confirmed=bool(suggestion.confirmed),
                 )
             )
-    return folder_of, albums, problems
+    return folder_of, in_month, albums, problems
 
 
 def plan_library(
@@ -840,7 +917,7 @@ def plan_library(
     probe = probe or PathProbe()
     plan = LibraryPlan(layout=layout, probe_blind=bool(getattr(probe, "blind", False)))
 
-    folder_of, albums, album_problems = _plan_albums(clustering, naming, layout)
+    folder_of, in_month, albums, album_problems = _plan_albums(clustering, naming, layout)
     plan.albums = albums
     plan.problems.extend(album_problems)
 
@@ -855,8 +932,9 @@ def plan_library(
         folder = folder_of[index]
         album = next((a.name for a in albums if a.folder == folder), "")
         start, _ = event.date_range
+        bucket = Bucket.MONTH if index in in_month else Bucket.EVENT
         for moment in event.moments:
-            home[moment.display_path] = (Bucket.EVENT, folder, start, album)
+            home[moment.display_path] = (bucket, folder, start, album)
 
     for moment in clustering.undated:
         home[moment.display_path] = (Bucket.UNSORTED, layout.unsorted_folder(), None, "")
@@ -1033,6 +1111,12 @@ def _move_reason(
 ) -> str:
     if bucket is Bucket.EVENT:
         head = f"событие «{album}»" if album else "событие"
+    elif bucket is Bucket.MONTH:
+        head = (
+            f"день слишком мал для своей папки — в месяц «{album}»"
+            if album
+            else "день слишком мал для своей папки — в папку месяца"
+        )
     elif bucket is Bucket.SCREENSHOTS:
         head = "скриншот — вне событий по Р3, своя ветка по Р5"
     elif bucket is Bucket.DOCUMENTS:

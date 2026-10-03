@@ -1387,6 +1387,7 @@ def _cmd_library(args: argparse.Namespace) -> int:
             root=args.root,
             year_level=not args.no_year_level,
             max_path_chars=args.max_path_chars,
+            min_album_photos=args.min_album_photos,
         )
         probe = PathProbe() if args.no_probe else RealProbe()
         plan = plan_library(
@@ -2000,6 +2001,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=260,
         help="Предел длины пути, после которого перемещение становится вопросом "
         "к человеку (по умолчанию 260 — предел Windows без префикса \\?\\).",
+    )
+    library_p.add_argument(
+        "--min-album-photos",
+        type=int,
+        default=0,
+        help="Событие меньше этого размера не получает своей папки, а едет в "
+        "папку месяца (`2021-07 Июль`). 0 — у каждого события своя папка. "
+        "Замер на библиотеке Азиза: при пороге события 48 часов и этом "
+        "значении 20 получается 442 папки вместо 2163, и 88%% снимков всё "
+        "равно лежат в названных папках событий. Подтверждённое вручную "
+        "название своей папки не теряет никогда.",
     )
     library_p.add_argument(
         "--no-probe",
