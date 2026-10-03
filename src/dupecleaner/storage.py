@@ -1677,6 +1677,29 @@ class ScanIndex:
             for row in cursor
         ]
 
+    def media_records(self, scan_id: str) -> list[FileRecord]:
+        """Every photo and video of this scan as a `FileRecord`.
+
+        `moments` returns the thin tuples clustering needs; задача 21
+        needs the record itself — the size, because a cross-volume copy
+        costs that many bytes at the destination, and the whole record,
+        because Р8's `choose_keeper` takes records and the planner is
+        required to call it rather than rank copies a second way.
+        Archive members are excluded here, not filtered later: Р1 says a
+        member cannot be extracted on its own, so it has no canonical
+        path to plan.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM files
+             WHERE last_scan_id = ? AND is_archive_member = 0
+               AND media_kind IN ('photo', 'video')
+             ORDER BY display_path
+            """,
+            (scan_id,),
+        )
+        return [_row_to_record(row) for row in cursor]
+
     def latest_scan_id(self) -> str | None:
         """The scan whose rows are newest in the index.
 
@@ -1741,6 +1764,30 @@ class ScanIndex:
             (scan_id, *classes),
         )
         return [row["display_path"] for row in cursor]
+
+    def excluded_from_albums_classes(self, scan_id: str) -> dict[str, str]:
+        """`display_path -> origin_class` for exactly what Р3 keeps out of
+        albums.
+
+        `excluded_from_albums_paths` answers "which files", which is all
+        задача 16 needed to drop them before clustering. Задача 21 needs
+        "which kind", because Р5 gives a screenshot `_screenshots/<year>/`
+        and a scan `_documents/` — two different trees, and the index is
+        the only place that distinction is written down.
+        """
+        from .origin import OriginClass
+
+        classes = [c.value for c in OriginClass if c.excluded_from_albums]
+        placeholders = ",".join("?" * len(classes))
+        cursor = self._conn.execute(
+            f"""
+            SELECT display_path, origin_class FROM files
+             WHERE last_scan_id = ? AND origin_class IN ({placeholders})
+             ORDER BY display_path
+            """,
+            (scan_id, *classes),
+        )
+        return {row["display_path"]: row["origin_class"] for row in cursor}
 
     # --- thumbnail cache (see thumbnails.py) -------------------------------
     #
