@@ -40,6 +40,12 @@ from .persons import (
 )
 from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
 from .best_copy import rank_copies
+from .library import (
+    LibraryLayout,
+    PathProbe,
+    RealProbe,
+    plan_library,
+)
 from .similar import (
     PHASH_ALGO,
     PHASH_BITS,
@@ -1278,6 +1284,193 @@ def _cmd_albums(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_library(args: argparse.Namespace) -> int:
+    r"""Show the whole plan Р5 asks for — and move nothing (задача 21).
+
+    This command is the dry run, and it is the only thing задача 21 ships:
+    every move, every name conflict, every file that could not be planned,
+    with the reason in each case. Carrying it out is задача 22, which reads
+    the file `--json` writes here and refuses to execute a plan whose
+    fingerprint does not match what a person read.
+
+    The probe is chosen rather than assumed: on the machine that holds the
+    library the destinations and open files are actually checked; against
+    an index whose photographs are not mounted the plan is built from the
+    paths alone and says so, instead of reporting every destination free.
+    """
+    policy = NamePolicy(
+        subject_order=tuple(s.strip() for s in args.subject_order.split(",") if s.strip())
+    )
+    unknown = set(policy.subject_order) - {"place", "person", "folder"}
+    if unknown:
+        print(
+            f"--subject-order: неизвестные звенья {sorted(unknown)}; "
+            "допустимы place, person, folder.",
+            file=sys.stderr,
+        )
+        return 2
+
+    gazetteer_path = Path(args.gazetteer) if args.gazetteer else default_gazetteer_path(args.db)
+    gazetteer = load_gazetteer(gazetteer_path) if gazetteer_path.exists() else None
+    if gazetteer is None:
+        print(
+            f"Геокодера нет ({gazetteer_path}) — первое звено цепочки Р4 молчит, "
+            "альбомы будут названы по папкам, лицам и датам.",
+            file=sys.stderr,
+        )
+
+    thresholds = EventThresholds(session_gap_seconds=args.session_gap_hours * 3600)
+    moment_policy = MomentPolicy(
+        utc_offset_seconds=(
+            args.utc_offset_hours * 3600 if args.utc_offset_hours is not None else None
+        ),
+        use_mtime=args.use_mtime,
+    )
+
+    with ScanIndex(args.db) as index:
+        scan_id = args.scan_id or index.latest_scan_id()
+        if scan_id is None:
+            print(
+                "В индексе нет ни одного скана. Сначала: dupecleaner scan --mode full <папки>",
+                file=sys.stderr,
+            )
+            return 1
+
+        rows = index.moments(scan_id)
+        excluded_classes = index.excluded_from_albums_classes(scan_id)
+        hashes = index.content_hash_by_path(scan_id)
+        persons_by_hash = index.persons_by_content_hash(scan_id)
+        labels = index.person_labels()
+        confirmed = index.confirmed_album_names()
+        records = {r.display_path: r for r in index.media_records(scan_id)}
+
+        moments = moments_from_rows(rows, policy=moment_policy)
+        if not any(m.has_time for m in moments):
+            print(
+                "Ни у одного файла нет времени съёмки — событий не будет, а без "
+                "событий план это один _unsorted/. Сначала полная обработка: "
+                "dupecleaner scan --mode full",
+                file=sys.stderr,
+            )
+            return 1
+
+        clustering = cluster_events(
+            moments, thresholds=thresholds, excluded_paths=list(excluded_classes)
+        )
+        naming = suggest_names(
+            clustering,
+            gazetteer=gazetteer,
+            content_hashes=hashes,
+            persons_by_hash=persons_by_hash,
+            person_labels=labels,
+            confirmed=confirmed,
+            policy=policy,
+        )
+        capture_dates = {
+            path: date
+            for path, date in (
+                (m.display_path, m.local_date())
+                for m in moments
+                if m.display_path in excluded_classes
+            )
+            if date is not None
+        }
+
+        layout = LibraryLayout(
+            root=args.root,
+            year_level=not args.no_year_level,
+            max_path_chars=args.max_path_chars,
+        )
+        probe = PathProbe() if args.no_probe else RealProbe()
+        plan = plan_library(
+            clustering,
+            naming,
+            records=records,
+            layout=layout,
+            content_keys=hashes,
+            origins=excluded_classes,
+            capture_dates=capture_dates,
+            probe=probe,
+        )
+
+    summary = plan.summary()
+    print(f"Скан: {scan_id}")
+    print(f"Библиотека: {args.root}")
+    print(
+        f"Перемещений: {summary['moves']} ({_fmt_bytes(summary['bytes'])}), "
+        f"альбомов: {summary['albums']}"
+    )
+    print(
+        "Режим переноса: "
+        + ", ".join(
+            f"{'переименование' if k == 'rename' else 'копия с проверкой'}={v}"
+            for k, v in sorted(summary["by_transfer"].items())
+        )
+    )
+    print(
+        "По деревьям Р5: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(summary["by_bucket"].items()))
+    )
+    print(
+        f"Уже на месте: {summary['already_in_place']}, переименовано из-за "
+        f"совпадения имён: {summary['renamed']}"
+    )
+    print(
+        f"Лишних копий остаётся на месте: {summary['redundant_copies']} "
+        f"({_fmt_bytes(summary['redundant_bytes'])}) — это решение об "
+        "избыточности, а не об организации (Р0)"
+    )
+    print(f"Отпечаток плана: {summary['fingerprint']}")
+
+    if plan.needs_human:
+        print(f"\nТребует вашего решения: {len(plan.needs_human)}")
+        for problem in plan.needs_human[: args.limit]:
+            print(f"  [{problem.kind.value}] {problem.source}")
+            print(f"      {problem.detail}")
+    if plan.busy:
+        print(
+            f"\nЗаняты другим процессом и пропущены: {len(plan.busy)} "
+            "(по Р5 это предупреждение, а не вопрос)"
+        )
+        for problem in plan.busy[: args.limit]:
+            print(f"  {problem.source}")
+    other = [p for p in plan.problems if not p.kind.needs_human and p.kind.value != "busy"]
+    if other:
+        print(f"\nНе переезжают по другим причинам: {len(other)}")
+        for problem in other[: args.limit]:
+            print(f"  [{problem.kind.value}] {problem.source}")
+
+    for warning in plan.warnings:
+        print(f"\n! {warning}")
+
+    shown = sorted(plan.albums, key=lambda a: -a.photos)[: args.limit]
+    if shown:
+        print(f"\nКрупнейшие альбомы ({len(shown)} из {summary['albums']}):")
+        for album in shown:
+            mark = "✓" if album.confirmed else " "
+            print(f"{mark} {album.folder}  [{album.photos} снимков, {album.source}]")
+
+    if args.show_moves:
+        print(f"\nПеремещения ({min(args.limit, len(plan.moves))} из {len(plan.moves)}):")
+        for move in plan.moves[: args.limit]:
+            print(f"  {move.source}")
+            print(f"    -> {move.destination}")
+            print(f"       {move.reason}")
+
+    print(
+        "\nНи один файл не тронут: это план. Выполнение — задача 22, и она "
+        "сверит отпечаток, чтобы выполнить именно то, что вы прочитали."
+    )
+
+    if args.json:
+        Path(args.json).write_text(
+            json.dumps(plan.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"План сохранён в {args.json} — это вход задачи 22.")
+
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -1641,6 +1834,66 @@ def build_parser() -> argparse.ArgumentParser:
     albums_p.add_argument("--limit", type=int, default=20, help="Сколько событий распечатать")
     albums_p.add_argument("--json", default=None, help="Сохранить названия в JSON")
     albums_p.set_defaults(func=_cmd_albums)
+
+    library_p = subparsers.add_parser(
+        "library",
+        help="Показать план построения библиотеки целиком, ничего не перемещая "
+        "(Р5, задача 21)",
+    )
+    library_p.add_argument(
+        "--root",
+        required=True,
+        help=r"Корень будущей библиотеки, например D:\Library. Папка может не "
+        "существовать: план от этого не меняется, а создавать её — задача 22.",
+    )
+    library_p.add_argument(
+        "--scan-id", default=None, help="Какой скан планировать. По умолчанию последний."
+    )
+    library_p.add_argument(
+        "--no-year-level",
+        action="store_true",
+        help="Складывать альбомы прямо в корень, без уровня года.",
+    )
+    library_p.add_argument(
+        "--max-path-chars",
+        type=int,
+        default=260,
+        help="Предел длины пути, после которого перемещение становится вопросом "
+        "к человеку (по умолчанию 260 — предел Windows без префикса \\?\\).",
+    )
+    library_p.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Не спрашивать файловую систему (план строится по путям). Нужен, "
+        "когда индекс есть, а самих снимков на этой машине нет; план честно "
+        "скажет, что занятость и занятые целевые пути не проверялись.",
+    )
+    library_p.add_argument(
+        "--show-moves", action="store_true", help="Распечатать сами перемещения"
+    )
+    library_p.add_argument(
+        "--subject-order",
+        default=",".join(DEFAULT_NAME_POLICY.subject_order),
+        help="Порядок звеньев цепочки Р4 — тот же, что у команды albums.",
+    )
+    library_p.add_argument(
+        "--gazetteer", default=None, help="Файл офлайн-геокодера (см. albums)."
+    )
+    library_p.add_argument(
+        "--session-gap-hours",
+        type=float,
+        default=DEFAULT_THRESHOLDS.session_gap_seconds / 3600,
+        help="Тот же порог события, что у команды events.",
+    )
+    library_p.add_argument("--use-mtime", action="store_true", help="См. events --use-mtime")
+    library_p.add_argument("--utc-offset-hours", type=float, default=None)
+    library_p.add_argument("--limit", type=int, default=20, help="Сколько строк распечатать")
+    library_p.add_argument(
+        "--json",
+        default=None,
+        help="Сохранить план в JSON — это то, что будет выполнять задача 22.",
+    )
+    library_p.set_defaults(func=_cmd_library)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")
