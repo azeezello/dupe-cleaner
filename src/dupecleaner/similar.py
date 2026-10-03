@@ -200,7 +200,7 @@ class PerceptualHash:
 
 
 def phash_image(img: Image.Image) -> PerceptualHash:
-    """Perceptual hash of an already-decoded image.
+    r"""Perceptual hash of an already-decoded image.
 
     Takes an `Image`, not a path, because every caller already has one open
     — that is the entire cost saving this module is built around (see the

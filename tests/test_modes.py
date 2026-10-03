@@ -705,3 +705,38 @@ def test_cli_similar_prints_the_best_copy_its_reason_and_its_caveats(
     # не умолчано.
     assert "upscaled.jpg" in out
     assert "признаки спорят" in out
+
+
+def test_the_package_runs_as_a_module():
+    """`python -m dupecleaner` должен работать без активации окружения:
+    консольная команда ставится в `.venv/Scripts/` и вне него не находится.
+    """
+    import subprocess, sys, os
+    env = dict(os.environ, PYTHONPATH="src", PYTHONIOENCODING="utf-8")
+    out = subprocess.run(
+        [sys.executable, "-m", "dupecleaner", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert out.returncode == 0, out.stderr[-400:]
+    assert "library" in out.stdout and "albums" in out.stdout
+
+
+def test_no_source_file_has_an_invalid_escape_sequence():
+    """`D:\\Photos` в обычной строке — это `\\P`, то есть неверная
+    escape-последовательность: Python 3.12 печатает SyntaxWarning при каждом
+    запуске, а дальше это станет ошибкой. Докстроки в этом проекте полны
+    windows-путей, поэтому проверяется весь пакет, а не одно место.
+    """
+    import pathlib, warnings
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "src").rglob("*.py")) + sorted((root / "tests").rglob("*.py")):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            offenders += [
+                f"{path.name}:{c.lineno} {c.message}"
+                for c in caught
+                if "escape sequence" in str(c.message)
+            ]
+    assert not offenders, "поставьте r-префикс докстроке: " + "; ".join(offenders)
