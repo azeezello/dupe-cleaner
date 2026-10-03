@@ -1388,6 +1388,8 @@ def _cmd_library(args: argparse.Namespace) -> int:
             year_level=not args.no_year_level,
             max_path_chars=args.max_path_chars,
             min_album_photos=args.min_album_photos,
+            grouping=args.grouping,
+            latin_names=args.latin_names,
         )
         probe = PathProbe() if args.no_probe else RealProbe()
         plan = plan_library(
@@ -2001,6 +2003,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=260,
         help="Предел длины пути, после которого перемещение становится вопросом "
         "к человеку (по умолчанию 260 — предел Windows без префикса \\?\\).",
+    )
+    library_p.add_argument(
+        "--grouping",
+        choices=("event", "year"),
+        default="event",
+        help="event — у каждого события своя папка с датой (Р5 как написано). "
+        "year — одна папка на место в году (`2018/2018 Novosibirsk`), "
+        "остальное по сезонам, подтверждённое вручную имя стоит само. На "
+        "библиотеке Азиза: 442 папки против 110.",
+    )
+    library_p.add_argument(
+        "--latin-names",
+        action="store_true",
+        help="Транслитерировать кириллицу в именах папок (Новосибирск → "
+        "Novosibirsk). Исходное название остаётся в сайдкаре и в индексе.",
     )
     library_p.add_argument(
         "--min-album-photos",

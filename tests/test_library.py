@@ -92,6 +92,10 @@ def one_event(paths: list[str], *, when: float | None = None) -> ev.EventCluster
     return ev.EventClustering(events=[ev.EventCluster(moments=moments)])
 
 
+def basename(path: str) -> str:
+    return path.rsplit("\\", 1)[-1]
+
+
 def layout(root: str = r"D:\Library", **kw) -> lib.LibraryLayout:
     return lib.LibraryLayout(root=root, **kw)
 
@@ -654,7 +658,7 @@ def test_two_small_days_of_one_month_are_not_a_collision():
 
 def test_the_month_move_says_why_in_words():
     plan = month_plan([2], floor=20)
-    assert "слишком мал" in plan.moves[0].reason
+    assert "без своей папки" in plan.moves[0].reason
     assert "2017-04 Апрель" in plan.moves[0].reason
 
 
@@ -664,3 +668,156 @@ def test_the_floor_survives_the_round_trip():
     assert restored.layout.min_album_photos == 20
     assert restored.fingerprint() == plan.fingerprint()
     assert [m.bucket for m in restored.moves] == [m.bucket for m in plan.moves]
+
+
+# --- 16. раскладка по годам: одна папка на место, остальное по сезонам ------
+#
+# Посчитано на настоящей библиотеке прежде, чем написано: событийная
+# раскладка давала 442 папки, эта — 110, медиана 95 снимков. Азиз сказал
+# прямо, чего хотел: «не надо разбивки по месяцам и плодить их».
+
+
+def year_plan(spec, *, floor=20, latin=True):
+    """spec: список (размер, подлежащее, дата, подтверждённое_имя|None)."""
+    events, suggestions, records, keys = [], [], {}, {}
+    for n, (size, subject, date, conf) in enumerate(spec):
+        paths = [rf"D:\Photos\src\{n}_{i}.jpg" for i in range(size)]
+        stamp = dt.datetime(date[0], date[1], date[2], 12, 0).timestamp()
+        events.append(
+            ev.EventCluster(moments=[moment(p, stamp + i) for i, p in enumerate(paths)])
+        )
+        cand = (
+            [NameCandidate(source="place", subject=subject, text=f"{subject}, когда-то",
+                           evidence="тест", strength=1.0)]
+            if subject
+            else [NameCandidate(source="dates", subject="", text="когда-то",
+                                evidence="нет координат", strength=1.0)]
+        )
+        suggestions.append(
+            AlbumSuggestion(anchor=paths[0], date_range="тест", candidates=cand,
+                            confirmed=conf, size=size)
+        )
+        for i, p in enumerate(paths):
+            records[p] = record(p)
+            keys[p] = f"k{n}_{i}"
+    return lib.plan_library(
+        ev.EventClustering(events=events),
+        AlbumNaming(suggestions=suggestions),
+        records=records,
+        layout=layout(grouping="year", latin_names=latin, min_album_photos=floor),
+        content_keys=keys,
+    )
+
+
+def test_every_trip_to_one_place_in_one_year_shares_a_folder():
+    plan = year_plan([
+        (108, "Новосибирск", (2018, 6, 2), None),
+        (42, "Новосибирск", (2018, 6, 21), None),
+        (30, "Новосибирск", (2018, 11, 25), None),
+    ])
+    folders = {m.destination.rsplit("\\", 1)[0] for m in plan.moves}
+    assert folders == {r"D:\Library\2018\2018 Novosibirsk"}
+    assert len(plan.albums) == 1
+    assert plan.albums[0].merged_events == 3
+    assert plan.albums[0].photos == 180
+
+
+def test_the_same_place_in_two_years_is_two_folders():
+    plan = year_plan([
+        (30, "Новосибирск", (2018, 6, 2), None),
+        (30, "Новосибирск", (2019, 6, 2), None),
+    ])
+    assert len({a.folder for a in plan.albums}) == 2
+
+
+def test_two_places_in_one_year_stay_apart():
+    plan = year_plan([
+        (30, "Новосибирск", (2021, 5, 1), None),
+        (30, "Краснодар", (2021, 8, 1), None),
+    ])
+    assert {basename(a.folder) for a in plan.albums} == {"2021 Novosibirsk", "2021 Krasnodar"}
+
+
+def test_a_small_day_goes_to_its_season():
+    plan = year_plan([(4, "Новосибирск", (2021, 11, 18), None)])
+    assert {m.bucket for m in plan.moves} == {lib.Bucket.MONTH}
+    assert basename(plan.albums[0].folder) == "2021 Autumn"
+
+
+def test_an_event_with_no_place_goes_to_its_season_however_big():
+    """`2012-11-18` на 945 снимков не говорит человеку ничего; если день
+    важен, его можно подписать — и тогда он получит свою папку."""
+    plan = year_plan([(945, "", (2012, 11, 18), None)])
+    assert basename(plan.albums[0].folder) == "2012 Autumn"
+    assert plan.albums[0].source == "season"
+
+
+def test_december_belongs_to_the_winter_of_its_own_year():
+    plan = year_plan([(4, "", (2021, 12, 31), None), (4, "", (2021, 1, 2), None)])
+    assert {basename(a.folder) for a in plan.albums} == {"2021 Winter"}
+    assert plan.albums[0].merged_events == 2
+
+
+def test_a_confirmed_name_stands_alone_without_a_date():
+    plan = year_plan([(1817, "Душанбе", (2017, 4, 15), "Aziz-Nekbakht-Wedding")])
+    assert plan.albums[0].folder == r"D:\Library\2017\Aziz-Nekbakht-Wedding"
+    assert plan.albums[0].confirmed
+
+
+def test_a_confirmed_name_is_not_swallowed_by_its_place():
+    """Свадьба и остальной Душанбе того же года — разные папки."""
+    plan = year_plan([
+        (1817, "Душанбе", (2017, 4, 15), "Aziz-Nekbakht-Wedding"),
+        (392, "Душанбе", (2017, 8, 1), None),
+    ])
+    assert {basename(a.folder) for a in plan.albums} == {
+        "Aziz-Nekbakht-Wedding", "2017 Dushanbe",
+    }
+
+
+def test_the_year_is_cut_out_of_a_folder_you_named():
+    """«Новосибирск 2021» + год впереди напечатало бы год дважды."""
+    plan = year_plan([(40, "Новосибирск 2021", (2021, 4, 3), None)])
+    assert basename(plan.albums[0].folder) == "2021 Novosibirsk"
+
+
+def test_outskirts_merge_into_the_place_itself():
+    plan = year_plan([
+        (40, "Академгородок", (2021, 4, 9), None),
+        (133, "Академгородок (окрестности)", (2021, 7, 5), None),
+    ])
+    assert {basename(a.folder) for a in plan.albums} == {"2021 Akademgorodok"}
+
+
+def test_latin_names_can_be_turned_off():
+    plan = year_plan([(40, "Новосибирск", (2021, 4, 3), None)], latin=False)
+    assert basename(plan.albums[0].folder) == "2021 Новосибирск"
+
+
+def test_turkish_names_pass_through_untouched():
+    plan = year_plan([(40, "Foça", (2024, 6, 29), None)])
+    assert basename(plan.albums[0].folder) == "2024 Foça"
+
+
+def test_the_year_layout_has_no_album_collisions_by_construction():
+    plan = year_plan([
+        (30, "Новосибирск", (2018, 6, 2), None),
+        (30, "Новосибирск", (2018, 6, 21), None),
+    ])
+    assert not [p for p in plan.problems if p.kind is lib.Problem.ALBUM_COLLISION]
+
+
+def test_the_grouping_mode_survives_the_round_trip():
+    plan = year_plan([(30, "Новосибирск", (2018, 6, 2), None), (4, "", (2018, 1, 5), None)])
+    restored = lib.plan_from_dict(plan.to_dict())
+    assert restored.layout.grouping == "year"
+    assert restored.layout.latin_names is True
+    assert restored.fingerprint() == plan.fingerprint()
+
+
+def test_the_event_layout_is_untouched_by_all_this():
+    """Раскладка по умолчанию осталась прежней — её проверяют тесты выше,
+    этот утверждает, что режим действительно выбирается, а не угадывается."""
+    plan = plan_one([r"D:\Photos\Краснодар\IMG_1.jpg"], subject="Краснодар")
+    assert plan.layout.grouping == "event"
+    assert "2017-04-16 Краснодар" in plan.moves[0].destination

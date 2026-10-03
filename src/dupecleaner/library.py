@@ -128,6 +128,69 @@ MONTH_NAMES = (
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 )
 
+#: Seasons, for the layout that files a small day under its season rather
+#: than its month — twelve buckets a year is still eleven more than most of
+#: them deserve. Latin, because this layout is the one that asks for latin
+#: names anyway, and because «Зима» next to `2021 Novosibirsk` reads worse
+#: than `2021 Winter`. December belongs to the winter of the year it was
+#: shot in: a folder that moves a photograph into the next year to be
+#: astronomically right is wrong about the thing a person looks for.
+SEASON_NAMES = ("Winter", "Spring", "Summer", "Autumn")
+
+
+def season_of(month: int) -> str:
+    """Which season a month belongs to. December → Winter of its own year."""
+    return SEASON_NAMES[(month % 12) // 3]
+
+
+#: Cyrillic → latin, the GOST-ish transliteration a person reads rather than
+#: a reversible one: `Новосибирск` → `Novosibirsk`, not `Novosibirsk` with
+#: diacritics nobody types. Folder names are read and typed by hand, so
+#: legibility beats round-tripping; the original is in the sidecar and the
+#: index either way.
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def latinise(text: str) -> str:
+    """Transliterate Cyrillic, leave everything else alone.
+
+    Turkish place names (`Foça`, `Balatçık`) and a name a person typed
+    themselves pass through untouched: they are already latin, and
+    "fixing" someone's own spelling is not this function's business.
+    """
+    out: list[str] = []
+    for ch in text:
+        mapped = _TRANSLIT.get(ch.lower())
+        if mapped is None:
+            out.append(ch)
+        elif ch.isupper() and mapped:
+            out.append(mapped[0].upper() + mapped[1:])
+        else:
+            out.append(mapped)
+    return "".join(out)
+
+
+#: `Академгородок (окрестности)` — a point outside the city limits. At one
+#: folder per place per year the distinction stops earning its folder: the
+#: trip was to Akademgorodok either way.
+_OUTSKIRTS_RE = re.compile(r"\s*\((?:окрестности|окрест\.?)\)\s*", re.IGNORECASE)
+#: A year inside a folder the person named (`Новосибирск 2021`) would print
+#: twice once the layout puts the year in front of it.
+_BARE_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def place_label(subject: str) -> str:
+    """The subject as a year's folder should carry it."""
+    text = _OUTSKIRTS_RE.sub(" ", subject)
+    text = _BARE_YEAR_RE.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" -—,")
+
 #: Characters Windows refuses in a path component, plus the control range.
 #: An album name comes from a geocoder, from a folder a person named, or
 #: from a name a person typed by hand at `albums --confirm`, so it can
@@ -421,6 +484,21 @@ class LibraryLayout:
     #: Two events on one day, neither of which has a subject, share a
     #: folder: see the module docstring.
     merge_same_day_unnamed: bool = True
+    #: `"event"` gives every occasion its own dated folder — Р5 as written.
+    #: `"year"` gives every *place* one folder per year
+    #: (`2018/2018 Novosibirsk`), files the rest under the season, and
+    #: leaves a confirmed name standing alone. Measured on this library:
+    #: 442 folders become 110, median 95 photographs, six folders with one
+    #: or two. The trade is named out loud — a year's folder no longer says
+    #: which day, and the day is in the file's own metadata, in the sidecar
+    #: and in the index.
+    grouping: str = "event"
+    #: Transliterate Cyrillic in folder names (`Новосибирск` →
+    #: `Novosibirsk`). The album name in the sidecar and the index keeps
+    #: the original: this is about what is comfortable to type in a shell
+    #: and what survives a filesystem that is unsure about UTF-8, not
+    #: about what the place is called.
+    latin_names: bool = False
     #: Below this many photographs an event gets no folder of its own and
     #: is filed under its month instead. 0 keeps every event's folder,
     #: which is the behaviour this field was added to make optional rather
@@ -440,6 +518,41 @@ class LibraryLayout:
 
     def event_folder(self, start: dt.date, subject: str) -> str:
         return join_path(self.year_folder(start), self.event_folder_name(start, subject))
+
+    def label(self, text: str) -> str:
+        """A folder's visible part, transliterated if this layout asks."""
+        return latinise(text) if self.latin_names else text
+
+    def season_folder(self, date: dt.date) -> str:
+        """`<root>/<year>/<year> <Season>` — where a small day goes in the
+        year layout."""
+        return join_path(
+            self.year_folder(date),
+            sanitize_component(
+                f"{date.year} {season_of(date.month)}",
+                max_chars=self.max_component_chars,
+            ),
+        )
+
+    def place_year_folder(self, date: dt.date, subject: str) -> str:
+        """`<root>/<year>/<year> <Place>` — one folder per place per year."""
+        clean = self.label(place_label(subject))
+        name = f"{date.year} {clean}".strip() if clean else str(date.year)
+        return join_path(
+            self.year_folder(date),
+            sanitize_component(name, max_chars=self.max_component_chars),
+        )
+
+    def confirmed_folder(self, date: dt.date, name: str) -> str:
+        """A name a person typed, standing on its own.
+
+        No date in front: they said what it is, and the year is already in
+        the path. The same verbatim-use rule `album_subject` applies.
+        """
+        return join_path(
+            self.year_folder(date),
+            sanitize_component(self.label(name), max_chars=self.max_component_chars),
+        )
 
     def month_folder(self, date: dt.date) -> str:
         """`<root>/<year>/<year>-<month> <Месяц>` — where a small day goes.
@@ -474,6 +587,8 @@ class LibraryLayout:
             "max_component_chars": self.max_component_chars,
             "merge_same_day_unnamed": self.merge_same_day_unnamed,
             "min_album_photos": self.min_album_photos,
+            "grouping": self.grouping,
+            "latin_names": self.latin_names,
         }
 
 
@@ -753,6 +868,84 @@ class _FolderNames:
             n += 1
 
 
+def _plan_albums_by_year(
+    clustering: EventClustering,
+    naming: AlbumNaming,
+    layout: LibraryLayout,
+) -> tuple[dict[int, str], set[int], list[PlannedAlbum], list[PlanProblem]]:
+    """One folder per place per year; everything else under its season.
+
+    There are no album collisions in this layout by construction: two
+    events of one place in one year are *meant* to share a folder, which
+    is the whole point. What the event layout reports as a problem, this
+    one reports as a merge — `merged_events` on the album.
+    """
+    folder_of: dict[int, str] = {}
+    in_month: set[int] = set()
+    floor = max(0, layout.min_album_photos)
+    groups: dict[str, dict] = {}
+
+    for index, event, suggestion in zip(
+        range(len(clustering.events)), clustering.events, naming.suggestions
+    ):
+        start, end = event.date_range
+        subject = suggestion.primary.subject if suggestion.candidates else ""
+        if suggestion.confirmed:
+            folder = layout.confirmed_folder(start, suggestion.confirmed)
+            name, source, seasonal = suggestion.confirmed, suggestion.primary.source, False
+        elif subject.strip() and event.size >= floor:
+            folder = layout.place_year_folder(start, subject)
+            name = basename_of(folder)
+            source, seasonal = suggestion.primary.source, False
+        else:
+            # No subject at all, or too small to stand alone: the season.
+            # A date-only event lands here however big it is — a folder
+            # called `2012-11-18` says nothing a person recognises, and if
+            # that day matters they can confirm a name for it.
+            folder = layout.season_folder(start)
+            name, source, seasonal = basename_of(folder), "season", True
+
+        folder_of[index] = folder
+        if seasonal:
+            in_month.add(index)
+        g = groups.setdefault(
+            folder,
+            {
+                "name": name,
+                "anchor": suggestion.anchor,
+                "start": start,
+                "end": end,
+                "photos": 0,
+                "source": source,
+                "confirmed": bool(suggestion.confirmed),
+                "events": 0,
+                "first": event.start,
+            },
+        )
+        g["photos"] += event.size
+        g["events"] += 1
+        g["start"] = min(g["start"], start)
+        g["end"] = max(g["end"], end)
+        if event.start < g["first"]:
+            g["first"], g["anchor"] = event.start, suggestion.anchor
+
+    albums = [
+        PlannedAlbum(
+            folder=folder,
+            name=g["name"],
+            anchor=g["anchor"],
+            start=g["start"],
+            end=g["end"],
+            photos=g["photos"],
+            source=g["source"],
+            confirmed=g["confirmed"],
+            merged_events=g["events"],
+        )
+        for folder, g in sorted(groups.items())
+    ]
+    return folder_of, in_month, albums, []
+
+
 def _plan_albums(
     clustering: EventClustering,
     naming: AlbumNaming,
@@ -917,7 +1110,8 @@ def plan_library(
     probe = probe or PathProbe()
     plan = LibraryPlan(layout=layout, probe_blind=bool(getattr(probe, "blind", False)))
 
-    folder_of, in_month, albums, album_problems = _plan_albums(clustering, naming, layout)
+    planner = _plan_albums_by_year if layout.grouping == "year" else _plan_albums
+    folder_of, in_month, albums, album_problems = planner(clustering, naming, layout)
     plan.albums = albums
     plan.problems.extend(album_problems)
 
@@ -1113,9 +1307,9 @@ def _move_reason(
         head = f"событие «{album}»" if album else "событие"
     elif bucket is Bucket.MONTH:
         head = (
-            f"день слишком мал для своей папки — в месяц «{album}»"
+            f"день без своей папки — в «{album}»"
             if album
-            else "день слишком мал для своей папки — в папку месяца"
+            else "день без своей папки — в общую папку периода"
         )
     elif bucket is Bucket.SCREENSHOTS:
         head = "скриншот — вне событий по Р3, своя ветка по Р5"
