@@ -473,3 +473,107 @@ kbd {
 .tile-best { font-size: 0.7rem; }
 .tile-best.muted { color: var(--muted); }
 .tile-best.warn { color: var(--warn); }
+
+/* --- разбор альбома: по одному снимку и целиком сеткой (задача 24) ------- */
+/* Палитра не расширяется: четыре цвета решения 4 из design-decisions.md.
+   «Оставить» нейтрально, «в печать» — ok, «убрать» — danger, «не годится
+   для печати» — warn, тот же цвет, которым во всём проекте помечено
+   «посмотри глазами». Пятого цвета для пятого смысла здесь нет. */
+
+.review-banner {
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
+  padding: 0.55rem 0.7rem;
+  margin: 0 0 0.7rem;
+  font-size: 0.85rem;
+  border-radius: 0 6px 6px 0;
+}
+
+.review-album { max-width: 32rem; }
+
+.review-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.review-single {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  gap: 0.9rem;
+  align-items: start;
+  margin: 0.6rem 0;
+}
+
+@media (max-width: 720px) {
+  .review-single { grid-template-columns: minmax(0, 1fr); }
+}
+
+.review-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 14rem;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.review-stage img {
+  max-width: 100%;
+  max-height: 24rem;
+  object-fit: contain;
+  /* Превью 240 px, растянутое до 24rem, честнее показать мягким, чем
+     сделать вид, что это и есть снимок: решение принимается по тому, что
+     видно, и резкость на экране не должна быть артефактом интерполяции. */
+  image-rendering: auto;
+}
+
+.review-fallback { font-size: 0.85rem; opacity: 0.75; padding: 1rem; text-align: center; }
+
+.review-side { display: flex; flex-direction: column; gap: 0.35rem; }
+.review-position { font-size: 0.8rem; opacity: 0.7; margin: 0; }
+.review-path { font-size: 0.72rem; opacity: 0.7; overflow-wrap: anywhere; }
+.review-reason { font-size: 0.85rem; margin: 0.2rem 0; }
+.review-print { font-size: 0.85rem; margin: 0; font-weight: 600; }
+.review-print.unfit { color: var(--warn); }
+
+.review-metrics {
+  list-style: none;
+  padding: 0;
+  margin: 0.3rem 0;
+  font-size: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.review-states { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.4rem; }
+.review-states .btn-decide.chosen {
+  border-width: 2px;
+  font-weight: 600;
+}
+
+.review-viewport { max-height: 30rem; }
+
+.tile-decision-badge.review-keep { background: var(--muted); color: Canvas; }
+.tile-decision-badge.review-print { background: var(--ok); color: #fff; }
+.tile-decision-badge.review-drop { background: var(--danger); color: #fff; }
+.tile.review-unfit { box-shadow: inset 0 0 0 1px var(--warn); }
+
+.review-batch {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 0.6rem 0;
+}
+
+.review-apply {
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+  margin-top: 0.4rem;
+}

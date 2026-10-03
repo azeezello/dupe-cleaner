@@ -795,8 +795,10 @@ def test_schema_version_matches_the_highest_migration(tmp_path: Path):
     """Два ключа с одним номером в `_MIGRATIONS` молча вытесняют друг
     друга, поэтому после каждого мержа схемы проверяется не «тесты
     зелёные», а это. Разрыв закрыт: 11 — `library_moves` задачи 22, та
-    самая зарезервированная под библиотеку."""
+    самая зарезервированная под библиотеку. 13 — альбомная ось решений
+    задачи 24, три колонки на уже существующей `review_decisions`."""
     from dupecleaner.storage import _MIGRATIONS, SCHEMA_VERSION
 
     assert SCHEMA_VERSION == max(_MIGRATIONS)
-    assert sorted(_MIGRATIONS) == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert sorted(_MIGRATIONS) == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    assert len(_MIGRATIONS) == 12

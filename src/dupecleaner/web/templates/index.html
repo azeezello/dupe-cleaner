@@ -192,6 +192,115 @@
     </div>
   </section>
 
+  <!-- Пункт 24: разбор собранной библиотеки по одному снимку. Не внутри
+       #results намеренно — экран не про скан и не про группы дублей, а про
+       альбомы, которые собрал пункт 22; он работает и без единого скана в
+       этой сессии, потому что всё, что ему нужно, лежит в индексе по хэшу
+       содержимого. -->
+  <section class="card" id="review-card">
+    <h2>Разбор альбома: что оставить, что напечатать, что убрать</h2>
+
+    <p class="review-banner">
+      <strong>«Красиво» этот экран не определяет и не пытается.</strong>
+      Композиция, выражение лица, тот ли это момент — не вычисляются, и балла
+      за них здесь нет: он был бы техническими метриками, переодетыми в
+      эстетические. Считается арифметика — сколько мегапикселей требует формат
+      печати при 300&nbsp;dpi и сколько их есть, — плюс следы пережатия,
+      резкость относительно альбома и есть ли в кадре крупное лицо. Это
+      сортировка очереди и фильтр «заведомо непригодно для печати», а не
+      вердикт о снимке.
+      <br>
+      <strong>«Убрать» перемещает файл в карантин.</strong> Не удаляет: перемещение
+      с журналом и откатом (Р5), вернуть можно одной кнопкой на экране журнала.
+      Удалить навсегда можно только самому, глядя на содержимое карантина.
+    </p>
+
+    <div class="row">
+      <button id="review-load-btn">Показать альбомы библиотеки</button>
+      <select id="review-album" class="review-album" hidden></select>
+    </div>
+    <p class="hint" id="review-status"></p>
+    <p class="hint" id="review-print-note"></p>
+
+    <div id="review-body" hidden>
+      <p class="hint" id="review-summary"></p>
+
+      <div class="review-controls">
+        <div class="type-tabs" role="tablist">
+          <button class="type-tab active" data-rtab="queue" role="tab">Очередь <span class="cnt">0</span></button>
+          <button class="type-tab" data-rtab="unfit" role="tab">Не годится для печати <span class="cnt">0</span></button>
+        </div>
+        <button id="review-view-btn">Сеткой (G)</button>
+      </div>
+
+      <p class="hint kbd-hint">
+        <kbd>&larr;</kbd><kbd>&rarr;</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd> по снимкам ·
+        <kbd>1</kbd> оставить · <kbd>2</kbd> в печать · <kbd>3</kbd> убрать ·
+        <kbd>U</kbd> отменить решение · <kbd>G</kbd> переключить «по одному / сеткой».
+        Решение пишется сразу и по хэшу содержимого — переживает перескан и перенос
+        файла. Файлы не двигаются, пока ниже не нажата «Отправить «убрать» в карантин».
+      </p>
+
+      <!-- По одному снимку -->
+      <div class="review-single" id="review-single">
+        <div class="review-stage">
+          <img id="review-photo" alt="">
+          <div class="review-fallback" id="review-fallback" hidden></div>
+        </div>
+        <div class="review-side">
+          <p class="review-position" id="review-position"></p>
+          <strong id="review-name"></strong>
+          <code class="review-path" id="review-path"></code>
+          <p class="review-reason" id="review-reason"></p>
+          <p class="review-print" id="review-print"></p>
+          <ul class="review-metrics" id="review-metrics"></ul>
+          <div class="review-states" id="review-states">
+            <button class="btn-decide" data-state="keep" title="Клавиша 1">Оставить (1)</button>
+            <button class="btn-decide ok" data-state="print" title="Клавиша 2">В печать (2)</button>
+            <button class="btn-decide danger" data-state="drop" title="Клавиша 3">Убрать (3)</button>
+            <button class="btn-decide" id="review-undo-btn" title="Клавиша U">Отменить (U)</button>
+          </div>
+          <p class="decision-status" id="review-state-status"></p>
+        </div>
+      </div>
+
+      <!-- Целиком сеткой -->
+      <div class="grid-card" id="review-grid-card" hidden>
+        <div class="grid-viewport review-viewport" id="review-viewport">
+          <div class="grid-sizer" id="review-sizer"><div class="grid-pool" id="review-pool"></div></div>
+        </div>
+      </div>
+      <p class="hint grid-empty" id="review-empty" hidden></p>
+
+      <div class="review-batch">
+        <span class="hint">Пачкой, по тому списку, который открыт сейчас:</span>
+        <button data-batch="keep">оставить</button>
+        <button data-batch="print">в печать</button>
+        <button data-batch="drop" class="danger">убрать</button>
+        <span class="hint" id="review-batch-status"></span>
+      </div>
+
+      <div class="review-apply">
+        <p class="hint" id="review-drop-count"></p>
+        <label for="review-quarantine-dir">Папка карантина</label>
+        <input type="text" id="review-quarantine-dir" placeholder="D:\DupeQuarantine">
+        <label class="inline">
+          <input type="checkbox" id="review-confirm">
+          Подтверждаю перемещение отмеченных «убрать» в эту папку карантина
+        </label>
+        <div class="row">
+          <button id="review-apply-btn" class="primary">Отправить «убрать» в карантин</button>
+          <label class="inline">
+            <input type="checkbox" id="review-apply-album" checked>
+            только из этого альбома
+          </label>
+        </div>
+        <p class="hint" id="review-apply-status"></p>
+        <div id="review-apply-result" class="verify-result"></div>
+      </div>
+    </div>
+  </section>
+
   <section class="card" id="quarantine-card" hidden>
     <h2>Карантин</h2>
     <label for="quarantine-dir">Папка карантина</label>

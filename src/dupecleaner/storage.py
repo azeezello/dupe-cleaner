@@ -60,7 +60,14 @@ if TYPE_CHECKING:  # pragma: no cover - import kept out of runtime on purpose
 # skipped here: задача 17 took 12 so the two sessions could not claim one
 # number. The set-based bookkeeping below applies 11 whenever that branch
 # lands, even on an index already stamped 12.
-SCHEMA_VERSION = 12
+#
+# 13 is задача 24's album review: three more columns on `review_decisions`
+# rather than a second decisions table, because Р10's promise is about the
+# *key* — a decision keyed by content hash survives a rescan, a move into
+# the library and a trip through quarantine — and a second table keyed the
+# same way would be a second place to keep that promise. The columns are
+# additive, so nothing already in the table is rewritten.
+SCHEMA_VERSION = 13
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -184,6 +191,43 @@ def _migrate_v12_similar_quality(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(
                 f"ALTER TABLE content_phashes ADD COLUMN {column} {declaration}"
+            )
+
+
+# v13 (задача 24) extends `review_decisions` instead of adding a second
+# decisions table, and the three columns are three separate facts:
+#
+# - `album_state` — «оставить» / «в печать» / «убрать» for one photograph.
+#   A *different axis* from the `action` column next to it: `action`
+#   answers "what happens to the extra copies of these bytes" (Р8's
+#   keeper stays, the rest go), `album_state` answers "is this photograph
+#   worth keeping, worth printing, or should it go". One photograph can
+#   legitimately be the keeper of a duplicate group *and* marked for
+#   print, so the two cannot share one column — and they do share one
+#   row, keyed by content hash, which is the whole of Р10's promise.
+# - `album_decided_at` / `album_applied_at` — the same pair `decided_at`
+#   and `applied_at` already are for the other axis, and for the same
+#   reason: "queued to go to quarantine" and "already moved" are not the
+#   same state, and a page reload must not offer to move a file twice.
+#
+# A row that exists only for the album axis carries `action` =
+# `GROUP_ACTION_NONE`. `action` is NOT NULL (задача 12 declared it so, on
+# an index that already holds Aziz's real decisions), and widening that
+# would mean rebuilding the table rather than adding to it. A sentinel
+# costs one `WHERE` clause in `decisions_for_hashes`; a table rebuild
+# costs a migration that can lose rows.
+def _migrate_v13_album_review(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"] for row in conn.execute("PRAGMA table_info(review_decisions)")
+    }
+    for column, declaration in (
+        ("album_state", "TEXT"),
+        ("album_decided_at", "REAL"),
+        ("album_applied_at", "REAL"),
+    ):
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE review_decisions ADD COLUMN {column} {declaration}"
             )
 
 
@@ -500,7 +544,20 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         ON library_moves(content_key);
     """,
     12: _migrate_v12_similar_quality,
+    13: _migrate_v13_album_review,
 }
+
+#: `review_decisions.action` for a row that exists only because of the
+#: album-review axis (задача 24). Not a decision about duplicate copies —
+#: the absence of one. Every reader of the duplicate-group axis filters it
+#: out, so "not reviewed" stays the absence of a decision there.
+GROUP_ACTION_NONE = "unset"
+GROUP_ACTIONS = ("quarantine", "keep")
+#: `review_decisions.album_state` (задача 24). Mirrors
+#: `album_review.ReviewState`; repeated here so opening the index does
+#: not import the review layer, the same reason `quality.QualityMetrics`
+#: is only a type name in this module.
+ALBUM_STATES = ("keep", "print", "drop")
 
 DEFAULT_DB_PATH = Path.home() / ".dupecleaner" / "index.db"
 
@@ -2186,7 +2243,7 @@ class ScanIndex:
         then, so the group stops appearing in the next scan's report and
         nothing in the UI offers to re-decide it.
         """
-        if action not in ("quarantine", "keep"):
+        if action not in GROUP_ACTIONS:
             raise ValueError(f"record_decision: неизвестное действие {action!r}")
         self._conn.execute(
             """
@@ -2197,18 +2254,39 @@ class ScanIndex:
                 keeper_path = excluded.keeper_path,
                 decided_at  = excluded.decided_at,
                 applied_at  = NULL
+            -- `album_state` and its two timestamps are deliberately absent
+            -- from this SET list (задача 24): the row is shared by two
+            -- axes, the decision is not. A group decision must not silently
+            -- undo «в печать».
             """,
             (content_hash, action, keeper_path, time.time()),
         )
         self._conn.commit()
 
     def clear_decision(self, content_hash: str) -> None:
-        """Undo — back to "not reviewed". Used by the keyboard `U` action
+        """Undo — the keyboard `U` action. Used by the keyboard `U` action
         and by nothing else; there is no other way for a decision to stop
         existing short of the group itself disappearing.
+
+        Clears the *duplicate-group* axis only. Before задача 24 this was a
+        plain `DELETE`, which was the same thing while the row held nothing
+        else; now the row may also carry an album-review state, and
+        dropping it would silently forget «в печать» because someone
+        pressed `U` on the duplicates screen. The row is deleted only once
+        nothing is left in it.
         """
         self._conn.execute(
-            "DELETE FROM review_decisions WHERE content_hash = ?", (content_hash,)
+            """
+            UPDATE review_decisions
+               SET action = ?, keeper_path = NULL, applied_at = NULL
+             WHERE content_hash = ?
+            """,
+            (GROUP_ACTION_NONE, content_hash),
+        )
+        self._conn.execute(
+            "DELETE FROM review_decisions "
+            "WHERE content_hash = ? AND album_state IS NULL",
+            (content_hash,),
         )
         self._conn.commit()
 
@@ -2233,6 +2311,7 @@ class ScanIndex:
                 SELECT content_hash, action, keeper_path, decided_at, applied_at
                   FROM review_decisions
                  WHERE content_hash IN ({placeholders})
+                   AND action IN ('quarantine', 'keep')
                 """,
                 chunk,
             )
@@ -2272,6 +2351,253 @@ class ScanIndex:
             "WHERE action = 'quarantine' AND applied_at IS NULL"
         ).fetchone()
         return int(row["n"])
+
+    # --- альбомная ось: разбор по одному снимку (задача 24) ---------------
+
+    def record_album_state(self, content_hash: str, state: str) -> None:
+        """Записать (или заменить) решение человека по одному снимку.
+
+        Тот же ключ, что у решения по группе, и та же причина (Р10): это
+        факт про **содержимое**, а не про один прогон скана и не про один
+        путь. Поэтому «в печать», поставленное до переноса в библиотеку,
+        остаётся на снимке после переноса, и после перескана, и после
+        поездки в карантин и обратно — ничего из этого байты не меняет.
+
+        Строка делится с осью групп дублей, решение — нет: вставка ставит
+        `action = GROUP_ACTION_NONE`, а обновление не трогает `action`
+        вовсе. `album_applied_at` сбрасывается в NULL при каждой новой
+        записи: человек передумал, и прошлое «уже перемещено» описывает
+        не это решение.
+        """
+        if state not in ALBUM_STATES:
+            raise ValueError(f"record_album_state: неизвестное состояние {state!r}")
+        if not content_hash:
+            # SQLite не считает NULL нарушением TEXT PRIMARY KEY, так что
+            # пустой ключ тихо завёл бы строку, которую уже ничем не
+            # найти — и решение было бы потеряно ровно тем способом, от
+            # которого Р10 защищает. Найдено на сквозном прогоне: после
+            # переноса `resolve_content_hash` по новому пути отвечает None,
+            # потому что `files` помнит путь до переноса.
+            raise ValueError(
+                "record_album_state: пустой хэш содержимого — решение, "
+                "которому некуда лечь по содержимому, не переживёт перескан (Р10)"
+            )
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO review_decisions (
+                content_hash, action, keeper_path, decided_at, applied_at,
+                album_state, album_decided_at, album_applied_at
+            ) VALUES (?, ?, NULL, ?, NULL, ?, ?, NULL)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                album_state      = excluded.album_state,
+                album_decided_at = excluded.album_decided_at,
+                album_applied_at = NULL
+            """,
+            (content_hash, GROUP_ACTION_NONE, now, state, now),
+        )
+        self._conn.commit()
+
+    def clear_album_state(self, content_hash: str) -> None:
+        """Отмена — клавиша `U` на экране разбора.
+
+        Снимает только альбомную ось и удаляет строку лишь тогда, когда в
+        ней больше нечего хранить, — зеркально `clear_decision`.
+        """
+        self._conn.execute(
+            """
+            UPDATE review_decisions
+               SET album_state = NULL, album_decided_at = NULL,
+                   album_applied_at = NULL
+             WHERE content_hash = ?
+            """,
+            (content_hash,),
+        )
+        self._conn.execute(
+            "DELETE FROM review_decisions WHERE content_hash = ? AND action = ?",
+            (content_hash, GROUP_ACTION_NONE),
+        )
+        self._conn.commit()
+
+    def album_states_for_hashes(self, content_hashes: Iterable[str]) -> dict[str, dict]:
+        """Решения по многим снимкам за один запрос — та же пакетная
+        логика, что у `decisions_for_hashes` и `quality_for_hashes`: альбом
+        на 945 снимков (а такой в библиотеке есть) открывается одним
+        запросом, не девятьюстами.
+
+        Хэша без решения в ответе нет: «не просмотрено» — это отсутствие
+        решения, а не ещё одно решение.
+        """
+        wanted = list(dict.fromkeys(content_hashes))
+        if not wanted:
+            return {}
+        out: dict[str, dict] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self._conn.execute(
+                f"""
+                SELECT content_hash, album_state, album_decided_at, album_applied_at
+                  FROM review_decisions
+                 WHERE content_hash IN ({placeholders})
+                   AND album_state IS NOT NULL
+                """,
+                chunk,
+            )
+            for row in cursor:
+                out[row["content_hash"]] = {
+                    "album_state": row["album_state"],
+                    "album_decided_at": row["album_decided_at"],
+                    "album_applied_at": row["album_applied_at"],
+                }
+        return out
+
+    def mark_album_states_applied(
+        self, content_hashes: Iterable[str], when: float | None = None
+    ) -> None:
+        """Отметить, что «убрать» уже исполнено — файл уехал в карантин.
+
+        Ровно та же роль, что у `mark_decisions_applied`: файла на месте
+        уже нет в любом случае, но только этот вызов сообщает об этом
+        индексу, и только он отличает «в очереди» от «перемещено» при
+        повторном применении или перезагрузке страницы.
+        """
+        rows = [(when if when is not None else time.time(), h) for h in content_hashes]
+        if not rows:
+            return
+        self._conn.executemany(
+            "UPDATE review_decisions SET album_applied_at = ? WHERE content_hash = ?",
+            rows,
+        )
+        self._conn.commit()
+
+    def album_state_counts(self) -> dict:
+        """Сколько снимков в каждом состоянии — и сколько «убрать» ещё
+        ждёт применения. Независимо от альбома и от скана: это и есть
+        ответ на «пережил ли вечер разбора перезапуск»."""
+        counts = {state: 0 for state in ALBUM_STATES}
+        cursor = self._conn.execute(
+            "SELECT album_state, COUNT(*) AS n FROM review_decisions "
+            "WHERE album_state IS NOT NULL GROUP BY album_state"
+        )
+        for row in cursor:
+            counts[row["album_state"]] = int(row["n"])
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM review_decisions "
+            "WHERE album_state = 'drop' AND album_applied_at IS NULL"
+        ).fetchone()
+        counts["drop_pending"] = int(row["n"])
+        return counts
+
+    def pending_drop_hashes(self) -> list[str]:
+        """Хэши, помеченные «убрать» и ещё не перемещённые."""
+        cursor = self._conn.execute(
+            "SELECT content_hash FROM review_decisions "
+            "WHERE album_state = 'drop' AND album_applied_at IS NULL "
+            "ORDER BY content_hash"
+        )
+        return [row["content_hash"] for row in cursor]
+
+    def library_contents(self) -> list[dict]:
+        """Что лежит в собранной библиотеке: путь, хэш содержимого, размер.
+
+        Источник — `library_moves` (задача 22), а не обход диска: там уже
+        записано и куда файл переехал, и какому содержимому он
+        соответствует, и в какой альбом его положил план. Откатанные
+        перемещения исключены — после `rollback_library` файла по этому
+        пути нет.
+
+        Один путь — одна строка: журнал может помнить несколько
+        перемещений в одно и то же место (прогон, откат, повторный
+        прогон), и побеждает последнее по времени, как в
+        `library_origin_of`. Размер берётся по хэшу содержимого из
+        `files`: байт-в-байт равные копии равны и по размеру, поэтому
+        `MIN` здесь — способ получить одно число, а не выбор между
+        разными.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT lm.destination AS destination,
+                   lm.content_key AS content_key,
+                   lm.album       AS album,
+                   (SELECT MIN(f.size) FROM files f
+                     WHERE f.full_hash = lm.content_key) AS size
+              FROM library_moves lm
+             WHERE lm.rolled_back_at IS NULL
+               AND lm.moved_at = (
+                     SELECT MAX(x.moved_at) FROM library_moves x
+                      WHERE x.destination = lm.destination
+                        AND x.rolled_back_at IS NULL
+                   )
+             GROUP BY lm.destination
+             ORDER BY lm.destination
+            """
+        )
+        return [
+            {
+                "destination": row["destination"],
+                "content_key": row["content_key"],
+                "album": row["album"] or "",
+                "size": int(row["size"] or 0),
+            }
+            for row in cursor
+        ]
+
+    def face_counts_for_hashes(self, content_hashes: Iterable[str]) -> dict[str, dict]:
+        """Лица по хэшу содержимого — факты, без политики.
+
+        Отдаются `scanned` (детектор над этим снимком работал — та самая
+        разница, ради которой задача 18 завела `content_face_scans`),
+        число найденных лиц и длинная сторона каждой рамки вместе с
+        масштабом, в котором она измерена. Что считать «крупным лицом» —
+        порог просмотра, и он живёт в `album_review`, а не здесь:
+        хранилище сообщает измеренное, политику применяет тот, кто её
+        формулирует.
+        """
+        wanted = list(dict.fromkeys(h for h in content_hashes if h))
+        if not wanted:
+            return {}
+        out: dict[str, dict] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            for row in self._conn.execute(
+                f"""
+                SELECT content_hash, detect_long_side, faces_found
+                  FROM content_face_scans
+                 WHERE content_hash IN ({placeholders})
+                """,
+                chunk,
+            ):
+                out[row["content_hash"]] = {
+                    "scanned": True,
+                    "detect_long_side": int(row["detect_long_side"]),
+                    "faces": int(row["faces_found"]),
+                    "face_long_sides": [],
+                }
+            for row in self._conn.execute(
+                f"""
+                SELECT content_hash, width, height
+                  FROM content_faces
+                 WHERE content_hash IN ({placeholders})
+                 ORDER BY content_hash, face_index
+                """,
+                chunk,
+            ):
+                entry = out.setdefault(
+                    row["content_hash"],
+                    # A face with no scan row cannot happen through
+                    # `set_faces`, which writes both. If it ever does, the
+                    # face is still a fact — but the scale it was measured
+                    # at is not known, so the policy layer sees 0 and
+                    # counts no prominent faces rather than guessing.
+                    {"scanned": False, "detect_long_side": 0, "faces": 0,
+                     "face_long_sides": []},
+                )
+                entry["face_long_sides"].append(
+                    max(int(row["width"]), int(row["height"]))
+                )
+        return out
 
 
 def _row_to_quality_dict(row: sqlite3.Row) -> dict:

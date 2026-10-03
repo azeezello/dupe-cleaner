@@ -51,7 +51,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable, Mapping
 
 from .archive_classify import MemberTwins, member_twins, verify_members
 # Р8 lives in its own module because `archive_classify` needs the same
@@ -551,6 +551,118 @@ def quarantine_reviewed_groups(
                 confirm_media=confirm_media,
                 keeper_override=keeper_override,
             )
+
+    _append_manifest(quarantine_root, result)
+    return result
+
+
+def quarantine_review_drops(
+    photos: Iterable[Mapping[str, object]],
+    quarantine_root: Path,
+    *,
+    confirm: bool = False,
+) -> QuarantineResult:
+    r"""Задача 24: снимки, которые человек пометил «убрать», уезжают в
+    карантин — и только туда.
+
+    Это третий — и последний — вызывающий `journalled_move`, и он
+    появился именно для того, чтобы второго пути из библиотеки наружу не
+    появилось. Намерение пишется в тот же `journal.jsonl` до операции
+    (Р5), раскладка в карантине та же (зеркало дерева путей, уникальное
+    имя при коллизии), и возвращает файлы тот же `restore_from_journal`,
+    в котором для этого не понадобилось ни одной новой строки, — ровно
+    как задача 4 проверила это для архивов.
+
+    **Ни одного удаления.** Ни здесь, ни в `album_review`, ни в ручке,
+    которая это вызывает. «Удалить навсегда» остаётся действием человека
+    над папкой карантина, который он видит списком; единственное место в
+    проекте, где файл удаляется, — сверенная копия при переезде между
+    томами (`executor._CrossVolume`), и так оно и остаётся.
+
+    `photos` — словари с `path`, `content_hash` и, необязательно, `size`.
+    Не `DuplicateGroup`: здесь нет ни групп, ни хранителя, ни
+    освобождаемого места. Уезжает **сам снимок**, по одному решению
+    человека о нём, и это другая ось, чем Р8.
+
+    `confirm` — тот же обязательный второй шаг, которым этот проект
+    обставляет каждое перемещение медиа, но с другим обоснованием, и
+    стоит сказать с каким. В задаче 12 `confirm_media` защищает от
+    решения, принятого **по группе**: человек подтвердил группу, но не
+    смотрел каждую копию в ней. Здесь он смотрел — экран разбора
+    показывает по одному снимку, и решение «убрать» относится ровно к
+    нему. Поэтому гейт не на файл, а на пачку: пока его нет, ни один
+    снимок не двигается, папка карантина не создаётся, а все решения
+    остаются в очереди (`pending_media_review`), откуда второй вызов с
+    `confirm=True` подхватит их без повторного просмотра — то же
+    поведение, что у неподтверждённой медиа-группы.
+    """
+    result = QuarantineResult()
+    items = [
+        {
+            "path": str(photo.get("path") or ""),
+            "content_hash": str(photo.get("content_hash") or ""),
+            "size": int(photo.get("size") or 0),
+        }
+        for photo in photos
+    ]
+    items = [item for item in items if item["path"]]
+
+    if not confirm:
+        for item in items:
+            result.pending_media_review.append(
+                {
+                    "original": item["path"],
+                    "group_hash": item["content_hash"],
+                    "reason": (
+                        "решение «убрать» записано, но перемещение требует "
+                        "явного подтверждения пачки (confirm=True)"
+                    ),
+                }
+            )
+        return result
+
+    if not items:
+        return result
+
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    journal_path = quarantine_root / JOURNAL_FILENAME
+    with _JournalWriter(journal_path) as journal:
+        for item in items:
+            source = Path(item["path"])
+            if not source.is_file():
+                # Not a failure of the move — the file is simply not where
+                # the library says it is. Reported rather than skipped, for
+                # the same reason `restore_from_journal` reports "gone from
+                # both paths" instead of passing over it: a missing
+                # original is the thing a person needs to be told about.
+                result.failed.append(
+                    {
+                        "original": item["path"],
+                        "quarantined": None,
+                        "group_hash": item["content_hash"],
+                        "error": "файла нет по этому пути",
+                    }
+                )
+                continue
+            size = item["size"] or source.stat().st_size
+            destination, error = _move_one(
+                source,
+                quarantine_root,
+                item["content_hash"],
+                size,
+                journal,
+                extra={"origin": "album_review"},
+            )
+            record = {
+                "original": item["path"],
+                "quarantined": destination,
+                "group_hash": item["content_hash"],
+                "size": size,
+            }
+            if error:
+                result.failed.append({**record, "error": error})
+            else:
+                result.moved.append(record)
 
     _append_manifest(quarantine_root, result)
     return result

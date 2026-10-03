@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,9 @@ import pytest
 from dupecleaner import quarantine as quarantine_module
 from dupecleaner.dedupe import find_duplicate_groups
 from dupecleaner.quarantine import (
+    JOURNAL_FILENAME,
     journal_summary,
+    quarantine_review_drops,
     quarantine_reviewed_groups,
     restore_from_journal,
     run_quarantine,
@@ -525,3 +529,165 @@ def test_journal_summary_reports_moved_then_restored(tmp_tree: Path):
     restore_from_journal(quarantine_dir)
     entries_after = journal_summary(quarantine_dir)
     assert entries_after[0]["status"] == "restored"
+
+
+# --- задача 24: «убрать» ведёт в карантин, и только туда -------------------
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _library(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Три настоящих файла в «собранной библиотеке» и их хэши до всего."""
+    album = tmp_path / "Library" / "2018" / "2018 Novosibirsk"
+    album.mkdir(parents=True)
+    digests = {}
+    for name, payload in (
+        ("IMG_1.jpg", b"\xff\xd8\xff" + b"first photo " * 400),
+        ("IMG_2.jpg", b"\xff\xd8\xff" + b"second photo " * 300),
+        ("IMG_3.jpg", b"\xff\xd8\xff" + b"third photo " * 200),
+    ):
+        (album / name).write_bytes(payload)
+        digests[name] = _sha(album / name)
+    return album, digests
+
+
+def test_a_dropped_photo_is_moved_not_deleted(tmp_path: Path):
+    """Несущий тест пункта 24. На настоящих файлах, с побайтной сверкой:
+    файла нет на исходном пути, он лежит в карантине, и это **те же
+    байты**. Удаления не происходит ни на одном шаге."""
+    album, digests = _library(tmp_path)
+    quarantine_root = tmp_path / "Quarantine"
+
+    result = quarantine_review_drops(
+        [{"path": str(album / "IMG_2.jpg"), "content_hash": "h2", "size": 0}],
+        quarantine_root,
+        confirm=True,
+    )
+
+    assert len(result.moved) == 1
+    assert result.failed == []
+    assert not (album / "IMG_2.jpg").exists()
+    moved_to = Path(result.moved[0]["quarantined"])
+    assert moved_to.is_file()
+    assert _sha(moved_to) == digests["IMG_2.jpg"]
+    # Соседи не тронуты: двигается ровно помеченное.
+    assert _sha(album / "IMG_1.jpg") == digests["IMG_1.jpg"]
+    assert _sha(album / "IMG_3.jpg") == digests["IMG_3.jpg"]
+
+
+def test_a_dropped_photo_comes_back_with_the_same_bytes(tmp_path: Path):
+    """Откат — тот же `restore_from_journal`, что у задач 5, 4 и 12, без
+    единой новой строчки в нём. Это и есть проверка того, что «убрать»
+    пользуется существующей механикой, а не второй своей."""
+    album, digests = _library(tmp_path)
+    quarantine_root = tmp_path / "Quarantine"
+    quarantine_review_drops(
+        [{"path": str(album / "IMG_1.jpg"), "content_hash": "h1"}],
+        quarantine_root,
+        confirm=True,
+    )
+    assert not (album / "IMG_1.jpg").exists()
+
+    restored = restore_from_journal(quarantine_root)
+
+    assert len(restored.restored) == 1
+    assert restored.skipped == []
+    assert (album / "IMG_1.jpg").is_file()
+    assert _sha(album / "IMG_1.jpg") == digests["IMG_1.jpg"]
+
+
+def test_without_confirmation_nothing_moves_and_no_quarantine_is_created(tmp_path: Path):
+    """Тот же приём, которым задача 7 проверяет отказ быстрого режима:
+    не только «не переместил», но и «папку даже не создал». Решения
+    остаются в очереди, а не теряются."""
+    album, digests = _library(tmp_path)
+    quarantine_root = tmp_path / "Quarantine"
+
+    result = quarantine_review_drops(
+        [
+            {"path": str(album / "IMG_1.jpg"), "content_hash": "h1"},
+            {"path": str(album / "IMG_2.jpg"), "content_hash": "h2"},
+        ],
+        quarantine_root,
+    )
+
+    assert result.moved == []
+    assert len(result.pending_media_review) == 2
+    assert not quarantine_root.exists()
+    for name, digest in digests.items():
+        assert _sha(album / name) == digest
+
+
+def test_a_photo_missing_from_its_library_path_is_reported(tmp_path: Path):
+    album, _ = _library(tmp_path)
+    result = quarantine_review_drops(
+        [{"path": str(album / "gone.jpg"), "content_hash": "hX"}],
+        tmp_path / "Quarantine",
+        confirm=True,
+    )
+    assert result.moved == []
+    assert len(result.failed) == 1
+    assert "нет по этому пути" in result.failed[0]["error"]
+
+
+def test_a_drop_writes_the_intent_before_the_move(tmp_path: Path):
+    """Р5 целиком: строка намерения на диске раньше, чем произошло
+    перемещение. Проверяется по журналу, который пишет тот же
+    `journalled_move`, что и остальные два пути в карантин."""
+    album, _ = _library(tmp_path)
+    quarantine_root = tmp_path / "Quarantine"
+    quarantine_review_drops(
+        [{"path": str(album / "IMG_3.jpg"), "content_hash": "h3"}],
+        quarantine_root,
+        confirm=True,
+    )
+    lines = [
+        json.loads(line)
+        for line in (quarantine_root / JOURNAL_FILENAME).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    events = [entry["event"] for entry in lines]
+    assert events == ["move_pending", "move_done"]
+    assert lines[0]["origin"] == "album_review"
+    assert lines[0]["group_hash"] == "h3"
+
+
+def test_the_journal_screen_sees_a_drop_like_any_other_move(tmp_path: Path):
+    album, _ = _library(tmp_path)
+    quarantine_root = tmp_path / "Quarantine"
+    quarantine_review_drops(
+        [{"path": str(album / "IMG_1.jpg"), "content_hash": "h1"}],
+        quarantine_root,
+        confirm=True,
+    )
+    rows = journal_summary(quarantine_root)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "moved"
+
+
+def test_the_drop_path_contains_no_deletion(tmp_path: Path):
+    """Единственное место в проекте, где файл удаляется, — сверенная копия
+    при переезде между томами (пункт 22). Разбор альбома к этому списку не
+    добавляется, и это проверяется по исходнику функции, а не на доверии:
+    `quarantine.py` законно импортирует `shutil` и `os` ради перемещения,
+    поэтому проверять надо тело именно этой функции."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(quarantine_review_drops)
+    tree = ast.parse(textwrap.dedent(source))
+    calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = node.func
+            if isinstance(target, ast.Attribute):
+                calls.add(target.attr)
+            elif isinstance(target, ast.Name):
+                calls.add(target.id)
+
+    for forbidden in ("remove", "unlink", "rmtree", "rmdir", "truncate", "open"):
+        assert forbidden not in calls, forbidden
+    # И наоборот: перемещение идёт через общий journalled-путь, а не своим.
+    assert "_move_one" in calls

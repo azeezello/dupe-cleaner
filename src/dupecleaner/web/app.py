@@ -21,7 +21,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
 
-from .. import thumbnails
+from .. import album_review, thumbnails
 from ..archive_classify import classify_archives
 from ..dedupe import verify_group
 from ..jobs import ScanRegistry
@@ -29,6 +29,7 @@ from ..models import ScanMode
 from ..quarantine import (
     journal_summary,
     quarantine_archives,
+    quarantine_review_drops,
     quarantine_reviewed_groups,
     restore_from_journal,
     run_quarantine,
@@ -99,6 +100,28 @@ class ArchiveActionRequest(BaseModel):
 class RestoreRequest(BaseModel):
     quarantine_dir: str
     op_ids: Optional[list[str]] = None
+
+
+class AlbumStateRequest(BaseModel):
+    """Одно решение по одному снимку (задача 24): «оставить» / «в печать»
+    / «убрать». Другая ось, чем `DecisionRequest` выше: та отвечает, что
+    станет с лишними копиями этих байт, эта — стоит ли снимок хранить и
+    печатать. Один снимок может быть и хранителем группы дублей, и
+    отобранным в печать."""
+
+    content_hash: str
+    path: Optional[str] = None
+    state: str  # "keep" | "print" | "drop"
+
+
+class ApplyDropsRequest(BaseModel):
+    """Пачка «убрать» в карантин. `confirm` обязателен — это тот же
+    второй явный шаг, которым обставлено любое перемещение в этом
+    проекте; `folder` ограничивает применение одним альбомом."""
+
+    quarantine_dir: str
+    confirm: bool = False
+    folder: Optional[str] = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -561,4 +584,170 @@ def scan_similar(
     # нет вовсе, и экран обязан сказать это прямо, а не показать пустой
     # список, который читается как «похожих не нашлось».
     payload["phash_available"] = bool(entries)
+    return payload
+
+
+# --- разбор альбома по одному снимку (задача 24) ----------------------------
+#
+# Ни одна из этих ручек не привязана к `scan_id`, и это то же решение, что
+# у `/api/scan/{id}/similar`, доведённое до конца. Разбор идёт по
+# **собранной библиотеке** (задача 22), а не по отчёту скана: состав
+# альбомов лежит в `library_moves`, метрики — в `content_phashes`
+# (миграция 12), лица — в `content_faces`, решения — в `review_decisions`.
+# Всё это по хэшу содержимого и всё это переживает перезапуск сервера, в
+# отличие от объекта отчёта, который не переживает (см. «Мелочь» в
+# plan.md). Поэтому разбор можно начать в любой момент, не сканируя
+# заново.
+
+
+def _library_rows() -> list[dict]:
+    with ScanIndex(DB_PATH) as index:
+        return index.library_contents()
+
+
+@app.get("/api/library/albums")
+def library_albums():
+    """Папки собранной библиотеки со счётчиками решений.
+
+    Пустой список — не ошибка, а честный ответ «библиотека ещё не
+    собрана»: до задачи 22 в `library_moves` нет ни строки, и экран
+    обязан сказать это прямо, а не показать пустую сетку, которая
+    читается как «альбомов нет». Это та же находка, что у задачи 11 с
+    вкладкой «Обычные файлы».
+    """
+    rows = _library_rows()
+    albums = album_review.group_albums(rows)
+    with ScanIndex(DB_PATH) as index:
+        states = index.album_states_for_hashes(r["content_key"] for r in rows)
+        totals = index.album_state_counts()
+
+    by_folder: dict[str, dict] = {}
+    for album in albums:
+        by_folder[album.folder] = {**album.to_dict(), "states": {"keep": 0, "print": 0, "drop": 0, "none": 0}}
+    for row in rows:
+        folder = album_review.folder_of(row["destination"])
+        entry = by_folder.get(folder)
+        if entry is None:
+            continue
+        state = (states.get(row["content_key"]) or {}).get("album_state") or "none"
+        entry["states"][state] = entry["states"].get(state, 0) + 1
+
+    return {
+        "albums": [by_folder[a.folder] for a in albums],
+        "photos": len(rows),
+        "totals": totals,
+        "formats": [f.to_dict() for f in album_review.PRINT_FORMATS],
+        "states": list(album_review.ALL_STATES),
+        "state_labels": album_review.STATE_LABEL,
+    }
+
+
+@app.get("/api/library/album")
+def library_album(folder: str = Query(..., description="Папка альбома как её вернул /api/library/albums")):
+    """Очередь одного альбома: сетка, порядок и фильтр «не годится для печати».
+
+    `folder` приходит параметром запроса, а не частью пути: путь альбома
+    содержит разделители (`2018\\2018 Novosibirsk`), и собирать его обратно
+    из сегментов URL значило бы угадывать, какой разделитель был в
+    исходном пути — ровно то, от чего `library.join_path` защищается.
+    """
+    rows = _library_rows()
+    photos = album_review.photos_in_album(rows, folder)
+    if not photos:
+        raise HTTPException(404, "Такой папки нет среди альбомов библиотеки.")
+
+    hashes = [p["content_hash"] for p in photos if p["content_hash"]]
+    with ScanIndex(DB_PATH) as index:
+        quality = index.quality_for_hashes(hashes)
+        faces = index.face_counts_for_hashes(hashes)
+        states = index.album_states_for_hashes(hashes)
+
+    name = next(
+        (a.name for a in album_review.group_albums(rows) if a.folder == folder),
+        album_review.basename_of(folder),
+    )
+    queue = album_review.build_album_queue(
+        photos, album=folder, name=name, quality=quality, faces=faces, states=states
+    )
+    payload = queue.to_dict()
+    payload["state_labels"] = album_review.STATE_LABEL
+    return payload
+
+
+@app.post("/api/library/review/state")
+def set_album_state(req: AlbumStateRequest):
+    """Записать решение по снимку. Запись мгновенная и обратимая
+    (`DELETE` ниже); файл от неё не двигается — двигает только
+    `/api/library/review/apply`, пачкой и только то, что помечено
+    «убрать». Тот же разрыв между «решил» и «произошло», который задача
+    12 завела для групп."""
+    if req.state not in album_review.ALL_STATES:
+        raise HTTPException(
+            400,
+            "state должен быть одним из: " + ", ".join(album_review.ALL_STATES),
+        )
+    if not req.content_hash:
+        raise HTTPException(
+            400,
+            "у снимка нет хэша содержимого — решение некуда записать так, чтобы "
+            "оно пережило перескан (Р10). Досчитайте индекс полной обработкой.",
+        )
+    with ScanIndex(DB_PATH) as index:
+        index.record_album_state(req.content_hash, req.state)
+    return {
+        "content_hash": req.content_hash,
+        "state": req.state,
+        "state_label": album_review.STATE_LABEL[req.state],
+    }
+
+
+@app.delete("/api/library/review/state")
+def clear_album_state(content_hash: str = Query(...)):
+    """Отмена — клавиша `U` на экране разбора. Снимает только альбомную
+    ось: решение по группе дублей на том же хэше остаётся как было."""
+    with ScanIndex(DB_PATH) as index:
+        index.clear_album_state(content_hash)
+    return {"content_hash": content_hash, "cleared": True}
+
+
+@app.post("/api/library/review/apply")
+def apply_album_drops(req: ApplyDropsRequest):
+    """Применить «убрать»: пачкой, в карантин, и больше никуда.
+
+    Двигаются только снимки, которые (а) помечены «убрать», (б) ещё не
+    перемещены, (в) лежат в библиотеке по записи задачи 22 — и, если
+    `folder` задан, только из этой папки. Непомеченное не посещается
+    вовсе: итерация идёт по решениям, а не по альбому.
+
+    `confirm=False` ничего не двигает и даже не создаёт папку карантина —
+    решения остаются в очереди, и повторный вызов с `confirm=True`
+    подхватит их без повторного просмотра.
+    """
+    rows = _library_rows()
+    with ScanIndex(DB_PATH) as index:
+        pending = set(index.pending_drop_hashes())
+
+    photos = [
+        {
+            "path": row["destination"],
+            "content_hash": row["content_key"],
+            "size": row["size"],
+        }
+        for row in rows
+        if row["content_key"] in pending
+        and (req.folder is None or album_review.folder_of(row["destination"]) == req.folder)
+    ]
+
+    result = quarantine_review_drops(
+        photos, Path(req.quarantine_dir), confirm=req.confirm
+    )
+    moved_hashes = [m["group_hash"] for m in result.moved if m.get("group_hash")]
+    if moved_hashes:
+        with ScanIndex(DB_PATH) as index:
+            index.mark_album_states_applied(moved_hashes)
+
+    payload = result.to_dict()
+    payload["applied"] = len(moved_hashes)
+    payload["queued"] = len(photos)
+    payload["confirmed"] = req.confirm
     return payload

@@ -38,7 +38,13 @@ from .persons import (
     observation_from_row,
     person_display_name,
 )
-from .quarantine import quarantine_archives, restore_from_journal, run_quarantine
+from .quarantine import (
+    quarantine_archives,
+    quarantine_review_drops,
+    restore_from_journal,
+    run_quarantine,
+)
+from . import album_review
 from .best_copy import rank_copies
 from .library import (
     LibraryLayout,
@@ -1579,6 +1585,194 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    r"""Разбор собранной библиотеки по одному снимку (задача 24).
+
+    Три режима, и ни один из них по умолчанию ничего не двигает:
+
+    - без аргументов — список альбомов со счётчиками решений;
+    - `--album <папка>` — очередь одного альбома с причиной у каждого
+      снимка и отдельным списком «не годится для печати»;
+    - `--apply --quarantine-dir <папка>` — перемещение помеченных
+      «убрать» в карантин, и только после `--confirm`.
+
+    Решения ставятся на экране (`dupecleaner serve`) — там видно сам
+    снимок, а решать «стоит ли печатать» по строке текста нельзя. CLI
+    показывает, что уже решено, и исполняет пачку.
+    """
+    with ScanIndex(args.db) as index:
+        rows = index.library_contents()
+        if not rows:
+            print(
+                "В индексе нет ни одного перемещения в библиотеку: разбор идёт по "
+                "альбомам собранной библиотеки (пункт 22), а она ещё не собрана."
+            )
+            print("Сначала: dupecleaner library --root <папка> --json plan.json, затем build.")
+            return 1
+        totals = index.album_state_counts()
+
+    if args.apply:
+        return _apply_review_drops(args, rows)
+
+    albums = album_review.group_albums(rows)
+
+    if not args.album:
+        print(f"Альбомов в библиотеке: {len(albums)}, снимков: {len(rows)}")
+        print(
+            "Решено: оставить {keep}, в печать {print}, убрать {drop} "
+            "(из них ждут применения {drop_pending})".format(**totals)
+        )
+        print()
+        print("Порог печати при 300 dpi:")
+        for fmt in album_review.PRINT_FORMATS:
+            width, height = fmt.pixels
+            print(
+                f"  {fmt.label:<10} {width}×{height} px = {fmt.megapixels:g} МП"
+            )
+        print()
+        for album in albums:
+            print(f"  {album.photos:>5}  {album.folder}")
+        print()
+        print("Очередь одного альбома: dupecleaner review --album \"<папка>\"")
+        _maybe_write_json(
+            args,
+            {
+                "albums": [a.to_dict() for a in albums],
+                "photos": len(rows),
+                "totals": totals,
+                "formats": [f.to_dict() for f in album_review.PRINT_FORMATS],
+            },
+        )
+        return 0
+
+    photos = album_review.photos_in_album(rows, args.album)
+    if not photos:
+        print(f"Среди альбомов библиотеки нет папки {args.album!r}.")
+        print("Список: dupecleaner review")
+        return 1
+
+    hashes = [p["content_hash"] for p in photos if p["content_hash"]]
+    with ScanIndex(args.db) as index:
+        quality = index.quality_for_hashes(hashes)
+        faces = index.face_counts_for_hashes(hashes)
+        states = index.album_states_for_hashes(hashes)
+
+    name = next((a.name for a in albums if a.folder == args.album), "")
+    queue = album_review.build_album_queue(
+        photos, album=args.album, name=name, quality=quality, faces=faces, states=states
+    )
+    summary = queue.summary()
+
+    print(f"Альбом: {queue.name}")
+    print(f"Папка:  {queue.album}")
+    print(
+        f"Снимков {summary['photos']}: в очереди {summary['queue']}, "
+        f"не годится для печати {summary['unfit']}"
+    )
+    print(
+        "Решено: оставить {keep}, в печать {print}, убрать {drop}, "
+        "не просмотрено {none}".format(**summary["states"])
+    )
+    if summary["unmeasured"]:
+        print(
+            f"Без измеренных метрик: {summary['unmeasured']} — такие снимки стоят в "
+            "конце очереди с пометкой «не измерялось», а не выброшены из неё."
+        )
+    if summary["sharpness_reference"] is None:
+        print(
+            "Резкость с альбомом не сравнивается: измеренных снимков меньше "
+            f"{album_review.MIN_SHARPNESS_SAMPLE}."
+        )
+    else:
+        print(f"Медиана резкости в альбоме: {summary['sharpness_reference']}")
+    print()
+
+    def _line(card: album_review.PhotoCard) -> None:
+        mark = album_review.STATE_LABEL.get(card.state or "", "—")
+        print(f"  [{mark:^9}] {card.name}")
+        print(f"              {card.reason}")
+
+    print("Очередь (годное первым):")
+    for card in queue.queue[: args.limit]:
+        _line(card)
+    if len(queue.queue) > args.limit:
+        print(f"  … и ещё {len(queue.queue) - args.limit}")
+
+    if queue.unfit:
+        print()
+        print("Не годится для печати (отдельный фильтр, не вердикт о снимке):")
+        for card in queue.unfit[: args.limit]:
+            _line(card)
+        if len(queue.unfit) > args.limit:
+            print(f"  … и ещё {len(queue.unfit) - args.limit}")
+
+    print()
+    print(
+        "«Красиво» инструмент не определяет и не пытается: это ранжирование "
+        "очереди и арифметика печати, а не оценка снимка."
+    )
+    _maybe_write_json(args, queue.to_dict())
+    return 0
+
+
+def _apply_review_drops(args: argparse.Namespace, rows: list[dict]) -> int:
+    """Перемещение помеченных «убрать» в карантин — и только туда."""
+    if not args.quarantine_dir:
+        print("Для --apply нужен --quarantine-dir.")
+        return 2
+
+    with ScanIndex(args.db) as index:
+        pending = set(index.pending_drop_hashes())
+
+    photos = [
+        {
+            "path": row["destination"],
+            "content_hash": row["content_key"],
+            "size": row["size"],
+        }
+        for row in rows
+        if row["content_key"] in pending
+        and (not args.album or album_review.folder_of(row["destination"]) == args.album)
+    ]
+
+    if not photos:
+        print("Помеченных «убрать» и ещё не перемещённых снимков нет.")
+        return 0
+
+    if not args.confirm:
+        print(f"Помечено «убрать» и готово к перемещению: {len(photos)}")
+        for photo in photos[: args.limit]:
+            print(f"  {photo['path']}")
+        if len(photos) > args.limit:
+            print(f"  … и ещё {len(photos) - args.limit}")
+        print()
+        print(
+            "Ничего не перемещено: нужен --confirm. Файлы уедут в карантин "
+            "(перемещение с журналом, Р5), откуда их возвращает "
+            "`dupecleaner restore`. Удалить навсегда можно только руками, "
+            "глядя на содержимое карантина."
+        )
+        return 0
+
+    result = quarantine_review_drops(
+        photos, Path(args.quarantine_dir), confirm=True
+    )
+    print(f"Перемещено в карантин: {len(result.moved)}")
+    for item in result.failed:
+        print(f"  не удалось: {item['original']} — {item['error']}")
+
+    moved_hashes = [m["group_hash"] for m in result.moved if m.get("group_hash")]
+    if moved_hashes:
+        with ScanIndex(args.db) as index:
+            index.mark_album_states_applied(moved_hashes)
+    print(
+        "Файлы лежат в карантине, не удалены. Возврат: "
+        f"dupecleaner restore --quarantine-dir {args.quarantine_dir}"
+    )
+    _maybe_write_json(args, result.to_dict())
+    return 0
+
+
 def _print_rollback(outcome, args: argparse.Namespace) -> int:
     summary = outcome.summary()
     print(f"Журнал: {outcome.journal_path}")
@@ -2123,6 +2317,45 @@ def build_parser() -> argparse.ArgumentParser:
     build_p.add_argument("--limit", type=int, default=20, help="Сколько строк распечатать")
     build_p.add_argument("--json", default=None, help="Сохранить итог в JSON")
     build_p.set_defaults(func=_cmd_build)
+
+    review_p = subparsers.add_parser(
+        "review",
+        help="Разбор собранной библиотеки: что оставить, что напечатать, что убрать",
+        description=(
+            "Пункт 24. Очередь на просмотр по альбомам собранной библиотеки "
+            "(пункт 22), с честным фильтром «не годится для печати» по "
+            "мегапикселям. «Красиво» не вычисляется — инструмент сортирует "
+            "очередь и отсекает заведомо непригодное, вердикт выносите вы. "
+            "Решения ставятся на экране (dupecleaner serve); «убрать» ведёт "
+            "в карантин, и только туда."
+        ),
+    )
+    review_p.add_argument(
+        "--album",
+        help="Папка альбома, как её печатает `dupecleaner review` без аргументов",
+    )
+    review_p.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Сколько строк печатать (по умолчанию 40)",
+    )
+    review_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Переместить помеченные «убрать» в карантин (нужен --quarantine-dir)",
+    )
+    review_p.add_argument(
+        "--quarantine-dir",
+        help="Папка карантина для --apply",
+    )
+    review_p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Явный второй шаг: без него --apply только печатает список",
+    )
+    review_p.add_argument("--json", help="Сохранить итог в JSON-файл")
+    review_p.set_defaults(func=_cmd_review)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")

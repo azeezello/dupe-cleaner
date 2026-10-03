@@ -570,7 +570,7 @@ function selectGroupByHash(hash) {
 
 function setActiveTab(tab) {
   activeTab = tab;
-  document.querySelectorAll(".type-tab").forEach((btn) => {
+  document.querySelectorAll("#results .type-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === tab);
   });
   hideGroupDetail();
@@ -969,6 +969,10 @@ function isTypingTarget(target) {
 
 document.addEventListener("keydown", (e) => {
   if (isTypingTarget(e.target)) return;
+  // Экран разбора альбома (задача 24) делит клавиатуру с этим экраном, и
+  // 1-9 там значат другое. Арбитр — последнее место, куда ткнул человек;
+  // см. `reviewIsEngaged`.
+  if (typeof reviewIsEngaged === "function" && reviewIsEngaged()) return;
   if (!currentReport || $("results").hidden) return;
   if (activeTab === "archive") return; // no per-group grid on this tab
   if (activeTab === "similar") {
@@ -1149,7 +1153,7 @@ function renderReport(report) {
     archive: archiveVerdictCount > 0 || buckets.archive.length > 0,
   };
 
-  document.querySelectorAll(".type-tab").forEach((btn) => {
+  document.querySelectorAll("#results .type-tab").forEach((btn) => {
     const tab = btn.dataset.tab;
     // "Похожие" не живут в отчёте: это запрос над отпечатками в индексе,
     // со своим порогом, и до первой загрузки у вкладки нет числа — там
@@ -1173,7 +1177,14 @@ function renderReport(report) {
   refreshQueueSummary();
 }
 
-document.querySelectorAll(".type-tab").forEach((btn) => {
+// Селектор сужен до #results намеренно: экран разбора альбома (задача 24)
+// переиспользует тот же класс `.type-tab` для своих двух вкладок, и
+// неспецифичный селектор вешал на них обработчик отчёта. Он вызывался с
+// `dataset.tab === undefined` и падал внутри `setActiveTab` на
+// `buckets[undefined]`. Поймано jsdom-прогоном поверх настоящего сервера,
+// а не чтением: в консоли это выглядело как одна строка "Uncaught
+// TypeError" без следа, ведущего к вкладкам.
+document.querySelectorAll("#results .type-tab").forEach((btn) => {
   btn.addEventListener("click", () => setActiveTab(btn.dataset.tab));
 });
 
@@ -1406,7 +1417,7 @@ function initSimilarGrid() {
 }
 
 function similarTabCount() {
-  return document.querySelector('.type-tab[data-tab="similar"] .cnt');
+  return document.querySelector('#results .type-tab[data-tab="similar"] .cnt');
 }
 
 // Вызывается при каждом новом отчёте: вкладка обнуляется, но не грузится —
@@ -1887,3 +1898,647 @@ $("similar-filter").addEventListener("change", (e) => {
   if (similarState.loaded) renderSimilar();
 });
 $("similar-detail-close").addEventListener("click", hideSimilarDetail);
+
+// --- разбор альбома: по одному снимку и целиком сеткой (задача 24) ---------
+//
+// Пятый экран, и единственный, который не живёт внутри #results: он не про
+// скан и не про группы дублей, а про альбомы собранной библиотеки (задача
+// 22). Всё, что ему нужно, лежит в индексе по хэшу содержимого — состав
+// альбомов, метрики, лица, решения, — поэтому он открывается без единого
+// скана в этой сессии и переживает перезапуск сервера.
+//
+// Сетка — тот же `createVirtualGrid`, что у задач 11 и 14: разбор это та же
+// механика над другим запросом, а не новый экран с нуля. Клавиатура — та
+// же идея, что у задачи 12 (состояние на индексе сетки, не на DOM-узле), но
+// свои клавиши: 1/2/3 это три состояния снимка, а не выбор хранителя в
+// группе, и путать их нельзя.
+
+const REVIEW_STATE_LABEL = { keep: "оставить", print: "в печать", drop: "убрать" };
+const REVIEW_STATE_KEY = { "1": "keep", "2": "print", "3": "drop" };
+
+let reviewGrid = null;
+const reviewState = {
+  engaged: false,
+  albums: [],
+  folder: null,
+  payload: null,
+  tab: "queue",
+  single: true,
+  index: 0,
+  totals: null,
+};
+
+// Экран разбора и экран дублей слушают одну и ту же клавиатуру, и у них
+// общие клавиши с разным смыслом (1-9 там — «оставить вот эту копию»,
+// 1-3 здесь — «состояние этого снимка»). Арбитр — не фокус на узле (узлы
+// в пуле переиспользуются), а последнее место, куда человек ткнул.
+function reviewIsEngaged() {
+  return reviewState.engaged && Boolean(reviewState.payload);
+}
+
+$("review-card").addEventListener("pointerdown", () => {
+  reviewState.engaged = true;
+});
+$("results").addEventListener("pointerdown", () => {
+  reviewState.engaged = false;
+});
+
+function reviewList() {
+  if (!reviewState.payload) return [];
+  return reviewState.tab === "unfit"
+    ? reviewState.payload.unfit
+    : reviewState.payload.queue;
+}
+
+function reviewCard() {
+  const list = reviewList();
+  if (!list.length) return null;
+  return list[Math.max(0, Math.min(list.length - 1, reviewState.index))] || null;
+}
+
+function reviewQuarantineDir() {
+  return $("review-quarantine-dir").value.trim();
+}
+
+// Та же папка карантина, что у экрана дублей, и та же запись в
+// localStorage: две копии одного значения разошлись бы ровно в тот момент,
+// когда человек поправил одну из них.
+try {
+  const savedDir = localStorage.getItem(QDIR_STORAGE_KEY);
+  if (savedDir) $("review-quarantine-dir").value = savedDir;
+} catch {
+  /* приватный режим — начинаем с пустого, как и экран дублей */
+}
+$("review-quarantine-dir").addEventListener("change", () => {
+  const value = reviewQuarantineDir();
+  try {
+    localStorage.setItem(QDIR_STORAGE_KEY, value);
+  } catch {
+    /* non-fatal */
+  }
+  const other = $("quarantine-dir");
+  if (other && !other.value.trim()) other.value = value;
+});
+
+async function loadReviewAlbums() {
+  const status = $("review-status");
+  status.textContent = "Читаю индекс…";
+  let data;
+  try {
+    const resp = await fetch("/api/library/albums");
+    if (!resp.ok) throw new Error(await resp.text());
+    data = await resp.json();
+  } catch (err) {
+    status.textContent = `Не удалось прочитать альбомы: ${err.message}`;
+    return;
+  }
+
+  reviewState.albums = data.albums || [];
+  reviewState.totals = data.totals || null;
+  renderReviewPrintNote(data.formats || []);
+
+  if (!reviewState.albums.length) {
+    // Пустой список — честный ответ «библиотека ещё не собрана», а не
+    // пустая сетка: та читалась бы как «альбомов нет», что ровно наоборот
+    // (находка задачи 11 про вкладку «Обычные файлы»).
+    status.textContent =
+      "В индексе нет ни одного перемещения в библиотеку — разбор идёт по альбомам " +
+      "собранной библиотеки (пункт 22), а она ещё не собрана.";
+    $("review-album").hidden = true;
+    $("review-body").hidden = true;
+    return;
+  }
+
+  const select = $("review-album");
+  select.innerHTML = "";
+  reviewState.albums.forEach((album) => {
+    const option = document.createElement("option");
+    option.value = album.folder;
+    const decided = album.photos - (album.states.none || 0);
+    option.textContent = `${album.name} — ${album.photos} снимков` +
+      (decided ? ` (решено ${decided})` : "");
+    select.appendChild(option);
+  });
+  select.hidden = false;
+
+  const totals = data.totals || {};
+  status.textContent =
+    `Альбомов ${reviewState.albums.length}, снимков ${data.photos}. ` +
+    `Решено: оставить ${totals.keep || 0}, в печать ${totals.print || 0}, ` +
+    `убрать ${totals.drop || 0} (ждут перемещения ${totals.drop_pending || 0}).`;
+
+  await loadReviewAlbum(select.value);
+}
+
+function renderReviewPrintNote(formats) {
+  if (!formats.length) {
+    $("review-print-note").textContent = "";
+    return;
+  }
+  const parts = formats.map(
+    (f) => `${f.label} — ${f.megapixels} МП (${f.width_px}×${f.height_px})`
+  );
+  $("review-print-note").textContent =
+    "Порог печати считается, а не берётся из таблицы: " + parts.join(", ") +
+    " при 300 dpi. Снимок, которому не хватает и на самый мелкий формат, уходит " +
+    "в отдельный фильтр, а не вниз очереди.";
+}
+
+async function loadReviewAlbum(folder) {
+  const status = $("review-status");
+  let data;
+  try {
+    const resp = await fetch(`/api/library/album?folder=${encodeURIComponent(folder)}`);
+    if (!resp.ok) throw new Error(await resp.text());
+    data = await resp.json();
+  } catch (err) {
+    status.textContent = `Не удалось открыть альбом: ${err.message}`;
+    return;
+  }
+  reviewState.folder = folder;
+  reviewState.payload = data;
+  reviewState.index = 0;
+  setReviewTab("queue");
+  $("review-body").hidden = false;
+}
+
+function renderReviewSummary() {
+  const payload = reviewState.payload;
+  if (!payload) return;
+  const s = payload.summary;
+  const bits = [
+    `Снимков ${s.photos}: в очереди ${s.queue}, не годится для печати ${s.unfit}.`,
+    `Решено: оставить ${s.states.keep}, в печать ${s.states.print}, ` +
+      `убрать ${s.states.drop}; не просмотрено ${s.states.none}.`,
+  ];
+  if (s.unmeasured) {
+    bits.push(
+      `Без измеренных метрик ${s.unmeasured} — они стоят в конце очереди с пометкой ` +
+      `«не измерялось», а не выброшены из неё.`
+    );
+  }
+  if (s.sharpness_reference === null) {
+    bits.push("Резкость с альбомом не сравнивается: измеренных снимков слишком мало.");
+  } else {
+    bits.push(`Медиана резкости в альбоме — ${s.sharpness_reference}.`);
+  }
+  $("review-summary").textContent = bits.join(" ");
+
+  const queueTab = document.querySelector('.type-tab[data-rtab="queue"] .cnt');
+  const unfitTab = document.querySelector('.type-tab[data-rtab="unfit"] .cnt');
+  if (queueTab) queueTab.textContent = String(s.queue);
+  if (unfitTab) unfitTab.textContent = String(s.unfit);
+
+  $("review-drop-count").textContent = s.drop_pending
+    ? `Помечено «убрать» и ждёт перемещения в этом альбоме: ${s.drop_pending}.`
+    : "Помеченных «убрать» в этом альбоме нет.";
+}
+
+function setReviewTab(tab) {
+  reviewState.tab = tab;
+  reviewState.index = 0;
+  document.querySelectorAll(".type-tab[data-rtab]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.rtab === tab);
+  });
+  renderReviewSummary();
+  renderReviewList();
+}
+
+function renderReviewList() {
+  const list = reviewList();
+  $("review-empty").hidden = list.length > 0;
+  if (!list.length) {
+    $("review-empty").textContent =
+      reviewState.tab === "unfit"
+        ? "Непригодных для печати в этом альбоме нет — ни у одного снимка разрешение не оказалось ниже порога."
+        : "В очереди нет снимков.";
+  }
+  if (reviewState.single) {
+    renderReviewSingle();
+  } else {
+    const g = initReviewGrid();
+    g.setItems(list);
+    if (list.length) g.setActive(reviewState.index);
+  }
+}
+
+function toggleReviewView(single) {
+  reviewState.single = single;
+  $("review-single").hidden = !single;
+  $("review-grid-card").hidden = single;
+  $("review-view-btn").textContent = single ? "Сеткой (G)" : "По одному (G)";
+  renderReviewList();
+}
+
+function initReviewGrid() {
+  if (reviewGrid) return reviewGrid;
+  reviewGrid = createVirtualGrid({
+    viewport: $("review-viewport"),
+    sizer: $("review-sizer"),
+    pool: $("review-pool"),
+    tileWidth: 168,
+    tileHeight: 206,
+    gap: 9,
+    overscan: 3,
+    renderTile: renderReviewTile,
+  });
+  return reviewGrid;
+}
+
+function reviewThumbUrl(card) {
+  // store=0 по той же причине, что и на вкладке похожих (задача 14):
+  // отпечатки и метрики есть у всей библиотеки, а кэш превью на 512 МБ
+  // (Р9) рассчитан на группы дублей. Разбор тридцати тысяч снимков
+  // вытеснил бы из него именно то, за чем он нужен.
+  return `/api/thumbnail?path=${encodeURIComponent(card.path)}` +
+    `&hash=${encodeURIComponent(card.content_hash)}&store=0`;
+}
+
+function renderReviewTile(node, card) {
+  node.dataset.hash = card.content_hash;
+  node.setAttribute("aria-label", `${card.name}. ${card.reason}`);
+
+  let refs = node._reviewRefs;
+  if (!refs) {
+    const thumb = document.createElement("div");
+    thumb.className = "tile-thumb";
+    const badge = document.createElement("div");
+    badge.className = "tile-decision-badge";
+    const info = document.createElement("div");
+    info.className = "tile-info";
+    const nameEl = document.createElement("div");
+    nameEl.className = "tile-size";
+    const whyEl = document.createElement("div");
+    whyEl.className = "tile-keeper";
+    info.appendChild(nameEl);
+    info.appendChild(whyEl);
+    node.appendChild(thumb);
+    node.appendChild(badge);
+    node.appendChild(info);
+    refs = { thumb, badge, nameEl, whyEl };
+    node._reviewRefs = refs;
+    node.addEventListener("click", () => selectReviewByHash(node.dataset.hash));
+    node.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        selectReviewByHash(node.dataset.hash);
+        toggleReviewView(true);
+      }
+    });
+  }
+
+  refs.thumb.className = "tile-thumb";
+  refs.thumb.innerHTML = "";
+  if (IMAGE_RE.test(card.name)) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = reviewThumbUrl(card);
+    img.addEventListener(
+      "error",
+      () => {
+        refs.thumb.className = "tile-thumb no-preview kind-generic";
+        refs.thumb.innerHTML = "";
+        const ext = document.createElement("div");
+        ext.className = "tile-ext";
+        ext.textContent = (card.name.split(".").pop() || "").toUpperCase();
+        refs.thumb.appendChild(ext);
+      },
+      { once: true }
+    );
+    refs.thumb.appendChild(img);
+  } else {
+    refs.thumb.className = "tile-thumb no-preview kind-generic";
+    const ext = document.createElement("div");
+    ext.className = "tile-ext";
+    ext.textContent = (card.name.split(".").pop() || "").toUpperCase();
+    refs.thumb.appendChild(ext);
+  }
+
+  if (card.state) {
+    refs.badge.hidden = false;
+    refs.badge.textContent =
+      REVIEW_STATE_LABEL[card.state] + (card.applied_at ? " ✓" : "");
+    refs.badge.className = `tile-decision-badge review-${card.state}`;
+  } else {
+    refs.badge.hidden = true;
+  }
+
+  refs.nameEl.textContent = card.name;
+  refs.whyEl.textContent = card.print.text;
+  refs.whyEl.title = card.reason;
+  node.classList.toggle("review-unfit", card.print.unfit);
+}
+
+function selectReviewByHash(hash) {
+  const list = reviewList();
+  const idx = list.findIndex((c) => c.content_hash === hash);
+  if (idx < 0) return;
+  reviewState.index = idx;
+  if (reviewGrid && !reviewState.single) reviewGrid.setActive(idx);
+  if (reviewState.single) renderReviewSingle();
+  $("review-state-status").textContent = "";
+}
+
+function renderReviewSingle() {
+  const list = reviewList();
+  const card = reviewCard();
+  const img = $("review-photo");
+  const fallback = $("review-fallback");
+
+  if (!card) {
+    img.hidden = true;
+    fallback.hidden = false;
+    fallback.textContent = "Нечего показывать.";
+    $("review-position").textContent = "";
+    $("review-name").textContent = "";
+    $("review-path").textContent = "";
+    $("review-reason").textContent = "";
+    $("review-print").textContent = "";
+    $("review-metrics").innerHTML = "";
+    return;
+  }
+
+  img.hidden = false;
+  fallback.hidden = true;
+  img.src = reviewThumbUrl(card);
+  img.onerror = () => {
+    img.hidden = true;
+    fallback.hidden = false;
+    fallback.textContent = "Превью не построилось — файл на месте, показать его нечем.";
+  };
+
+  $("review-position").textContent =
+    `${reviewState.index + 1} из ${list.length}` +
+    (reviewState.tab === "unfit" ? " · фильтр «не годится для печати»" : "");
+  $("review-name").textContent = card.name;
+  $("review-path").textContent = card.path;
+  $("review-reason").textContent = card.reason;
+  $("review-print").textContent = card.print.text;
+  $("review-print").className = "review-print" + (card.print.unfit ? " unfit" : "");
+
+  const metrics = $("review-metrics");
+  metrics.innerHTML = "";
+  const rows = [
+    ["Разрешение", card.width && card.height
+      ? `${card.width}×${card.height} (${card.megapixels} МП)`
+      : "не измерялось"],
+    ["Резкость", card.sharpness === null ? "не измерялась" : String(card.sharpness)],
+    ["Следы пережатия", card.recompression === null
+      ? "не измерялись"
+      : `${card.recompression}` +
+        (card.jpeg_quality ? ` (качество JPEG ≈${card.jpeg_quality})` : "")],
+    ["Лица в кадре", card.faces_scanned
+      ? `${card.faces}, из них крупных ${card.prominent_faces}`
+      : "детектор по этому снимку не работал"],
+    ["Хэш содержимого", card.content_hash.slice(0, 16)],
+  ];
+  rows.forEach(([label, value]) => {
+    const li = document.createElement("li");
+    const strong = document.createElement("strong");
+    strong.textContent = label + ": ";
+    li.appendChild(strong);
+    li.appendChild(document.createTextNode(value));
+    metrics.appendChild(li);
+  });
+
+  document.querySelectorAll("#review-states .btn-decide[data-state]").forEach((btn) => {
+    btn.classList.toggle("chosen", card.state === btn.dataset.state);
+  });
+  $("review-undo-btn").hidden = !card.state;
+  $("review-state-status").textContent = card.state
+    ? `Решено: ${REVIEW_STATE_LABEL[card.state]}` +
+      (card.applied_at ? " — файл уже в карантине." : " — файл пока на месте.")
+    : "Не просмотрено.";
+}
+
+// Счётчики пересчитываются из самих карточек, а не инкрементируются:
+// пачка меняет сотни состояний, и сложение «было плюс одно» разошлось бы
+// с правдой на первой же неудачной записи.
+function recountReviewStates() {
+  if (!reviewState.payload) return;
+  const s = reviewState.payload.summary;
+  const counts = { keep: 0, print: 0, drop: 0, none: 0 };
+  let dropPending = 0;
+  [...reviewState.payload.queue, ...reviewState.payload.unfit].forEach((c) => {
+    counts[c.state || "none"] += 1;
+    if (c.state === "drop" && !c.applied_at) dropPending += 1;
+  });
+  s.states = counts;
+  s.reviewed = s.photos - counts.none;
+  s.drop_pending = dropPending;
+}
+
+function applyLocalState(card, state) {
+  card.state = state;
+  card.applied_at = null;
+  recountReviewStates();
+}
+
+async function setReviewCardState(card, state) {
+  if (!card) return;
+  try {
+    const resp = await fetch("/api/library/review/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content_hash: card.content_hash,
+        path: card.path,
+        state,
+      }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+  } catch (err) {
+    $("review-state-status").textContent = `Решение не записано: ${err.message}`;
+    return;
+  }
+  applyLocalState(card, state);
+  afterReviewDecision();
+}
+
+async function clearReviewCardState(card) {
+  if (!card || !card.state) return;
+  try {
+    const resp = await fetch(
+      `/api/library/review/state?content_hash=${encodeURIComponent(card.content_hash)}`,
+      { method: "DELETE" }
+    );
+    if (!resp.ok) throw new Error(await resp.text());
+  } catch (err) {
+    $("review-state-status").textContent = `Отмена не прошла: ${err.message}`;
+    return;
+  }
+  applyLocalState(card, null);
+  renderReviewSummary();
+  if (reviewGrid && !reviewState.single) reviewGrid.refresh();
+  if (reviewState.single) renderReviewSingle();
+}
+
+function afterReviewDecision() {
+  renderReviewSummary();
+  if (reviewGrid && !reviewState.single) reviewGrid.refresh();
+  // Автопереход к следующему снимку — та же механика, что у задачи 12:
+  // решение по одному снимку и есть единица работы, и возвращаться к
+  // решённому незачем. На последнем остаёмся.
+  const list = reviewList();
+  if (reviewState.index < list.length - 1) {
+    reviewState.index += 1;
+    if (reviewGrid && !reviewState.single) reviewGrid.setActive(reviewState.index);
+  }
+  if (reviewState.single) renderReviewSingle();
+}
+
+async function batchReview(state) {
+  const list = reviewList();
+  if (!list.length) return;
+  const status = $("review-batch-status");
+  status.textContent = `Отмечаю ${list.length}…`;
+  let done = 0;
+  for (const card of list) {
+    try {
+      const resp = await fetch("/api/library/review/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content_hash: card.content_hash,
+          path: card.path,
+          state,
+        }),
+      });
+      if (!resp.ok) continue;
+      card.state = state;
+      card.applied_at = null;
+      done += 1;
+    } catch {
+      /* одна неудача не отменяет остальные — счётчик скажет правду */
+    }
+  }
+  recountReviewStates();
+  status.textContent =
+    `Отмечено «${REVIEW_STATE_LABEL[state]}»: ${done} из ${list.length}. ` +
+    "Файлы не двигались — для этого есть кнопка ниже.";
+  renderReviewSummary();
+  if (reviewGrid && !reviewState.single) reviewGrid.refresh();
+  if (reviewState.single) renderReviewSingle();
+}
+
+async function applyReviewDrops() {
+  const status = $("review-apply-status");
+  const out = $("review-apply-result");
+  out.className = "verify-result";
+  out.textContent = "";
+  const dir = reviewQuarantineDir();
+  if (!dir) {
+    status.textContent = "Укажите папку карантина.";
+    return;
+  }
+  if (!$("review-confirm").checked) {
+    status.textContent =
+      "Нужен явный второй шаг: поставьте галочку подтверждения. Без неё " +
+      "ни один файл не двинется и папка карантина даже не создастся.";
+    return;
+  }
+  status.textContent = "Перемещаю…";
+  let data;
+  try {
+    const resp = await fetch("/api/library/review/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        quarantine_dir: dir,
+        confirm: true,
+        folder: $("review-apply-album").checked ? reviewState.folder : null,
+      }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    data = await resp.json();
+  } catch (err) {
+    status.textContent = `Не получилось: ${err.message}`;
+    return;
+  }
+
+  status.textContent =
+    `Перемещено в карантин: ${data.applied} из ${data.queued}. ` +
+    "Файлы не удалены — вернуть их можно на экране журнала.";
+  if (data.failed && data.failed.length) {
+    const ul = document.createElement("ul");
+    data.failed.forEach((item) => {
+      const li = document.createElement("li");
+      li.textContent = `${item.original} — ${item.error}`;
+      ul.appendChild(li);
+    });
+    out.appendChild(ul);
+  }
+  $("review-confirm").checked = false;
+  await loadReviewAlbum(reviewState.folder);
+}
+
+function handleReviewKey(e) {
+  const list = reviewList();
+  if (!list.length) return;
+  const cols = reviewState.single ? 1 : (reviewGrid ? reviewGrid.columns || 1 : 1);
+
+  const moveTo = (idx) => {
+    reviewState.index = Math.max(0, Math.min(list.length - 1, idx));
+    if (reviewGrid && !reviewState.single) reviewGrid.setActive(reviewState.index);
+    if (reviewState.single) renderReviewSingle();
+  };
+
+  switch (e.key) {
+    case "ArrowRight":
+      e.preventDefault();
+      moveTo(reviewState.index + 1);
+      return;
+    case "ArrowLeft":
+      e.preventDefault();
+      moveTo(reviewState.index - 1);
+      return;
+    case "ArrowDown":
+      e.preventDefault();
+      moveTo(reviewState.index + cols);
+      return;
+    case "ArrowUp":
+      e.preventDefault();
+      moveTo(reviewState.index - cols);
+      return;
+    case "g":
+    case "G":
+      e.preventDefault();
+      toggleReviewView(!reviewState.single);
+      return;
+    case "u":
+    case "U":
+      e.preventDefault();
+      clearReviewCardState(reviewCard());
+      return;
+    default:
+      break;
+  }
+
+  const state = REVIEW_STATE_KEY[e.key];
+  if (state) {
+    e.preventDefault();
+    setReviewCardState(reviewCard(), state);
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (isTypingTarget(e.target)) return;
+  if (!reviewIsEngaged()) return;
+  handleReviewKey(e);
+});
+
+$("review-load-btn").addEventListener("click", loadReviewAlbums);
+$("review-album").addEventListener("change", (e) => loadReviewAlbum(e.target.value));
+$("review-view-btn").addEventListener("click", () => toggleReviewView(!reviewState.single));
+document.querySelectorAll(".type-tab[data-rtab]").forEach((btn) => {
+  btn.addEventListener("click", () => setReviewTab(btn.dataset.rtab));
+});
+document.querySelectorAll("#review-states .btn-decide[data-state]").forEach((btn) => {
+  btn.addEventListener("click", () => setReviewCardState(reviewCard(), btn.dataset.state));
+});
+$("review-undo-btn").addEventListener("click", () => clearReviewCardState(reviewCard()));
+document.querySelectorAll(".review-batch button[data-batch]").forEach((btn) => {
+  btn.addEventListener("click", () => batchReview(btn.dataset.batch));
+});
+$("review-apply-btn").addEventListener("click", applyReviewDrops);
