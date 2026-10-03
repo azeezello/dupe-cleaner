@@ -24,6 +24,7 @@ earlier scan can never resurrect as phantom duplicates.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections import defaultdict
@@ -464,8 +465,40 @@ _MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
         confirmed_at REAL NOT NULL
     );
     """,
-    # 11 belongs to задача 21; see SCHEMA_VERSION above for why it is skipped
-    # rather than renumbered.
+    # 11 was held for the library work (задачи 21 and 22) while задача 17
+    # took 12, so the two sessions could not claim one number. задача 22
+    # fills it: where a file came from, in a table that can be queried.
+    #
+    # Keyed by `op_id`, which is the journal's own identifier for the
+    # operation, because the journal — not this table — is the source of
+    # truth for an interrupted run (Р5, задача 5). A row here is written
+    # *after* the move succeeded, so a process killed mid-move leaves the
+    # journal with a `move_pending` and this table with nothing, and the
+    # rollback still works: it reads the journal. What the table adds is the
+    # half of Р5 the journal cannot give — "исходный путь сохраняется и в
+    # базе" as something answerable about one file in the library, without
+    # replaying thirty thousand journal lines. `also_at` is the rest of
+    # Р5's provenance: every other place the same bytes were found, which
+    # after the move is recoverable from nowhere else (it is also written
+    # into the XMP sidecar, so losing the index does not lose it either).
+    11: """
+    CREATE TABLE IF NOT EXISTS library_moves (
+        op_id          TEXT PRIMARY KEY,
+        content_key    TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        destination    TEXT NOT NULL,
+        also_at        TEXT NOT NULL DEFAULT '[]',
+        album          TEXT,
+        transfer       TEXT NOT NULL,
+        sidecar        TEXT,
+        moved_at       REAL NOT NULL,
+        rolled_back_at REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_library_moves_destination
+        ON library_moves(destination);
+    CREATE INDEX IF NOT EXISTS idx_library_moves_content
+        ON library_moves(content_key);
+    """,
     12: _migrate_v12_similar_quality,
 }
 
@@ -2027,6 +2060,118 @@ class ScanIndex:
     # kept), or keep everything and move on. Recording one is deliberately
     # cheap and separate from acting on it — задача 12's whole point is a
     # gap between "reviewed" and "moved" that today does not exist.
+
+    # --- задача 22: where a file in the library came from ------------------
+
+    def record_library_move(
+        self,
+        *,
+        op_id: str,
+        content_key: str,
+        source: str,
+        destination: str,
+        also_at: Iterable[str] = (),
+        album: str = "",
+        transfer: str = "rename",
+        sidecar: str | None = None,
+        moved_at: float | None = None,
+    ) -> None:
+        """Record one completed library move (Р5: "исходный путь
+        сохраняется и в базе, и в XMP").
+
+        Called after the move has happened and the sidecar is written, so a
+        row here means "this file is in the library and here is where it
+        used to be". A crash before this call is not a hole: the journal
+        already has the operation under the same `op_id`, and the rollback
+        reads the journal.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO library_moves (
+                op_id, content_key, source, destination, also_at, album,
+                transfer, sidecar, moved_at, rolled_back_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(op_id) DO UPDATE SET
+                content_key    = excluded.content_key,
+                source         = excluded.source,
+                destination    = excluded.destination,
+                also_at        = excluded.also_at,
+                album          = excluded.album,
+                transfer       = excluded.transfer,
+                sidecar        = excluded.sidecar,
+                moved_at       = excluded.moved_at,
+                rolled_back_at = NULL
+            """,
+            (
+                op_id,
+                content_key,
+                source,
+                destination,
+                json.dumps(list(also_at), ensure_ascii=False),
+                album,
+                transfer,
+                sidecar,
+                moved_at if moved_at is not None else time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def mark_library_move_rolled_back(self, op_id: str, when: float | None = None) -> None:
+        """Stamp a move as undone instead of deleting the row: a library
+        that was built and rolled back is a thing that happened, and the
+        next plan is allowed to know it."""
+        self._conn.execute(
+            "UPDATE library_moves SET rolled_back_at = ? WHERE op_id = ?",
+            (when if when is not None else time.time(), op_id),
+        )
+        self._conn.commit()
+
+    def library_moves(self, *, include_rolled_back: bool = True) -> list[dict]:
+        where = "" if include_rolled_back else " WHERE rolled_back_at IS NULL"
+        cursor = self._conn.execute(
+            f"""
+            SELECT op_id, content_key, source, destination, also_at, album,
+                   transfer, sidecar, moved_at, rolled_back_at
+              FROM library_moves{where}
+             ORDER BY moved_at
+            """
+        )
+        return [self._library_move_row(row) for row in cursor]
+
+    def library_origin_of(self, destination: str) -> dict | None:
+        """Where the file now sitting at `destination` came from — the
+        question the index exists to answer after the move."""
+        row = self._conn.execute(
+            """
+            SELECT op_id, content_key, source, destination, also_at, album,
+                   transfer, sidecar, moved_at, rolled_back_at
+              FROM library_moves
+             WHERE destination = ?
+             ORDER BY moved_at DESC
+             LIMIT 1
+            """,
+            (destination,),
+        ).fetchone()
+        return self._library_move_row(row) if row else None
+
+    @staticmethod
+    def _library_move_row(row) -> dict:
+        try:
+            also_at = json.loads(row["also_at"] or "[]")
+        except json.JSONDecodeError:
+            also_at = []
+        return {
+            "op_id": row["op_id"],
+            "content_key": row["content_key"],
+            "source": row["source"],
+            "destination": row["destination"],
+            "also_at": also_at,
+            "album": row["album"],
+            "transfer": row["transfer"],
+            "sidecar": row["sidecar"],
+            "moved_at": row["moved_at"],
+            "rolled_back_at": row["rolled_back_at"],
+        }
 
     def record_decision(
         self, content_hash: str, action: str, keeper_path: str | None = None

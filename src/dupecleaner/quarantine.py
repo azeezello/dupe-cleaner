@@ -51,6 +51,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .archive_classify import MemberTwins, member_twins, verify_members
 # Р8 lives in its own module because `archive_classify` needs the same
@@ -136,6 +137,19 @@ class RestoreResult:
             "restored": self.restored,
             "skipped": self.skipped,
         }
+
+
+class MoveRefused(Exception):
+    """A mover declined to finish a move for a reason that is not an OS
+    error.
+
+    Exactly one thing raises it today: задача 22's cross-volume copy, when
+    the hash of the copy does not match the hash of the source. That is not
+    a filesystem failure — every call succeeded — but it is emphatically a
+    failed move, and the source must stay where it is. `journalled_move`
+    treats it exactly like an `OSError`: a `move_failed` line in the
+    journal, and the caller told about it.
+    """
 
 
 class _JournalWriter:
@@ -246,29 +260,58 @@ def _unique_destination(directory: Path, filename: str) -> Path:
         n += 1
 
 
-def _move_one(
-    source: Path,
-    quarantine_root: Path,
-    group_hash: str | None,
-    size: int,
-    journal: _JournalWriter,
-    extra: dict | None = None,
-) -> tuple[str, str | None]:
-    """Move one file into quarantine, journalling the intent first.
+@dataclass(frozen=True)
+class JournalledMove:
+    """What `journalled_move` did: which operation id it is on the record
+    under, where the file was supposed to end up, and why it did not if it
+    did not."""
 
-    Returns `(destination, error_or_None)` and appends nothing to any
-    result — the caller decides where the outcome is recorded, which is
-    what lets a duplicate file and a whole redundant archive (Р1) take the
-    same journalled path and therefore be undone by the same `restore`.
+    op_id: str
+    destination: str
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def journalled_move(
+    source: Path,
+    destination: Path,
+    journal: _JournalWriter,
+    *,
+    group_hash: str | None = None,
+    size: int = 0,
+    extra: dict | None = None,
+    mover: "Callable[[Path, Path], None] | None" = None,
+) -> JournalledMove:
+    """Write the intent, then do the move. In that order, always.
+
+    This is the whole of Р5's "каждая операция пишется в журнал до её
+    выполнения", and it is one function on purpose. Three callers now share
+    it — a duplicate file and a whole redundant archive going into
+    quarantine (задачи 5, 4, 12) and a file taking its place in the library
+    (задача 22) — and they share it so that there is exactly one place where
+    the order of those two steps is decided, and exactly one journal format
+    to read back. A second implementation of this pattern would be a second
+    chance to get the order wrong, and the order is the entire guarantee:
+    a process killed between the two lines leaves a `move_pending` with no
+    outcome, which is precisely what tells a later rollback to go and look
+    at both paths instead of assuming.
+
+    The destination is the caller's business — quarantine mirrors the source
+    tree under its own root, the library takes the path the plan printed —
+    so nothing here computes or creates it. `mover` likewise defaults to
+    `shutil.move` and is swappable, which is how a cross-volume transfer
+    gets to copy, verify and only then delete (see
+    `executor._CrossVolume`): the journalling does not change, only the
+    mechanics of the move itself.
 
     `extra` is merged into the `move_pending` line, so anything the caller
-    wants on the record *before* the move happens — such as how many twins
-    were re-verified for an archive — is durable even if the process dies
-    during the move itself.
+    wants durable *before* the move happens — how many twins were
+    re-verified for an archive, which album a photograph is joining — is on
+    disk even if the process dies during the move.
     """
-    mirrored = _mirrored_destination(quarantine_root, source)
-    destination = _unique_destination(mirrored.parent, mirrored.name)
-
     op_id = uuid.uuid4().hex
     entry = {
         "op_id": op_id,
@@ -284,15 +327,51 @@ def _move_one(
     journal.write(entry)
 
     try:
-        shutil.move(str(source), str(destination))
-    except OSError as exc:
+        (mover or _rename_mover)(source, destination)
+    except (OSError, MoveRefused) as exc:
         journal.write(
             {"op_id": op_id, "event": "move_failed", "ts": time.time(), "error": str(exc)}
         )
-        return str(destination), str(exc)
+        return JournalledMove(op_id=op_id, destination=str(destination), error=str(exc))
 
     journal.write({"op_id": op_id, "event": "move_done", "ts": time.time()})
-    return str(destination), None
+    return JournalledMove(op_id=op_id, destination=str(destination))
+
+
+def _rename_mover(source: Path, destination: Path) -> None:
+    shutil.move(str(source), str(destination))
+
+
+def _move_one(
+    source: Path,
+    quarantine_root: Path,
+    group_hash: str | None,
+    size: int,
+    journal: _JournalWriter,
+    extra: dict | None = None,
+) -> tuple[str, str | None]:
+    """Move one file into quarantine, journalling the intent first.
+
+    Returns `(destination, error_or_None)` and appends nothing to any
+    result — the caller decides where the outcome is recorded, which is
+    what lets a duplicate file and a whole redundant archive (Р1) take the
+    same journalled path and therefore be undone by the same `restore`.
+
+    The quarantine layout (mirror the source tree, rename on collision)
+    lives here; the append-before-execute part lives in `journalled_move`,
+    which задача 22 reuses verbatim.
+    """
+    mirrored = _mirrored_destination(quarantine_root, source)
+    destination = _unique_destination(mirrored.parent, mirrored.name)
+    outcome = journalled_move(
+        source,
+        destination,
+        journal,
+        group_hash=group_hash,
+        size=size,
+        extra=extra,
+    )
+    return outcome.destination, outcome.error
 
 
 def quarantine_group(
@@ -612,6 +691,16 @@ def journal_summary(quarantine_root: Path) -> list[dict]:
         )
     rows.sort(key=lambda r: r.get("ts") or 0, reverse=True)
     return rows
+
+
+#: The journal readers, under names другие модули may use. задача 22 reads
+#: the same `journal.jsonl` format this module writes — reversing a library
+#: move needs exactly the collapse `restore_from_journal` already does — so
+#: it imports these rather than parsing the file a second way.
+read_journal = _read_journal
+operations_from_journal = _operations_from_journal
+#: And the writer itself, for the same reason.
+JournalWriter = _JournalWriter
 
 
 def _archive_has_media(report: ScanReport, archive_path: str) -> bool:

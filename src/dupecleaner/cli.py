@@ -46,6 +46,13 @@ from .library import (
     RealProbe,
     plan_library,
 )
+from .executor import (
+    PlanFingerprintMismatch,
+    execute_plan,
+    journal_path_for,
+    load_plan,
+    rollback_library,
+)
 from .similar import (
     PHASH_ALGO,
     PHASH_BITS,
@@ -1471,6 +1478,139 @@ def _cmd_library(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build(args: argparse.Namespace) -> int:
+    r"""Carry out the plan задача 21 built — or undo it (задача 22).
+
+    Dry run by default, and the flag that lifts that is
+    `--move-files-for-real`: long, explicit, impossible to type by
+    accident. Everything else about this command is the executor's;
+    printing is all this function does.
+    """
+    if args.rollback:
+        journal = Path(args.journal) if args.journal else None
+        if journal is None and args.plan:
+            plan, _ = load_plan(args.plan)
+            journal = journal_path_for(plan.layout.root)
+        if journal is None:
+            print(
+                "--rollback: укажите --journal (или --plan, чтобы взять журнал "
+                "рядом с его корнем).",
+                file=sys.stderr,
+            )
+            return 2
+        index = None if args.no_index else ScanIndex(args.db)
+        try:
+            outcome = rollback_library(
+                journal, move_files=args.move_files_for_real, index=index
+            )
+        finally:
+            if index is not None:
+                index.close()
+        return _print_rollback(outcome, args)
+
+    if not args.plan:
+        print("build: нужен --plan (файл, сохранённый командой library --json).",
+              file=sys.stderr)
+        return 2
+
+    plan, recorded = load_plan(args.plan)
+    expected = args.fingerprint or recorded or None
+    if args.fingerprint and recorded and args.fingerprint != recorded:
+        print(
+            f"Отпечаток в файле плана ({recorded}) не совпадает с тем, который "
+            f"вы назвали ({args.fingerprint}). Это другой план — ни один файл "
+            "не тронут.",
+            file=sys.stderr,
+        )
+        return 1
+
+    index = None if (args.no_index or not args.move_files_for_real) else ScanIndex(args.db)
+    try:
+        outcome = execute_plan(
+            plan,
+            expected_fingerprint=expected,
+            journal_path=args.journal,
+            move_files=args.move_files_for_real,
+            write_sidecars=not args.no_sidecars,
+            accept_unresolved=args.accept_unresolved,
+            index=index,
+        )
+    except PlanFingerprintMismatch as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        if index is not None:
+            index.close()
+
+    summary = outcome.summary()
+    print(f"План: {args.plan}")
+    print(f"Корень библиотеки: {plan.layout.root}")
+    print(f"Отпечаток сверен: {summary['fingerprint']}")
+    print(f"Перемещений в плане: {summary['planned']}")
+    if outcome.refusal:
+        print(f"\nОТКАЗ: {outcome.refusal}")
+        return 1
+    if outcome.dry_run:
+        print("\nСУХОЙ ПРОГОН — ни один файл не тронут.")
+        print(f"  будет перенесено: {summary['planned'] - summary['skipped'] - summary['failed']}")
+    else:
+        print(f"\nПеренесено: {summary['moved']} ({_fmt_bytes(summary['moved_bytes'])})")
+        print(f"Сайдкаров записано: {summary['sidecars']}, папок создано: {summary['created_dirs']}")
+        print(f"Журнал: {outcome.journal_path}")
+    if outcome.skipped:
+        print(f"\nПропущено: {len(outcome.skipped)}")
+        for item in outcome.skipped[: args.limit]:
+            print(f"  {item['source']}\n      {item['reason']}")
+    if outcome.failed:
+        print(f"\nНе перенесено: {len(outcome.failed)}")
+        for item in outcome.failed[: args.limit]:
+            print(f"  {item['source']}\n      {item['reason']}")
+    for warning in outcome.warnings:
+        print(f"\n! {warning}")
+    if not outcome.dry_run:
+        print(
+            "\nОткат: dupecleaner build --rollback --journal "
+            f"{outcome.journal_path} --move-files-for-real"
+        )
+    _maybe_write_json(args, outcome.to_dict())
+    return 0
+
+
+def _print_rollback(outcome, args: argparse.Namespace) -> int:
+    summary = outcome.summary()
+    print(f"Журнал: {outcome.journal_path}")
+    print(f"Операций в журнале: {summary['considered']}")
+    if outcome.dry_run:
+        print("\nСУХОЙ ПРОГОН — ни один файл не тронут.")
+        print(f"  будет возвращено: {summary['restored']}")
+    else:
+        print(f"\nВозвращено: {summary['restored']}")
+        print(
+            f"Сайдкаров убрано: {summary['sidecars_removed']}, "
+            f"пустых папок убрано: {summary['dirs_removed']}"
+        )
+    if outcome.skipped:
+        print(f"\nПропущено: {len(outcome.skipped)}")
+        for item in outcome.skipped[: args.limit]:
+            print(f"  {item['destination']}\n      {item['reason']}")
+    if outcome.failed:
+        print(f"\nТребует ручной проверки: {len(outcome.failed)}")
+        for item in outcome.failed[: args.limit]:
+            print(f"  {item['destination']}\n      {item['reason']}")
+    for warning in outcome.warnings:
+        print(f"\n! {warning}")
+    _maybe_write_json(args, outcome.to_dict())
+    return 0 if not outcome.failed else 1
+
+
+def _maybe_write_json(args: argparse.Namespace, payload: dict) -> None:
+    if getattr(args, "json", None):
+        Path(args.json).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"Итог сохранён в {args.json}")
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -1894,6 +2034,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Сохранить план в JSON — это то, что будет выполнять задача 22.",
     )
     library_p.set_defaults(func=_cmd_library)
+
+    build_p = subparsers.add_parser(
+        "build",
+        help="Выполнить план построения библиотеки (задача 22). По умолчанию — "
+        "сухой прогон: без явного флага ни один файл не двигается.",
+    )
+    build_p.add_argument(
+        "--plan",
+        default=None,
+        help="Файл плана, сохранённый командой library --json. Обязателен, "
+        "кроме --rollback.",
+    )
+    build_p.add_argument(
+        "--journal",
+        default=None,
+        help="Журнал операций. По умолчанию <корень библиотеки>/"
+        f"{journal_path_for('').parent.name}/library-journal.jsonl — он лежит "
+        "рядом с библиотекой, чтобы откат спустя месяцы не искал ничего, "
+        "кроме неё.",
+    )
+    build_p.add_argument(
+        "--fingerprint",
+        default=None,
+        help="Отпечаток, который вы прочитали. Сверяется дополнительно к тому, "
+        "что записан в самом файле плана.",
+    )
+    build_p.add_argument(
+        "--move-files-for-real",
+        action="store_true",
+        help="РАЗРЕШИТЬ ПЕРЕМЕЩЕНИЕ ФАЙЛОВ. Без этого флага команда только "
+        "показывает, что будет сделано. Флаг длинный и неудобный намеренно: "
+        "это самая опасная операция в проекте.",
+    )
+    build_p.add_argument(
+        "--accept-unresolved",
+        action="store_true",
+        help="Выполнять план, в котором остались вопросы к человеку "
+        "(album_collision и прочие needs_human) — то есть согласиться с тем, "
+        "что предложено.",
+    )
+    build_p.add_argument(
+        "--no-sidecars",
+        action="store_true",
+        help="Не писать XMP-сайдкары. Тогда исходный путь остаётся только в "
+        "индексе — одна копия вместо двух.",
+    )
+    build_p.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Не писать в индекс. Исходный путь останется только в XMP.",
+    )
+    build_p.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Откатить по журналу, в обратном порядке. Прерванный перенос "
+        "откатывается так же, как завершённый.",
+    )
+    build_p.add_argument("--limit", type=int, default=20, help="Сколько строк распечатать")
+    build_p.add_argument("--json", default=None, help="Сохранить итог в JSON")
+    build_p.set_defaults(func=_cmd_build)
 
     serve_p = subparsers.add_parser("serve", help="Запустить веб-интерфейс")
     serve_p.add_argument("--host", default="127.0.0.1")

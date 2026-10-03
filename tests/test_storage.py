@@ -794,8 +794,9 @@ def test_a_fingerprint_without_metrics_is_still_work_to_do(tmp_path: Path):
 def test_schema_version_matches_the_highest_migration(tmp_path: Path):
     """Два ключа с одним номером в `_MIGRATIONS` молча вытесняют друг
     друга, поэтому после каждого мержа схемы проверяется не «тесты
-    зелёные», а это. 11 намеренно пропущена — она за задачей 21."""
+    зелёные», а это. Разрыв закрыт: 11 — `library_moves` задачи 22, та
+    самая зарезервированная под библиотеку."""
     from dupecleaner.storage import _MIGRATIONS, SCHEMA_VERSION
 
     assert SCHEMA_VERSION == max(_MIGRATIONS)
-    assert sorted(_MIGRATIONS) == [2, 3, 4, 5, 6, 7, 8, 9, 10, 12]
+    assert sorted(_MIGRATIONS) == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
