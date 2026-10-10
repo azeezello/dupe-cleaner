@@ -715,7 +715,7 @@ def test_the_package_runs_as_a_module():
     env = dict(os.environ, PYTHONPATH="src", PYTHONIOENCODING="utf-8")
     out = subprocess.run(
         [sys.executable, "-m", "dupecleaner", "--help"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, encoding="utf-8", env=env,
     )
     assert out.returncode == 0, out.stderr[-400:]
     assert "library" in out.stdout and "albums" in out.stdout

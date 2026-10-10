@@ -203,7 +203,8 @@ class FileOps:
             fh.read(1)
 
     def write_text(self, path: Path, text: str) -> None:
-        path.write_text(text, encoding="utf-8")
+        # The journal hashes UTF-8 bytes before writing; keep them identical on Windows.
+        path.write_text(text, encoding="utf-8", newline="")
 
     def read_bytes(self, path: Path) -> bytes:
         return path.read_bytes()

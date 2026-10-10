@@ -275,6 +275,17 @@ def test_sidecar_and_index_both_remember_where_the_file_came_from(
     assert len(outcome.sidecars) == 4
 
 
+def test_sidecar_journal_digest_matches_the_bytes_on_disk(tree: Tree, tmp_path: Path):
+    journal = tmp_path / "journal.jsonl"
+    run(tree, tmp_path, journal_path=journal)
+
+    sidecars = [e for e in read_journal(journal) if e.get("event") == "sidecar_written"]
+    assert len(sidecars) == 4
+    for entry in sidecars:
+        data = Path(entry["path"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == entry["digest"]
+
+
 def test_sidecar_keeps_the_full_name_when_two_files_share_a_stem(tmp_path: Path):
     """`a.jpg` и `a.png` в одной папке оба хотят `a.xmp`. Один сайдкар на
     два файла — это сайдкар ни про один из них, поэтому второй берёт
@@ -679,6 +690,7 @@ def test_rollback_removes_only_a_sidecar_it_wrote_itself(tree: Tree, tmp_path: P
     assert edited.read_text(encoding="utf-8") == "правка человека"
     assert any("изменился" in w for w in back.warnings)
     assert len(back.restored) == 4
+    assert len(back.sidecars_removed) == 3
     assert tree.source_bytes_intact()
 
 
